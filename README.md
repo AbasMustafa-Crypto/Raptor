@@ -17,3 +17,7 @@ RAPTOR is a comprehensive, Kali Linux-native offensive security framework design
 - **IDOR Testing**: Insecure direct object reference detection
 - **Authentication Testing**: JWT analysis, session management, brute force protection
 - **Brute Force Module**: Credential testing with stealth and evasion (use with caution!)
+
+before starting the tool make sure to install all the requirements 
+- pip install -r requirements.txt
+
