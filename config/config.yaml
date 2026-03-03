@@ -1,0 +1,78 @@
+raptor:
+  version: "1.0.0"
+  author: "FYP Project"
+  
+  # Performance settings
+  performance:
+    max_concurrent: 100
+    request_timeout: 30
+    retry_attempts: 3
+    delay_min: 0.5
+    delay_max: 3.0
+    
+  # Stealth settings
+  stealth:
+    user_agent_rotation: true
+    proxy_rotation: false
+    request_jitter: true
+    header_spoofing: true
+    
+  # Database settings
+  database:
+    type: "sqlite"  # sqlite, postgresql, neo4j
+    sqlite_path: "data/raptor.db"
+    neo4j_uri: "bolt://localhost:7687"
+    neo4j_user: "neo4j"
+    neo4j_password: "password"
+    
+  # Module settings
+  modules:
+    recon:
+      enabled: true
+      subdomain_wordlist: "wordlists/subdomains.txt"
+      port_scan: true
+      
+    server_misconfig:
+      enabled: true
+      check_headers: true
+      ssl_verify: true
+      
+    idor:
+      enabled: true
+      test_range: 100
+      session_rotation: true
+      
+    auth:
+      enabled: true
+      jwt_tests: true
+      oauth_tests: true
+      
+    brute_force:
+      enabled: false  # Disabled by default for safety
+      max_attempts: 3
+      delay_between: 5
+      
+    dir_enum:
+      enabled: true
+      recursive: true
+      wordlist: "wordlists/dirs.txt"
+      
+    xss:
+      enabled: true
+      confirm_execution: true
+      payloads: "wordlists/payloads/xss.txt"
+      
+    sqli:
+      enabled: true
+      blind_timeout: 10
+      oob_enabled: true
+
+# Bounty platforms formatting
+reporting:
+  platforms:
+    hackerone:
+      template: "reports/templates/hackerone.md"
+    bugcrowd:
+      template: "reports/templates/bugcrowd.md"
+    generic:
+      template: "reports/templates/generic.md"
