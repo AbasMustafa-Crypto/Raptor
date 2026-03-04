@@ -69,42 +69,63 @@ class TechnologyFingerprinter(BaseModule):
         else:
             urls = [target]
             
+        success = False
+        
         for url in urls:
-            response = await self._make_request(url)
-            if not response:
-                continue
-                
             try:
-                text = await response.text()
-                headers = dict(response.headers)
+                response = await self._make_request(url)
+                if not response:
+                    continue
                 
-                detected = self._analyze_response(url, text, headers)
+                # Check if response is valid
+                if response.status >= 500:
+                    self.logger.warning(f"Server error {response.status} for {url}")
+                    continue
                 
-                for tech, details in detected.items():
-                    self.logger.info(f"Detected: {tech} {details.get('version', '')}")
+                success = True
                     
-                    # Save asset
-                    if self.db:
-                        self.db.save_asset(
-                            'technology', 
-                            tech, 
-                            'recon',
-                            metadata={'version': details.get('version'), 'url': url}
-                        )
+                try:
+                    text = await response.text()
+                    headers = dict(response.headers)
+                    
+                    detected = self._analyze_response(url, text, headers)
+                    
+                    for tech, details in detected.items():
+                        self.logger.info(f"Detected: {tech} {details.get('version', '')}")
                         
-                    # Check for known vulnerabilities based on version
-                    await self._check_vulnerabilities(tech, details, url)
+                        # Save asset
+                        if self.db:
+                            self.db.save_asset(
+                                'technology', 
+                                tech, 
+                                'recon',
+                                metadata={'version': details.get('version'), 'url': url}
+                            )
+                            
+                        # Check for known vulnerabilities based on version
+                        await self._check_vulnerabilities(tech, details, url)
+                        
+                except Exception as e:
+                    self.logger.error(f"Error analyzing response from {url}: {e}")
                     
             except Exception as e:
-                self.logger.error(f"Error analyzing {url}: {e}")
+                self.logger.error(f"Error connecting to {url}: {e}")
+                continue
+        
+        if not success:
+            self.logger.warning(f"Could not fingerprint any technologies for {target}")
                 
         return self.findings
         
     def _analyze_response(self, url: str, text: str, headers: Dict) -> Dict:
         """Analyze response for technology signatures"""
         detected = {}
-        soup = BeautifulSoup(text, 'html.parser')
         
+        try:
+            soup = BeautifulSoup(text, 'html.parser')
+        except Exception:
+            soup = None
+            
         for tech, signatures in self.tech_signatures.items():
             detected[tech] = {'confidence': 0, 'version': None}
             
@@ -121,27 +142,28 @@ class TechnologyFingerprinter(BaseModule):
                                 detected[tech]['version'] = match.group(1)
                                 
             # Check meta tags
-            for meta_sig in signatures.get('meta', []):
-                meta_tags = soup.find_all('meta', attrs={'name': 'generator'})
-                for tag in meta_tags:
-                    if tag.get('content') and re.search(meta_sig, tag.get('content'), re.I):
-                        detected[tech]['confidence'] += 20
-                        if 'version_regex' in signatures:
-                            match = re.search(signatures['version_regex'], tag.get('content'))
-                            if match:
-                                detected[tech]['version'] = match.group(1)
-                                
+            if soup:
+                for meta_sig in signatures.get('meta', []):
+                    meta_tags = soup.find_all('meta', attrs={'name': 'generator'})
+                    for tag in meta_tags:
+                        if tag.get('content') and re.search(meta_sig, tag.get('content'), re.I):
+                            detected[tech]['confidence'] += 20
+                            if 'version_regex' in signatures:
+                                match = re.search(signatures['version_regex'], tag.get('content'))
+                                if match:
+                                    detected[tech]['version'] = match.group(1)
+                                    
+                # Check scripts
+                scripts = soup.find_all('script', src=True)
+                for script_sig in signatures.get('scripts', []):
+                    for script in scripts:
+                        if script_sig in script.get('src', ''):
+                            detected[tech]['confidence'] += 15
+            
             # Check HTML content
             for html_sig in signatures.get('html', []):
                 if html_sig in text:
                     detected[tech]['confidence'] += 15
-                    
-            # Check scripts
-            scripts = soup.find_all('script', src=True)
-            for script_sig in signatures.get('scripts', []):
-                for script in scripts:
-                    if script_sig in script.get('src', ''):
-                        detected[tech]['confidence'] += 15
                         
             # Check cookies
             for cookie_sig in signatures.get('cookies', []):
