@@ -18,9 +18,10 @@ RAPTOR is a comprehensive, Kali Linux-native offensive security framework design
 - **Authentication Testing**: JWT analysis, session management, brute force protection
 - **Brute Force Module**: Credential testing with stealth and evasion (use with caution!)
 
-LOOK HERE !!!!
+LOOK HERE and start doing these things first !!!!
 - git clone https://github.com/AbasMustafa-Crypto/raptor.git
 - pip install -r requirements.txt
+- python3 raptor.py --help
 
 - Regarding to the usage guide for the RAPTOR framework, I am not stupid to give you a gun full of bullets even if it was a broken one , So here is some commands that you can use :
   
