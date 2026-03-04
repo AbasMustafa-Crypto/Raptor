@@ -203,7 +203,8 @@ class CredentialTester(BaseModule):
                                 'url': url,
                                 'attempts': attempt_count
                             },
-                            poc=f"POST {url} with {username_field}={username}&{password_field}={password}",
+                            poc=f"POST {url} with 
+                            {username_field}={username} & {password_field}={password}",
                             remediation='Implement strong password policy, rate limiting, and account lockout',
                             cvss_score=9.8,
                             bounty_score=5000,
