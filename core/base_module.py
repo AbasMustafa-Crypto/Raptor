@@ -1,6 +1,8 @@
 import asyncio
 import aiohttp
+import aiohttp.tcp_helpers
 import logging
+import ssl
 from abc import ABC, abstractmethod
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, field
@@ -49,15 +51,25 @@ class BaseModule(ABC):
         
     async def __aenter__(self):
         """Async context manager entry"""
+        # Create SSL context that allows us to connect to sites with certificate issues
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
         connector = aiohttp.TCPConnector(
-            limit=self.config.get('max_concurrent', 100),
-            limit_per_host=10,
+            limit=self.config.get('max_concurrent', 50),
+            limit_per_host=5,
             enable_cleanup_closed=True,
-            force_close=True,
+            force_close=False,
+            ssl=ssl_context,
+            use_dns_cache=True,
+            ttl_dns_cache=300,
         )
         
         timeout = aiohttp.ClientTimeout(
-            total=self.config.get('request_timeout', 30)
+            total=self.config.get('request_timeout', 30),
+            connect=self.config.get('connect_timeout', 10),
+            sock_read=self.config.get('sock_read_timeout', 10)
         )
         
         headers = await self._get_headers() if self.stealth else {}
@@ -65,7 +77,8 @@ class BaseModule(ABC):
         self.session = aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
-            headers=headers
+            headers=headers,
+            raise_for_status=False
         )
         return self
         
@@ -79,11 +92,12 @@ class BaseModule(ABC):
         if self.stealth:
             return await self.stealth.get_headers()
         return {
-            'User-Agent': 'RAPTOR/1.0 Security Testing Framework',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
+            'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
         }
         
     async def _make_request(self, url: str, method: str = 'GET', 
@@ -91,6 +105,7 @@ class BaseModule(ABC):
                            allow_redirects: bool = True) -> Optional[aiohttp.ClientResponse]:
         """Make HTTP request with stealth and retry logic"""
         max_retries = self.config.get('retry_attempts', 3)
+        retry_delay = self.config.get('retry_delay', 2)
         
         for attempt in range(max_retries):
             try:
@@ -100,35 +115,51 @@ class BaseModule(ABC):
                     
                 request_headers = headers or await self._get_headers()
                 
+                # Ensure URL is properly formatted
+                if not url.startswith(('http://', 'https://')):
+                    url = f"https://{url}"
+                
+                request_kwargs = {
+                    'headers': request_headers,
+                    'allow_redirects': allow_redirects,
+                    'ssl': False  # Disable SSL verification for testing
+                }
+                
                 if method.upper() == 'GET':
-                    async with self.session.get(
-                        url, 
-                        headers=request_headers,
-                        allow_redirects=allow_redirects,
-                        ssl=False
-                    ) as response:
+                    async with self.session.get(url, **request_kwargs) as response:
+                        # Read response to avoid connection issues
+                        await response.read()
                         return response
                         
                 elif method.upper() == 'POST':
-                    async with self.session.post(
-                        url,
-                        data=data,
-                        headers=request_headers,
-                        allow_redirects=allow_redirects,
-                        ssl=False
-                    ) as response:
+                    request_kwargs['data'] = data
+                    async with self.session.post(url, **request_kwargs) as response:
+                        await response.read()
                         return response
                         
             except asyncio.TimeoutError:
                 self.logger.warning(f"Timeout on attempt {attempt + 1} for {url}")
                 if attempt == max_retries - 1:
                     return None
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                await asyncio.sleep(retry_delay * (attempt + 1))
                 
-            except Exception as e:
-                self.logger.error(f"Request error: {e}")
+            except aiohttp.ClientConnectorError as e:
+                self.logger.warning(f"Connection error to {url}: {e}")
                 if attempt == max_retries - 1:
                     return None
+                await asyncio.sleep(retry_delay * (attempt + 1))
+                
+            except aiohttp.ClientOSError as e:
+                self.logger.warning(f"OS error on request to {url}: {e}")
+                if attempt == max_retries - 1:
+                    return None
+                await asyncio.sleep(retry_delay * (attempt + 1))
+                
+            except Exception as e:
+                self.logger.error(f"Request error on {url}: {e}")
+                if attempt == max_retries - 1:
+                    return None
+                await asyncio.sleep(retry_delay * (attempt + 1))
                     
         return None
         
