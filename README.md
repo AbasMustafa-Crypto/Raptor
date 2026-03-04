@@ -1,19 +1,5 @@
 # RAPTOR - Advanced Web Application Security Testing Framework
 
-&lt;p align="center"&gt;
-  &lt;img src="https://img.shields.io/badge/Version-1.0.0-blue.svg" alt="Version"&gt;
-  &lt;img src="https://img.shields.io/badge/Python-3.8+-green.svg" alt="Python"&gt;
-  &lt;img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License"&gt;
-  &lt;img src="https://img.shields.io/badge/Platform-Kali%20Linux-purple.svg" alt="Platform"&gt;
-&lt;/p&gt;
-
-&lt;p align="center"&gt;
-  &lt;b&gt;Advanced Automated Web Application Security Testing Framework&lt;/b&gt;&lt;br&gt;
-  &lt;i&gt;Optimized for Bug Bounty Hunting & Penetration Testing&lt;/i&gt;
-&lt;/p&gt;
-
----
-
 ## ⚠️ LEGAL DISCLAIMER
 
 &gt; **WARNING: This tool is for authorized security testing only!**
