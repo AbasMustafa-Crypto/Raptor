@@ -1,45 +1,114 @@
 # RAPTOR - Advanced Web Application Security Testing Framework
 
-⚠️ **LEGAL WARNING: This tool is for authorized security testing only!**  
-⚠️ **Use only on systems you own or have explicit written permission to test.**  
-⚠️ **Unauthorized access to computer systems is illegal under CFAA and similar laws.**
+&lt;p align="center"&gt;
+  &lt;img src="https://img.shields.io/badge/Version-1.0.0-blue.svg" alt="Version"&gt;
+  &lt;img src="https://img.shields.io/badge/Python-3.8+-green.svg" alt="Python"&gt;
+  &lt;img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License"&gt;
+  &lt;img src="https://img.shields.io/badge/Platform-Kali%20Linux-purple.svg" alt="Platform"&gt;
+&lt;/p&gt;
+
+&lt;p align="center"&gt;
+  &lt;b&gt;Advanced Automated Web Application Security Testing Framework&lt;/b&gt;&lt;br&gt;
+  &lt;i&gt;Optimized for Bug Bounty Hunting & Penetration Testing&lt;/i&gt;
+&lt;/p&gt;
+
+---
+
+## ⚠️ LEGAL DISCLAIMER
+
+&gt; **WARNING: This tool is for authorized security testing only!**
+&gt; 
+&gt; **Use only on systems you own or have explicit written permission to test.**
+&gt; 
+&gt; **Unauthorized access to computer systems is illegal under CFAA, Computer Misuse Act, and similar international laws.**
+&gt; 
+&gt; The authors assume no liability for misuse or damage caused by this program.
+
+---
+
+## Table of Contents
+
+- [Description](#description)
+- [Features](#features)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Usage Guide](#usage-guide)
+- [Module Documentation](#module-documentation)
+- [Configuration](#configuration)
+- [Wordlists](#wordlists)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
 
 ## Description
 
-RAPTOR is a comprehensive, Kali Linux-native offensive security framework designed specifically for bug bounty hunters and penetration testers. It implements intelligent attack chaining — correlating reconnaissance data with multi-vector vulnerability testing.
+RAPTOR is a comprehensive, Kali Linux-native offensive security framework designed specifically for bug bounty hunters and penetration testers. It implements intelligent attack chaining — correlating reconnaissance data with multi-vector vulnerability testing to identify exploitable attack paths.
 
-**Core Philosophy:** "One confirmed vulnerability is worth a thousand theoretical findings"
+**Core Philosophy:** *"One confirmed vulnerability is worth a thousand theoretical findings"*
+
+### Key Capabilities
+
+| Capability | Description |
+|-----------|-------------|
+| **Intelligent Correlation** | Links findings across modules to discover complex attack chains |
+| **Stealth Operations** | Built-in evasion techniques, rate limiting, and randomization |
+| **Zero External Dependencies** | Works out-of-the-box without pip install hassles on Kali |
+| **Database Persistence** | SQLite/Neo4j backend for large-scale assessments |
+| **Professional Reporting** | Markdown reports with CVSS scoring and bounty estimates |
+
+---
 
 ## Features
 
-- **Reconnaissance Module**: Subdomain enumeration, technology fingerprinting, cloud asset discovery
-- **Server Misconfiguration**: Header audit, SSL analysis, sensitive file detection
-- **IDOR Testing**: Insecure direct object reference detection
-- **Authentication Testing**: JWT analysis, session management, brute force protection
-- **Brute Force Module**: Credential testing with stealth and evasion (use with caution!)
+### 🔍 Reconnaissance Module
+- **Subdomain Enumeration**: Passive discovery via Certificate Transparency logs, DNS brute force
+- **Technology Fingerprinting**: Detects 100+ technologies with version detection
+- **Cloud Asset Discovery**: Identifies AWS S3 buckets, Azure blobs, GCP storage
+- **Service Detection**: Identifies open ports and running services
 
-LOOK HERE and start doing these things first !!!!
-- git clone https://github.com/AbasMustafa-Crypto/raptor.git
-- pip install -r requirements.txt
-- python3 raptor.py --help
+### ⚙️ Server Misconfiguration
+- **Security Header Audit**: Checks HSTS, CSP, X-Frame-Options, and 15+ headers
+- **SSL/TLS Analysis**: Certificate validation, cipher suite assessment
+- **Sensitive File Detection**: Discovers backup files, config leaks, .env exposures
+- **Method Enumeration**: HTTP verb tampering tests
 
-- Regarding to the usage guide for the RAPTOR framework, I am not stupid to give you a gun full of bullets even if it was a broken one , So here is some commands that you can use :
-  
-Reconnaissance only
-python3 raptor.py -t target.com --modules recon
+### 🔓 IDOR Testing
+- **Object Reference Manipulation**: Automated IDOR vulnerability detection
+- **Parameter Fuzzing**: Tests for insecure direct object references
+- **Access Control Bypass**: Horizontal and vertical privilege escalation tests
 
-Server misconfiguration only
-python3 raptor.py -t target.com --modules server
+### 🔐 Authentication Testing
+- **JWT Analysis**: Token validation, algorithm confusion, secret brute force
+- **Session Management**: Cookie security, fixation, predictable tokens
+- **Brute Force Protection**: Rate limiting detection, account lockout testing
+- **Credential Stuffing**: Custom wordlist support with intelligent detection
 
-IDOR testing only
-python3 raptor.py -t target.com --modules idor
+### 🛡️ Stealth & Evasion
+- **Request Randomization**: Rotating user agents, headers, and timing
+- **Proxy Support**: HTTP/HTTPS/SOCKS proxy rotation
+- **Rate Limit Adaptation**: Auto-adjusts delays based on 429/503 responses
+- **Header Spoofing**: X-Forwarded-For, X-Real-IP bypass attempts
 
-Brute force protection testing
-python3 raptor.py -t target.com --modules brute --enable-brute-force
+---
 
-Full scan
-python3 raptor.py -t target.com --full-scan --stealth
+## Installation
 
+### Prerequisites
 
+- Kali Linux (recommended) or any Debian-based system
+- Python 3.8+
+- No external tool dependencies required
 
+### Direct Clon:
 
+```bash
+# Clone the repository
+git clone https://github.com/AbasMustafa-Crypto/raptor.git
+
+# Navigate to directory
+cd raptor
+
+# The tool works immediately - no pip install needed!
+python3 raptor.py --help
