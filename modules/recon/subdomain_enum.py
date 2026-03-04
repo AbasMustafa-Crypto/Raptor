@@ -1,6 +1,7 @@
 import asyncio
 import subprocess
 import json
+import shutil
 from typing import List, Set, Dict
 from core.base_module import BaseModule, Finding
 import aiohttp
@@ -19,22 +20,37 @@ class SubdomainEnumerator(BaseModule):
         
         all_subdomains: Set[str] = set()
         
-        # Run tools in parallel
+        # Check which tools are available
+        available_tools = self._get_available_tools()
+        
+        if not available_tools:
+            self.logger.warning("No external subdomain tools found. Using fallback methods only.")
+        
+        # Run available tools in parallel
         tasks = []
-        for tool in self.tools:
+        for tool in available_tools:
             if kwargs.get(f'use_{tool}', True):
                 tasks.append(self._run_tool(tool, target))
                 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for result in results:
+                if isinstance(result, set):
+                    all_subdomains.update(result)
+                elif isinstance(result, Exception):
+                    self.logger.error(f"Tool error: {result}")
         
-        for result in results:
-            if isinstance(result, set):
-                all_subdomains.update(result)
-                
+        # Always try CT logs as fallback
+        await self._check_ct_logs(target, all_subdomains)
+        
         self.logger.info(f"Found {len(all_subdomains)} unique subdomains")
         
         # Resolve and validate subdomains
-        valid_subdomains = await self._validate_subdomains(all_subdomains)
+        if all_subdomains:
+            valid_subdomains = await self._validate_subdomains(all_subdomains)
+        else:
+            valid_subdomains = []
         
         # Save to database
         for subdomain in valid_subdomains:
@@ -43,9 +59,20 @@ class SubdomainEnumerator(BaseModule):
                                  metadata={'resolved': True})
                                  
         # Check for interesting findings
-        await self._analyze_subdomains(valid_subdomains, target)
+        if valid_subdomains:
+            await self._analyze_subdomains(valid_subdomains, target)
         
         return self.findings
+    
+    def _get_available_tools(self) -> List[str]:
+        """Check which tools are available in PATH"""
+        available = []
+        for tool in self.tools:
+            if shutil.which(tool):
+                available.append(tool)
+            else:
+                self.logger.warning(f"{tool} not found in PATH - skipping")
+        return available
         
     async def _run_tool(self, tool: str, target: str) -> Set[str]:
         """Run a specific subdomain enumeration tool"""
@@ -69,7 +96,16 @@ class SubdomainEnumerator(BaseModule):
                 stderr=asyncio.subprocess.PIPE
             )
             
-            stdout, stderr = await proc.communicate()
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), 
+                    timeout=300  # 5 minute timeout
+                )
+            except asyncio.TimeoutError:
+                self.logger.warning(f"{tool} timed out, killing process")
+                proc.kill()
+                await proc.wait()
+                return subdomains
             
             if tool == 'assetfinder':
                 # Assetfinder outputs plain text
@@ -103,13 +139,16 @@ class SubdomainEnumerator(BaseModule):
         """Validate subdomains via DNS resolution"""
         valid = []
         
+        if not subdomains:
+            return valid
+        
         # Use httpx or dns resolution
-        semaphore = asyncio.Semaphore(50)  # Limit concurrent DNS lookups
+        semaphore = asyncio.Semaphore(20)  # Limit concurrent DNS lookups
         
         async def check_subdomain(subdomain):
             async with semaphore:
                 try:
-                    # Simple HTTP check
+                    # Simple HTTP check with short timeout
                     url = f"http://{subdomain}"
                     response = await self._make_request(url, allow_redirects=True)
                     if response and response.status < 500:
@@ -118,7 +157,7 @@ class SubdomainEnumerator(BaseModule):
                 except Exception:
                     pass
                     
-        await asyncio.gather(*[check_subdomain(s) for s in subdomains])
+        await asyncio.gather(*[check_subdomain(s) for s in subdomains], return_exceptions=True)
         return valid
         
     async def _analyze_subdomains(self, subdomains: List[str], target: str):
@@ -146,45 +185,61 @@ class SubdomainEnumerator(BaseModule):
                     )
                     self.add_finding(finding)
                     break
-                    
-        # Check for certificate transparency
-        await self._check_ct_logs(target)
         
-    async def _check_ct_logs(self, target: str):
+    async def _check_ct_logs(self, target: str, existing_subdomains: Set[str]):
         """Check Certificate Transparency logs"""
         try:
             url = f"https://crt.sh/?q=%.{target}&output=json"
-            response = await self._make_request(url)
             
-            if response and response.status == 200:
-                data = await response.json()
-                
-                # Extract unique subdomains from CT logs
-                ct_subdomains = set()
-                for entry in data:
-                    name = entry.get('name_value', '').strip()
-                    if name and '*' not in name:
-                        ct_subdomains.add(name)
-                        
-                self.logger.info(f"Found {len(ct_subdomains)} subdomains in CT logs")
-                
-                # Find new subdomains not discovered by other tools
-                new_subdomains = ct_subdomains - self.resolved_subdomains
-                
-                if new_subdomains:
-                    finding = Finding(
-                        module='recon',
-                        title=f'Hidden Subdomains in CT Logs: {len(new_subdomains)}',
-                        severity='Low',
-                        description=f'Found {len(new_subdomains)} subdomains only in Certificate Transparency logs',
-                        evidence={'subdomains': list(new_subdomains)[:10]},
-                        poc=f"Check: https://crt.sh/?q=%.{target}",
-                        remediation='Review all subdomains for proper security controls',
-                        cvss_score=3.7,
-                        bounty_score=100,
-                        target=target
-                    )
-                    self.add_finding(finding)
+            # Use a fresh session for CT log check to avoid connection issues
+            timeout = aiohttp.ClientTimeout(total=15, connect=5)
+            
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                try:
+                    async with session.get(url, ssl=False) as response:
+                        if response.status == 200:
+                            try:
+                                data = await response.json()
+                                
+                                # Extract unique subdomains from CT logs
+                                ct_subdomains = set()
+                                for entry in data:
+                                    name = entry.get('name_value', '').strip()
+                                    if name and '*' not in name:
+                                        ct_subdomains.add(name)
+                                        
+                                self.logger.info(f"Found {len(ct_subdomains)} subdomains in CT logs")
+                                
+                                # Add to existing set
+                                existing_subdomains.update(ct_subdomains)
+                                
+                                # Find new subdomains not discovered by other tools
+                                new_subdomains = ct_subdomains - self.resolved_subdomains
+                                
+                                if new_subdomains:
+                                    finding = Finding(
+                                        module='recon',
+                                        title=f'Hidden Subdomains in CT Logs: {len(new_subdomains)}',
+                                        severity='Low',
+                                        description=f'Found {len(new_subdomains)} subdomains only in Certificate Transparency logs',
+                                        evidence={'subdomains': list(new_subdomains)[:10]},
+                                        poc=f"Check: https://crt.sh/?q=%.{target}",
+                                        remediation='Review all subdomains for proper security controls',
+                                        cvss_score=3.7,
+                                        bounty_score=100,
+                                        target=target
+                                    )
+                                    self.add_finding(finding)
+                            except Exception as e:
+                                self.logger.warning(f"Failed to parse CT log response: {e}")
+                        else:
+                            self.logger.warning(f"CT log check returned status {response.status}")
+                except aiohttp.ClientConnectorError as e:
+                    self.logger.warning(f"Cannot connect to crt.sh: {e}")
+                except asyncio.TimeoutError:
+                    self.logger.warning("CT log check timed out")
+                except Exception as e:
+                    self.logger.warning(f"CT log request failed: {e}")
                     
         except Exception as e:
             self.logger.error(f"CT log check failed: {e}")
