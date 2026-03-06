@@ -1,4 +1,9 @@
-import yaml
+try:
+    import yaml
+except ModuleNotFoundError:
+    raise ImportError("PyYAML required. Run: pip install pyyaml")
+
+from typing import Dict
 from typing import Dict
 
 class ConfigManager:
