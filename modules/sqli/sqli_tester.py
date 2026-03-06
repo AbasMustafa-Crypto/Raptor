@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RAPTOR SQL Injection Testing Module v2.0 - S-Tier Penetration Testing Suite
+RAPTOR SQL Injection Testing Module v2.0 
 ============================================================================
 Advanced SQLi detection with multi-technique fuzzing, WAF evasion, 
 database fingerprinting, and automated exploitation capabilities.
@@ -1079,3 +1079,4 @@ class SQLiTester(BaseModule):
 ### Payload
 ```sql
 {payload.payload}
+
