@@ -338,43 +338,33 @@ class SQLiTester(BaseModule):
     
     async def _test_error_based(self, target: str, params: Dict):
         """Test for Error-based SQLi"""
-        url_params = params.get('url_params', [])
-        
-        for param in url_params:
-            if param in self.tested_params:
-                continue
-            
-            self.logger.info(f"   Testing parameter: {param}")
-            
-            for db_type, payloads in self.payloads['error'].items():
-                for payload_obj in payloads:
-                    # Apply evasion if WAF detected
-                    test_payload = self._apply_evasion(payload_obj.payload) if self.waf_detected else payload_obj.payload
-                    
-                    try:
-                        test_url = f"{target}?{param}={quote(test_payload)}"
-                        resp = await self._make_request(test_url)
-                        
-                        if not resp:
-                            continue
-                        
-                        body = await resp.text()
-                        
-                        if self._check_error_signatures(body, db_type):
-                            # Fingerprint database
-                            fingerprint = await self._fingerprint_db(target, param, db_type)
-                            
-                            finding = self._create_finding(
-                                target, param, payload_obj, db_type,
-                                'Error-based', body, fingerprint
-                            )
-                            self.findings.append(finding)
-                            self.add_finding(finding)
-                            self.tested_params.add(param)
-                            break
-                            
-                    except Exception as e:
-                        self.logger.debug(f"Error-based test failed: {e}")
+        url_params = params.get('url_params', [])[:8]  # cap at 8 params
+        semaphore = asyncio.Semaphore(5)
+
+        async def test_param(param):
+            async with semaphore:
+                if param in self.tested_params:
+                    return
+                for db_type, payloads in self.payloads['error'].items():
+                    for payload_obj in payloads[:1]:  # 1 payload per db type
+                        test_payload = self._apply_evasion(payload_obj.payload) if self.waf_detected else payload_obj.payload
+                        try:
+                            test_url = f"{target}?{param}={quote(test_payload)}"
+                            resp = await self._make_request(test_url)
+                            if not resp:
+                                continue
+                            body = await resp.text()
+                            if self._check_error_signatures(body, db_type):
+                                fingerprint = await self._fingerprint_db(target, param, db_type)
+                                finding = self._create_finding(target, param, payload_obj, db_type, 'Error-based', body, fingerprint)
+                                self.findings.append(finding)
+                                self.add_finding(finding)
+                                self.tested_params.add(param)
+                                return
+                        except Exception as e:
+                            self.logger.debug(f"Error-based test failed: {e}")
+
+        await asyncio.gather(*[test_param(p) for p in url_params], return_exceptions=True)
     
     def _apply_evasion(self, payload: str) -> str:
         """Apply basic evasion techniques"""
