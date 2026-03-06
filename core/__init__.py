@@ -1,16 +1,22 @@
-from .base_module import BaseModule
+from .base_module import BaseModule, Finding
 from .config_manager import ConfigManager
 from .database_manager import DatabaseManager
-from .stealth_manager import StealthManager
 from .report_manager import ReportManager
 from .correlator import AttackPathCorrelator
+from .graph_manager import GraphManager
+
+# StealthManager lives in its own file; imported lazily to avoid missing-file errors
+try:
+    from .stealth_manager import StealthManager
+except ImportError:
+    StealthManager = None
 
 __all__ = [
-    'BaseModule',
-    'ConfigManager', 
+    'BaseModule', 'Finding',
+    'ConfigManager',
     'DatabaseManager',
     'StealthManager',
     'ReportManager',
-    'AttackPathCorrelator'
+    'AttackPathCorrelator',
     'GraphManager',
 ]
