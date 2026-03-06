@@ -277,7 +277,10 @@ class TechnologyFingerprinter(BaseModule):
         # Check additional technologies from wordlist
         detected.update(self._check_wordlist_technologies(text, headers, soup))
 
-            def _check_wordlist_technologies(self, text: str, headers: Dict, soup) -> Dict:
+        # Filter low confidence
+        return {k: v for k, v in detected.items() if v['confidence'] >= 30}
+
+    def _check_wordlist_technologies(self, text: str, headers: Dict, soup) -> Dict:
         """Check for additional technologies from wordlist"""
         detected = {}
         text_lower = text.lower()
@@ -525,8 +528,3 @@ class TechnologyFingerprinter(BaseModule):
                 target=url
             )
             self.add_finding(finding)
-
-        
-        
-        # Filter low confidence
-        return {k: v for k, v in detected.items() if v['confidence'] >= 30}
