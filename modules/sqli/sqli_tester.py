@@ -679,8 +679,12 @@ class SQLiTester(BaseModule):
         }
         
         title = f"[{technique}] SQL Injection in '{param}' parameter ({db_type})"
-        
-        description = f"""## SQL Injection Vulnerability
+
+        return Finding(
+            module='sqli',
+            title=title,
+            severity=severity_map.get(technique, 'High'),
+            description=f"""## SQL Injection Vulnerability
 
 **Type:** {technique}
 **Parameter:** `{param}`
@@ -690,3 +694,38 @@ class SQLiTester(BaseModule):
 ### Payload
 ```sql
 {payload.payload}
+```
+
+### Impact
+SQL injection allows attackers to read, modify, or delete database contents,
+bypass authentication, and potentially execute OS commands.
+
+### Database Fingerprint
+{fingerprint if fingerprint else 'Not fingerprinted'}
+""",
+            evidence={
+                'parameter':   param,
+                'payload':     payload.payload,
+                'technique':   technique,
+                'db_type':     db_type,
+                'fingerprint': fingerprint,
+            },
+            poc=f"curl '{target}?{param}={quote(payload.payload)}'",
+            remediation=(
+                'Use parameterised queries / prepared statements. '
+                'Never concatenate user input into SQL strings. '
+                'Apply least-privilege database accounts.'
+            ),
+            cvss_score=cvss_map.get(technique, 8.1),
+            bounty_score=bounty_map.get(technique, 3000),
+            target=target
+        )
+
+    async def _store_findings(self):
+        """Persist findings to database"""
+        if self.db:
+            for finding in self.findings:
+                try:
+                    self.db.save_finding(finding)
+                except Exception:
+                    pass
