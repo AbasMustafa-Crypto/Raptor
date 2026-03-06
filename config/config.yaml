@@ -1,78 +1,293 @@
-raptor:
-  version: "1.0.0"
-  author: "FYP Project"
-  
-  # Performance settings
-  performance:
-    max_concurrent: 100
-    request_timeout: 30
-    retry_attempts: 3
-    delay_min: 0.5
-    delay_max: 3.0
-    
-  # Stealth settings
-  stealth:
-    user_agent_rotation: true
-    proxy_rotation: false
-    request_jitter: true
-    header_spoofing: true
-    
-  # Database settings
-  database:
-    type: "sqlite"  # sqlite, postgresql, neo4j
-    sqlite_path: "data/raptor.db"
-    neo4j_uri: "bolt://localhost:7687"
-    neo4j_user: "neo4j"
-    neo4j_password: "password"
-    
-  # Module settings
-  modules:
-    recon:
-      enabled: true
-      subdomain_wordlist: "wordlists/subdomains.txt"
-      port_scan: true
-      
-    server_misconfig:
-      enabled: true
-      check_headers: true
-      ssl_verify: true
-      
-    idor:
-      enabled: true
-      test_range: 100
-      session_rotation: true
-      
-    auth:
-      enabled: true
-      jwt_tests: true
-      oauth_tests: true
-      
-    brute_force:
-      enabled: false  # Disabled by default for safety
-      max_attempts: 3
-      delay_between: 5
-      
-    dir_enum:
-      enabled: true
-      recursive: true
-      wordlist: "wordlists/dirs.txt"
-      
-    xss:
-      enabled: true
-      confirm_execution: true
-      payloads: "wordlists/payloads/xss.txt"
-      
-    sqli:
-      enabled: true
-      blind_timeout: 10
-      oob_enabled: true
+# =============================================================================
+# RAPTOR Configuration v3.2 - "CLI-NATIVE"
+# Standard Command Format: python3 raptor.py -t <target> --modules <module>
+# =============================================================================
 
-# Bounty platforms formatting
-reporting:
-  platforms:
-    hackerone:
-      template: "reports/templates/hackerone.md"
-    bugcrowd:
-      template: "reports/templates/bugcrowd.md"
-    generic:
-      template: "reports/templates/generic.md"
+raptor:
+  version: "3.2.0"
+  codename: "CLI-NATIVE"
+
+# =============================================================================
+# COMMAND-LINE INTERFACE CONFIGURATION
+# =============================================================================
+
+cli:
+  # Standard command format:
+  # python3 raptor.py -t <TARGET> --modules <MODULE>
+  # 
+  # Examples:
+  # python3 raptor.py -t target.com --modules xss
+  # python3 raptor.py -t target.com --modules sqli
+  # python3 raptor.py -t target.com --modules recon
+  # python3 raptor.py -t target.com --modules xss,sqli,idor
+  
+  parser:
+    target:
+      flag: "-t"
+      required: true
+      help: "Target domain or URL"
+    
+    modules:
+      flag: "--modules"
+      required: true
+      choices: ["recon", "server", "xss", "sqli", "idor", "api", "auth", "all"]
+      help: "Comma-separated module selection"
+    
+    # Optional flags (no env vars needed)
+    stealth:
+      flag: "--stealth"
+      action: "store_true"
+      help: "Enable stealth mode"
+    
+    output:
+      flag: "-o"
+      default: "raptor_report.md"
+      help: "Output file path"
+    
+    verbose:
+      flag: "-v"
+      action: "store_true"
+      help: "Verbose output"
+
+# =============================================================================
+# MODULE CONFIGURATIONS
+# =============================================================================
+
+modules:
+
+  # ---------------------------------------------------------------------------
+  # XSS MODULE
+  # Command: python3 raptor.py -t target.com --modules xss
+  # ---------------------------------------------------------------------------
+  xss:
+    enabled: true
+    description: "Cross-site scripting detection"
+    
+    test_vectors:
+      reflected: true
+      stored: true
+      dom_based: true
+      blind: true
+    
+    payloads:
+      source: "embedded"        # Built-in 10,000 payloads
+      encoding: ["raw", "url", "html_entities", "unicode"]
+    
+    evasion:
+      level: 3                  # 1-5, higher = more evasive
+      waf_bypass: true
+      techniques: ["case_randomization", "comment_injection", "encoding_cascade"]
+    
+    blind_detection:
+      enabled: true
+      mode: "dns_fallback"      # Uses DNS if no callback server
+      timeout: 300              # 5 minutes
+
+  # ---------------------------------------------------------------------------
+  # SQL INJECTION MODULE
+  # Command: python3 raptor.py -t target.com --modules sqli
+  # ---------------------------------------------------------------------------
+  sqli:
+    enabled: true
+    description: "SQL injection detection"
+    
+    dbms_support:
+      mysql: true
+      postgresql: true
+      mssql: true
+      oracle: true
+      sqlite: true
+      mongodb: true
+    
+    techniques:
+      error_based: true
+      union_based: true
+      boolean_blind: true
+      time_blind: true
+      stacked_queries: false    # Safety: disabled
+    
+    evasion:
+      level: 3
+      comment_styles: ["-- ", "#", "/* */"]
+      encoding: ["none", "url", "double_url"]
+
+  # ---------------------------------------------------------------------------
+  # IDOR MODULE
+  # Command: python3 raptor.py -t target.com --modules idor
+  # ---------------------------------------------------------------------------
+  idor:
+    enabled: true
+    description: "Insecure Direct Object Reference detection"
+    
+    patterns:
+      sequential: true
+      uuid: true
+      hash_based: true
+    
+    testing:
+      horizontal_escalation: true
+      vertical_escalation: false    # Safety: disabled
+      mass_assignment: true
+      parameter_pollution: true
+    
+    fuzz_range: 50                  # Test ±50 IDs
+
+  # ---------------------------------------------------------------------------
+  # RECONNAISSANCE MODULE
+  # Command: python3 raptor.py -t target.com --modules recon
+  # ---------------------------------------------------------------------------
+  recon:
+    enabled: true
+    description: "Subdomain and technology discovery"
+    
+    subdomain_enum:
+      wordlist: "wordlists/subdomains.txt"
+      sources: ["crt.sh", "wayback", "github"]  # Free sources only
+    
+    tech_fingerprint:
+      enabled: true
+      database: "data/technologies.json"
+    
+    port_scan:
+      enabled: false              # Safety: disabled by default
+
+  # ---------------------------------------------------------------------------
+  # SERVER MISCONFIGURATION MODULE
+  # Command: python3 raptor.py -t target.com --modules server
+  # ---------------------------------------------------------------------------
+  server:
+    enabled: true
+    description: "Security headers and configuration audit"
+    
+    header_audit:
+      check_csp: true
+      check_hsts: true
+      required_headers:
+        - "Strict-Transport-Security"
+        - "X-Content-Type-Options"
+        - "X-Frame-Options"
+        - "Content-Security-Policy"
+    
+    ssl_audit:
+      enabled: true
+      min_tls_version: "1.2"
+    
+    sensitive_files:
+      enabled: true
+      wordlist: "wordlists/sensitive_files.txt"
+
+  # ---------------------------------------------------------------------------
+  # API SECURITY MODULE
+  # Command: python3 raptor.py -t target.com --modules api
+  # ---------------------------------------------------------------------------
+  api:
+    enabled: true
+    description: "API endpoint security testing"
+    
+    protocols:
+      rest: true
+      graphql: true
+      grpc: true
+      websocket: true
+    
+    testing:
+      bola: true                  # Broken Object Level Authorization
+      bfla: true                  # Broken Function Level Authorization
+      mass_assignment: true
+      jwt_analysis: true
+
+  # ---------------------------------------------------------------------------
+  # AUTHENTICATION MODULE
+  # Command: python3 raptor.py -t target.com --modules auth
+  # ---------------------------------------------------------------------------
+  auth:
+    enabled: true
+    description: "Session and authentication testing"
+    
+    jwt:
+      algorithm_confusion: true
+      weak_secrets: true
+      secret_wordlist: "wordlists/jwt_secrets.txt"
+    
+    session:
+      entropy_analysis: true
+      fixation: false           # Safety: disabled
+    
+    brute_force:
+      enabled: false            # Safety: disabled
+
+# =============================================================================
+# PERFORMANCE SETTINGS
+# =============================================================================
+
+performance:
+  concurrency: 50
+  timeout: 30
+  delay_min: 0.5
+  delay_max: 2.0
+  
+  # Adaptive when --stealth flag used
+  stealth_mode:
+    concurrency: 10
+    delay_min: 2.0
+    delay_max: 5.0
+
+# =============================================================================
+# STEALTH SETTINGS
+# =============================================================================
+
+stealth:
+  enabled: false              # Enabled via --stealth flag
+  
+  user_agent_rotation: true
+  request_jitter: true
+  header_spoofing: true
+  
+  # Auto-activated when --stealth used
+  auto_configure: true
+
+# =============================================================================
+# OUTPUT SETTINGS
+# =============================================================================
+
+output:
+  format: "markdown"          # Default: markdown
+  directory: "reports/"
+  timestamp: true
+  
+  # Auto-generated filename: raptor_report_target.com_20240306_143022.md
+  filename_template: "raptor_report_{target}_{date}_{time}.md"
+
+# =============================================================================
+# DATABASE (ZERO-CONFIG)
+# =============================================================================
+
+database:
+  engine: "sqlite"
+  path: "data/raptor.db"
+  encryption: false         # No keys needed
+
+# =============================================================================
+# USAGE EXAMPLES
+# =============================================================================
+
+# Single module:
+#   python3 raptor.py -t target.com --modules xss
+#   python3 raptor.py -t target.com --modules sqli
+#   python3 raptor.py -t target.com --modules idor
+
+# Multiple modules:
+#   python3 raptor.py -t target.com --modules xss,sqli
+#   python3 raptor.py -t target.com --modules recon,server,xss
+
+# All modules:
+#   python3 raptor.py -t target.com --modules all
+
+# With stealth:
+#   python3 raptor.py -t target.com --modules xss --stealth
+
+# With output:
+#   python3 raptor.py -t target.com --modules xss -o xss_report.md
+
+# Verbose:
+#   python3 raptor.py -t target.com --modules xss -v
