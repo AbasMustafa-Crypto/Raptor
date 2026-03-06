@@ -30,8 +30,162 @@ from modules.server_misconfig.header_audit import HeaderAuditor
 from modules.server_misconfig.sensitive_files import SensitiveFileScanner
 from modules.idor.idor_tester import IDORTester
 from modules.brute_force.credential_tester import CredentialTester
+from modules.xss.xss_tester import XSSTester
+from modules.sqli.sqli_tester import SQLiTester
 
 console = Console()
+
+
+def show_welcome():
+    """Show welcome screen when no arguments provided"""
+    welcome_text = """
+[bold cyan]
+██████╗  █████╗ ██████╗ ████████╗ ██████╗ ██████╗ 
+██╔══██╗██╔══██╗██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗
+██████╔╝███████║██████╔╝   ██║   ██║   ██║██████╔╝
+██╔══██╗██╔══██║██╔══██╗   ██║   ██║   ██║██╔══██╗
+██║  ██║██║  ██║██║  ██║   ██║   ╚██████╔╝██║  ██║
+╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝
+[/bold cyan]
+
+[bold yellow]RAPTOR Security Framework v2.0[/bold yellow]
+[dim]Advanced Web Application Penetration Testing[/dim]
+
+[bold green]Quick Start:[/bold green]
+  python3 raptor.py -t [cyan]target.com[/cyan] --modules [green]recon,xss,sqli[/green]
+  python3 raptor.py -t [cyan]target.com[/cyan] --full-scan
+
+[bold green]Available Modules:[/bold green]
+  [cyan]recon[/cyan]  - Reconnaissance & Discovery
+  [cyan]server[/cyan] - Server Misconfiguration
+  [cyan]xss[/cyan]    - Cross-Site Scripting
+  [cyan]sqli[/cyan]   - SQL Injection
+  [cyan]idor[/cyan]   - Insecure Direct Object Reference
+  [cyan]brute[/cyan]  - Brute Force (requires --enable-brute-force)
+
+[bold yellow]Run --help for full documentation:[/bold yellow]
+  python3 raptor.py [bold]--help[/bold]
+"""
+    console.print(welcome_text)
+
+
+def create_help_text():
+    """Create comprehensive help text"""
+    
+    banner = """
+[bold cyan]
+██████╗  █████╗ ██████╗ ████████╗ ██████╗ ██████╗ 
+██╔══██╗██╔══██╗██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗
+██████╔╝███████║██████╔╝   ██║   ██║   ██║██████╔╝
+██╔══██╗██╔══██║██╔══██╗   ██║   ██║   ██║██╔══██╗
+██║  ██║██║  ██║██║  ██║   ██║   ╚██████╔╝██║  ██║
+╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝
+[/bold cyan]
+[bold yellow]Advanced Web Application Security Testing Framework v2.0[/bold yellow]
+"""
+    
+    description = """
+[bold green]RAPTOR[/bold green] is an S-tier automated security testing framework for 
+comprehensive web application assessment and bug bounty hunting.
+"""
+
+    modules_help = """
+[bold cyan]AVAILABLE MODULES[/bold cyan]
+
+[bold]recon[/bold]      Reconnaissance & Discovery
+             • Subdomain enumeration
+             • Technology fingerprinting
+             • Endpoint discovery
+
+[bold]server[/bold]     Server Misconfiguration
+             • Security header audit
+             • Sensitive file exposure
+             • Information disclosure
+
+[bold]xss[/bold]        Cross-Site Scripting
+             • Reflected, Stored, DOM-based XSS
+             • Blind XSS with callbacks
+             • WAF evasion techniques
+
+[bold]sqli[/bold]       SQL Injection
+             • Error-based (MySQL, PostgreSQL, MSSQL, Oracle, SQLite)
+             • Boolean/Time-based blind
+             • UNION-based exploitation
+
+[bold]idor[/bold]       Insecure Direct Object Reference
+             • Sequential ID detection
+             • RESTful endpoint manipulation
+             • Mass assignment testing
+
+[bold]brute[/bold]      Brute Force & Authentication
+             • Credential stuffing detection
+             • Rate limit testing
+             [red](Requires --enable-brute-force)[/red]
+
+[bold]all[/bold]         Run all modules (recon,server,xss,sqli,idor)
+"""
+
+    usage_examples = """
+[bold cyan]USAGE EXAMPLES[/bold cyan]
+
+[dim]# Quick reconnaissance[/dim]
+[bold green]python3 raptor.py -t example.com --modules recon[/bold green]
+
+[dim]# Standard security scan[/dim]
+[bold green]python3 raptor.py -t example.com --modules recon,server,xss,sqli[/bold green]
+
+[dim]# Full penetration test[/dim]
+[bold green]python3 raptor.py -t example.com --full-scan[/bold green]
+
+[dim]# Stealth mode (evasive)[/dim]
+[bold green]python3 raptor.py -t example.com --full-scan --stealth[/bold green]
+
+[dim]# Bug bounty optimized[/dim]
+[bold green]python3 raptor.py -t target.com --modules xss,sqli,idor --stealth[/bold green]
+"""
+
+    options_help = """
+[bold cyan]COMMAND LINE OPTIONS[/bold cyan]
+
+[bold]Required:[/bold]
+  -t, --target [yellow]TEXT[/yellow]     Target domain or URL
+
+[bold]Modules:[/bold]
+  --modules [yellow]LIST[/yellow]       Comma-separated (default: recon,server)
+  --full-scan              Enable all modules
+  --enable-brute-force     Enable brute force [red](use with caution)[/red]
+
+[bold]Configuration:[/bold]
+  --stealth                Enable stealth mode with evasion
+  --scope [yellow]CHOICE[/yellow]       quick/standard/comprehensive/aggressive
+  --evasion [yellow]1-5[/yellow]        WAF evasion level (default: 2)
+  --rate-limit [yellow]NUM[/yellow]      Requests per second (default: 10)
+  --timeout [yellow]SEC[/yellow]         Request timeout (default: 30)
+
+[bold]Auth & Proxy:[/bold]
+  --cookie [yellow]STR[/yellow]          Authentication cookie
+  --auth-header [yellow]STR[/yellow]    Authorization header
+  --proxy [yellow]URL[/yellow]          Proxy URL (e.g., http://127.0.0.1:8080)
+
+[bold]Output:[/bold]
+  --config [yellow]PATH[/yellow]         Config file (default: config/config.yaml)
+  -o, --output [yellow]PATH[/yellow]     Custom report path
+  --format [yellow]CHOICE[/yellow]      json/html/markdown/all
+  -v, --verbose            Verbose output
+  -q, --quiet              Minimal output
+"""
+
+    notes = """
+[bold cyan]IMPORTANT NOTES[/bold cyan]
+
+1. [bold]Legal:[/bold] Only use on systems you own or have explicit permission to test
+2. [bold]Stealth:[/bold] Slower scanning with evasion techniques to avoid detection
+3. [bold]Brute Force:[/bold] Can lock accounts - only use with permission
+4. [bold]Exit Codes:[/bold] 0 = clean, N = number of Critical/High findings
+"""
+    
+    return f"{banner}\n{description}\n{modules_help}\n{usage_examples}\n{options_help}\n{notes}"
+
 
 class Raptor:
     """Main RAPTOR Framework Controller"""
@@ -57,7 +211,7 @@ class Raptor:
         """Execute security scan"""
         
         console.print(Panel.fit(
-            f"[bold cyan]RAPTOR Security Framework v1.0[/bold cyan]\n"
+            f"[bold cyan]RAPTOR Security Framework v2.0[/bold cyan]\n"
             f"Target: [yellow]{target}[/yellow]\n"
             f"Modules: [green]{', '.join(modules)}[/green]\n"
             f"Mode: [red]{'Stealth' if stealth_mode else 'Aggressive'}[/red]",
@@ -76,7 +230,6 @@ class Raptor:
             if 'recon' in modules:
                 task = progress.add_task("[cyan]Running Reconnaissance...", total=None)
                 
-                # Subdomain enumeration
                 async with SubdomainEnumerator(
                     self.config.get('modules', {}).get('recon', {}),
                     self.stealth if stealth_mode else None,
@@ -85,7 +238,6 @@ class Raptor:
                     findings = await module.run(target, **kwargs)
                     all_findings.extend([f.to_dict() for f in findings])
                     
-                # Technology fingerprinting
                 async with TechnologyFingerprinter(
                     self.config.get('modules', {}).get('recon', {}),
                     self.stealth if stealth_mode else None,
@@ -100,7 +252,6 @@ class Raptor:
             if 'server' in modules:
                 task = progress.add_task("[cyan]Auditing Server Configuration...", total=None)
                 
-                # Header audit
                 async with HeaderAuditor(
                     self.config.get('modules', {}).get('server_misconfig', {}),
                     self.stealth if stealth_mode else None,
@@ -109,9 +260,36 @@ class Raptor:
                     findings = await module.run(target, **kwargs)
                     all_findings.extend([f.to_dict() for f in findings])
                     
-                # Sensitive file scan
                 async with SensitiveFileScanner(
                     self.config.get('modules', {}).get('server_misconfig', {}),
+                    self.stealth if stealth_mode else None,
+                    self.db
+                ) as module:
+                    findings = await module.run(target, **kwargs)
+                    all_findings.extend([f.to_dict() for f in findings])
+                    
+                progress.update(task, completed=True)
+                
+            # XSS Module
+            if 'xss' in modules:
+                task = progress.add_task("[cyan]Testing for XSS...", total=None)
+                
+                async with XSSTester(
+                    self.config.get('modules', {}).get('xss', {}),
+                    self.stealth if stealth_mode else None,
+                    self.db
+                ) as module:
+                    findings = await module.run(target, **kwargs)
+                    all_findings.extend([f.to_dict() for f in findings])
+                    
+                progress.update(task, completed=True)
+                
+            # SQLi Module
+            if 'sqli' in modules:
+                task = progress.add_task("[cyan]Testing for SQL Injection...", total=None)
+                
+                async with SQLiTester(
+                    self.config.get('modules', {}).get('sqli', {}),
                     self.stealth if stealth_mode else None,
                     self.db
                 ) as module:
@@ -246,39 +424,112 @@ class Raptor:
                     f.write(f"- **Estimated Bounty:** ${path.get('estimated_bounty')}\n")
                     f.write(f"- **Description:** {path.get('description')}\n\n")
 
+
 def main():
+    # Check if any arguments provided
+    if len(sys.argv) == 1:
+        show_welcome()
+        sys.exit(0)
+    
+    # Custom formatter for rich text help
+    class RichHelpFormatter(argparse.RawDescriptionHelpFormatter):
+        def __init__(self, prog):
+            super().__init__(prog, max_help_position=40, width=100)
+        
+        def format_help(self):
+            return create_help_text()
+    
+    # Create parser with custom formatter
     parser = argparse.ArgumentParser(
         description="RAPTOR - Advanced Web Application Security Testing",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python3 raptor.py -t example.com --full-scan --stealth
-  python3 raptor.py -t example.com --modules recon,server --stealth
-  python3 raptor.py -t example.com --modules idor,brute --enable-brute-force
-        """
+        formatter_class=RichHelpFormatter,
+        add_help=False
     )
     
-    parser.add_argument('-t', '--target', required=True, help='Target domain or URL')
-    parser.add_argument('--modules', default='recon,server', 
-                       help='Comma-separated modules: recon,server,idor,brute,xss,sqli')
-    parser.add_argument('--full-scan', action='store_true', 
-                       help='Enable all modules (except brute force)')
-    parser.add_argument('--stealth', action='store_true', 
-                       help='Enable stealth mode with evasion techniques')
+    # Help argument
+    parser.add_argument('-h', '--help', action='store_true', 
+                       help='Show this help message and exit')
+    
+    # Required arguments
+    parser.add_argument('-t', '--target', 
+                       help='Target domain or URL (e.g., https://example.com or example.com)')
+    
+    # Module selection
+    parser.add_argument('--modules', default='recon,server',
+                       help='Comma-separated list of modules (default: recon,server)')
+    parser.add_argument('--full-scan', action='store_true',
+                       help='Enable all modules: recon,server,xss,sqli,idor (except brute force)')
     parser.add_argument('--enable-brute-force', action='store_true',
-                       help='Enable brute force testing (use with caution)')
+                       help='Enable brute force testing module (requires explicit permission)')
+    
+    # Scan configuration
+    parser.add_argument('--stealth', action='store_true',
+                       help='Enable stealth mode: evasion techniques, jitter, random delays')
+    parser.add_argument('--scope', choices=['quick', 'standard', 'comprehensive', 'aggressive'],
+                       default='standard', help='Scan intensity level (default: standard)')
+    parser.add_argument('--evasion', type=int, choices=[1, 2, 3, 4, 5], default=2,
+                       help='WAF evasion level 1-5, higher = more evasive (default: 2)')
+    parser.add_argument('--rate-limit', type=int, default=10,
+                       help='Maximum requests per second (default: 10)')
+    parser.add_argument('--timeout', type=int, default=30,
+                       help='Request timeout in seconds (default: 30)')
+    parser.add_argument('--max-depth', type=int, default=3,
+                       help='Maximum crawl depth for discovery (default: 3)')
+    
+    # Authentication
+    parser.add_argument('--cookie', help='Authentication cookie string (e.g., "session=abc123")')
+    parser.add_argument('--auth-header', help='Authorization header (e.g., "Bearer token123")')
+    parser.add_argument('--proxy', help='Proxy URL for traffic routing (e.g., http://127.0.0.1:8080)')
+    
+    # Output control
     parser.add_argument('--config', default='config/config.yaml',
-                       help='Path to configuration file')
-    parser.add_argument('-o', '--output', help='Output report path')
+                       help='Path to YAML configuration file (default: config/config.yaml)')
+    parser.add_argument('-o', '--output', help='Custom output path for reports')
+    parser.add_argument('--format', choices=['json', 'html', 'markdown', 'all'], default='markdown',
+                       help='Report output format (default: markdown)')
+    parser.add_argument('--no-color', action='store_true', help='Disable colored terminal output')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging')
+    parser.add_argument('-q', '--quiet', action='store_true', help='Quiet mode (errors only)')
+    
+    # Version
+    parser.add_argument('--version', action='version', version='%(prog)s 2.0')
     
     args = parser.parse_args()
     
+    # Show help if requested
+    if args.help:
+        console.print(create_help_text())
+        sys.exit(0)
+    
+    # Validate target
+    if not args.target:
+        console.print("[red]Error: Target is required. Use -t target.com[/red]")
+        sys.exit(1)
+    
+    if not args.target.startswith(('http://', 'https://')):
+        args.target = f"https://{args.target}"
+    
     # Determine modules
     if args.full_scan:
-        modules = ['recon', 'server', 'idor', 'xss', 'sqli']
+        modules = ['recon', 'server', 'xss', 'sqli', 'idor']
     else:
         modules = [m.strip() for m in args.modules.split(',')]
+        valid_modules = {'recon', 'server', 'xss', 'sqli', 'idor', 'brute', 'all'}
+        invalid = set(modules) - valid_modules
+        if invalid:
+            console.print(f"[red]Error: Invalid modules: {', '.join(invalid)}[/red]")
+            console.print(f"[yellow]Valid modules: {', '.join(valid_modules)}[/yellow]")
+            sys.exit(1)
         
+        if 'all' in modules:
+            modules = ['recon', 'server', 'xss', 'sqli', 'idor']
+    
+    # Check brute force permission
+    if 'brute' in modules and not args.enable_brute_force:
+        console.print("[red]Error: Brute force module requires --enable-brute-force flag[/red]")
+        console.print("[yellow]Warning: Only use with explicit permission![/yellow]")
+        sys.exit(1)
+    
     # Initialize and run
     raptor = Raptor(args.config)
     
@@ -287,7 +538,17 @@ Examples:
             args.target,
             modules,
             stealth_mode=args.stealth,
-            enable_brute_force=args.enable_brute_force
+            scope=args.scope,
+            enable_brute_force=args.enable_brute_force,
+            evasion_level=args.evasion,
+            rate_limit=args.rate_limit,
+            timeout=args.timeout,
+            max_depth=args.max_depth,
+            cookie=args.cookie,
+            auth_header=args.auth_header,
+            proxy=args.proxy,
+            output_format=args.format,
+            output_path=args.output
         ))
         
         # Exit code based on findings
@@ -296,10 +557,11 @@ Examples:
         
     except KeyboardInterrupt:
         console.print("\n[red]Scan interrupted by user[/red]")
-        sys.exit(1)
+        sys.exit(130)
     except Exception as e:
-        console.print(f"\n[red]Error: {e}[/red]")
+        console.print(f"\n[red]Fatal Error: {e}[/red]")
         sys.exit(1)
+
 
 if __name__ == '__main__':
     main()
