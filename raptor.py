@@ -7,20 +7,17 @@ Optimized for Bug Bounty Hunting & Penetration Testing
 import asyncio
 import argparse
 import sys
-try:
-    import yaml
-except ModuleNotFoundError:
-    print("[!] ERROR: PyYAML module not found")
-    print("[*] Fix: pip install pyyaml")
-    print("[*] Or: pip3 install pyyaml")
-    sys.exit(1)
+import os
+
+# ── Zero-dependency bundled libraries (no pip needed) ──────────────────────
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, 'core'))
+
+from _yaml_lite import safe_load as _yaml_safe_load
+from _console  import Console, Table, Panel, Progress, SpinnerColumn, TextColumn, box
+
 from pathlib import Path
 from typing import List, Dict
-from rich.console import Console
-from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.panel import Panel
-from rich import box
 
 # Import core components
 from core.config_manager import ConfigManager
@@ -207,10 +204,10 @@ class Raptor:
         self.findings: List[Dict] = []
         
     def _load_config(self, path: str) -> Dict:
-        """Load configuration from YAML"""
+        """Load configuration from YAML (bundled zero-dep parser)"""
         try:
             with open(path, 'r') as f:
-                return yaml.safe_load(f)
+                return _yaml_safe_load(f.read()) or {}
         except FileNotFoundError:
             console.print(f"[red]Config file not found: {path}[/red]")
             return {}
