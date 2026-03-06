@@ -120,7 +120,27 @@ class TechnologyFingerprinter(BaseModule):
             'Vue.js': {
                 'html': ['v-app', 'vue-', '__VUE__'],
                 'scripts': ['vue.js']
-            }
+            },
+            'Firebase': {
+                'html': ['firebase', '__FIREBASE_APP__', 'firebaseapp.com'],
+                'scripts': ['firebase-app.js', 'firebase.js'],
+                'headers': ['X-Firebase-Appcheck'],
+            },
+            'Google Analytics': {
+                'html': ['gtag(', 'ga(', 'googletagmanager', 'UA-', 'G-'],
+                'scripts': ['gtag/js', 'analytics.js', 'gtm.js'],
+            },
+            'Bootstrap': {
+                'html': ['class="container"', 'class="navbar"', 'bootstrap'],
+                'scripts': ['bootstrap.js', 'bootstrap.min.js'],
+            },
+            'jQuery': {
+                'html': ['jquery'],
+                'scripts': ['jquery.js', 'jquery.min.js'],
+            },
+            'Tailwind CSS': {
+                'html': ['tailwind', 'class="flex ', 'class="grid '],
+            },
         }
         
     def _load_technologies_wordlist(self) -> List[str]:
@@ -288,8 +308,35 @@ class TechnologyFingerprinter(BaseModule):
         # Check additional technologies from wordlist
         detected.update(self._check_wordlist_technologies(text, headers, soup))
 
-        # Filter low confidence
-        return {k: v for k, v in detected.items() if v['confidence'] >= 30}
+        # Always add hosting/infra detection from headers regardless of confidence
+        self._detect_hosting(headers, detected)
+
+        # Filter low confidence — threshold lowered to 15 so partial matches count
+        return {k: v for k, v in detected.items() if v['confidence'] >= 15}
+
+    def _detect_hosting(self, headers: Dict, detected: Dict):
+        """Detect hosting provider and CDN from response headers"""
+        hosting_sigs = {
+            'Firebase': ['x-firebase-appcheck', 'server: Firebase', 'firebase'],
+            'Cloudflare': ['cf-ray', 'cf-cache-status', 'server: cloudflare'],
+            'AWS CloudFront': ['x-amz-cf-id', 'x-amz-cf-pop'],
+            'Google Cloud': ['x-goog-', 'server: ESF', 'via: 1.1 google'],
+            'Vercel': ['x-vercel-id', 'server: Vercel'],
+            'Netlify': ['x-nf-request-id', 'server: Netlify'],
+            'GitHub Pages': ['server: GitHub.com'],
+            'Fastly': ['x-fastly-request-id', 'fastly-restarts'],
+        }
+        headers_lower = {k.lower(): v.lower() for k, v in headers.items()}
+        headers_str = str(headers_lower)
+
+        for provider, sigs in hosting_sigs.items():
+            for sig in sigs:
+                if sig.lower() in headers_str:
+                    if provider not in detected:
+                        detected[provider] = {'confidence': 0, 'version': None, 'urls': []}
+                    detected[provider]['confidence'] += 40
+                    break
+
 
     def _check_wordlist_technologies(self, text: str, headers: Dict, soup) -> Dict:
         """Check for additional technologies from wordlist"""
