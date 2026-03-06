@@ -6,9 +6,7 @@ from pathlib import Path
 class CredentialTester(BaseModule):
     """Test for brute force vulnerabilities with stealth"""
     
-    def __init__(self, config, stealth=None, db=None, graph_manager=None):
-        super().__init__(config, stealth, db)
-        self.graph = graph_manager
+    def __init__(self, config, stealth=None, db=None):
         super().__init__(config, stealth, db)
         self.max_attempts = config.get('max_attempts', 50)  # Increased for actual testing
         self.delay = config.get('delay_between', 1)
@@ -38,37 +36,81 @@ class CredentialTester(BaseModule):
         return self.findings
         
     async def _discover_login_forms(self, target: str) -> List[Dict]:
-        """Discover login endpoints"""
+        """Discover login endpoints — always tests target + common paths"""
+        import re
         endpoints = []
-        
+        seen_urls = set()
+
         if not target.startswith(('http://', 'https://')):
             target = f"https://{target}"
-            
-        common_paths = [
+
+        from urllib.parse import urlparse, urljoin
+        base = f"{urlparse(target).scheme}://{urlparse(target).netloc}"
+
+        # Always check the target URL itself first
+        candidate_urls = [target]
+
+        # Common login paths appended to base domain
+        for path in [
             '/login', '/signin', '/auth', '/authenticate',
-            '/admin/login', '/user/login', '/account/login',
+            '/admin', '/admin/login', '/user/login', '/account/login',
             '/api/login', '/api/auth', '/api/token',
             '/wp-login.php', '/administrator/index.php',
-            '/admin.html', '/login.html', '/signin.html'
-        ]
-        
-        for path in common_paths:
-            url = f"{target}{path}"
-            response = await self._make_request(url)
-            
-            if response and response.status == 200:
+            '/admin.html', '/login.html', '/signin.html',
+        ]:
+            candidate_urls.append(base + path)
+
+        for url in candidate_urls:
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            try:
+                response = await self._make_request(url)
+                if not response or response.status not in [200, 301, 302]:
+                    continue
+
                 text = await response.text()
-                
-                # Check for login indicators
-                indicators = ['password', 'login', 'username', 'email', 'sign in', 'log in']
-                if any(ind in text.lower() for ind in indicators):
-                    endpoints.append({
-                        'url': url,
-                        'type': 'form',
-                        'fields': self._extract_form_fields(text)
-                    })
-                    
-        return endpoints
+                indicators = ['password', 'login', 'username', 'email', 'sign in', 'log in',
+                              'signin', 'passwd', 'credentials']
+
+                if not any(ind in text.lower() for ind in indicators):
+                    continue
+
+                fields = self._extract_form_fields(text)
+
+                # If form has an action URL, use that as the POST target
+                post_url = url
+                if fields.get('action'):
+                    action = fields['action']
+                    if action.startswith('http'):
+                        post_url = action
+                    elif action.startswith('/'):
+                        post_url = base + action
+                    else:
+                        post_url = urljoin(url, action)
+
+                endpoints.append({
+                    'url': post_url,
+                    'type': 'form',
+                    'fields': fields,
+                    'discovered_at': url
+                })
+                self.logger.info(f"Found login endpoint: {post_url} (from {url})")
+
+            except Exception as e:
+                self.logger.debug(f"Login discovery error on {url}: {e}")
+
+        # Deduplicate by post URL
+        seen = set()
+        unique = []
+        for ep in endpoints:
+            if ep['url'] not in seen:
+                seen.add(ep['url'])
+                unique.append(ep)
+
+        return unique
+
         
     def _extract_form_fields(self, html: str) -> Dict:
         """Extract form fields from HTML"""
@@ -187,7 +229,10 @@ class CredentialTester(BaseModule):
                     is_success = await self._check_login_success(response, url)
                     
                     if is_success:
-                        self.logger.info(f"\n[!] CREDENTIALS FOUND: {username}:{password} @ {url}")
+                        self.logger.info(f"\n{'='*50}")
+                        self.logger.info(f"[!!!] CREDENTIALS FOUND: {username}:{password}")
+                        self.logger.info(f"[!!!] URL: {url}")
+                        self.logger.info(f"{'='*50}\n")
                         successful_logins.append({
                             'username': username,
                             'password': password,
@@ -196,16 +241,16 @@ class CredentialTester(BaseModule):
                         
                         finding = Finding(
                             module='brute_force',
-                            title=f'Successful Brute Force Login: {username}:{password}',
+                            title=f'[CREDENTIALS FOUND] {username}:{password} @ {url}',
                             severity='Critical',
-                            description=f'Successfully brute forced credentials on {url}',
+                            description=f'Successfully brute forced login at {url}\nUsername: {username}\nPassword: {password}\nAttempts: {attempt_count}',
                             evidence={
                                 'username': username,
                                 'password': password,
                                 'url': url,
                                 'attempts': attempt_count
                             },
-                            poc=f"POST {url} with {username_field}={username} & {password_field}={password}",
+                            poc=f"curl -X POST '{url}' -d '{username_field}={username}&{password_field}={password}'",
                             remediation='Implement strong password policy, rate limiting, and account lockout',
                             cvss_score=9.8,
                             bounty_score=5000,
