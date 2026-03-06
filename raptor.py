@@ -25,10 +25,7 @@ from core.stealth_manager import StealthManager
 from core.database_manager import DatabaseManager
 from core.report_manager import ReportManager
 from core.graph_manager import GraphManager
-try:
-    from core.correlator import AttackPathCorrelator
-except ImportError:
-    AttackPathCorrelator = None
+from core.correlator import AttackPathCorrelator
 
 # Import modules
 from modules.recon.subdomain_enum import SubdomainEnumerator
@@ -45,154 +42,76 @@ console = Console()
 
 def show_welcome():
     """Show welcome screen when no arguments provided"""
-    welcome_text = """
-[bold cyan]
-██████╗  █████╗ ██████╗ ████████╗ ██████╗ ██████╗ 
+    console.print("""
+[bold cyan]██████╗  █████╗ ██████╗ ████████╗ ██████╗ ██████╗ 
 ██╔══██╗██╔══██╗██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗
 ██████╔╝███████║██████╔╝   ██║   ██║   ██║██████╔╝
 ██╔══██╗██╔══██║██╔══██╗   ██║   ██║   ██║██╔══██╗
 ██║  ██║██║  ██║██║  ██║   ██║   ╚██████╔╝██║  ██║
-╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝
-[/bold cyan]
+╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝[/bold cyan]
 
 [bold yellow]RAPTOR Security Framework v2.0[/bold yellow]
-[dim]Advanced Web Application Penetration Testing[/dim]
+[dim]Full power. No options required.[/dim]
 
 [bold green]Quick Start:[/bold green]
-  python3 raptor.py -t [cyan]target.com[/cyan] --modules [green]recon,xss,sqli[/green]
-  python3 raptor.py -t [cyan]target.com[/cyan] --full-scan
+  python3 raptor.py -t [cyan]target.com[/cyan]
+  python3 raptor.py -t [cyan]target.com[/cyan] --modules [green]xss,sqli,idor[/green]
+  python3 raptor.py -t [cyan]target.com[/cyan] --modules [green]brute[/green] --enable-brute-force
 
-[bold green]Available Modules:[/bold green]
-  [cyan]recon[/cyan]  - Reconnaissance & Discovery
-  [cyan]server[/cyan] - Server Misconfiguration
-  [cyan]xss[/cyan]    - Cross-Site Scripting
-  [cyan]sqli[/cyan]   - SQL Injection
-  [cyan]idor[/cyan]   - Insecure Direct Object Reference
-  [cyan]brute[/cyan]  - Brute Force (requires --enable-brute-force)
+[bold green]Modules:[/bold green]
+  [cyan]recon[/cyan]   Reconnaissance & Discovery
+  [cyan]server[/cyan]  Server Misconfiguration
+  [cyan]xss[/cyan]     Cross-Site Scripting
+  [cyan]sqli[/cyan]    SQL Injection
+  [cyan]idor[/cyan]    Insecure Direct Object Reference
+  [cyan]brute[/cyan]   Brute Force (--enable-brute-force)
 
-[bold yellow]Run --help for full documentation:[/bold yellow]
-  python3 raptor.py [bold]--help[/bold]
-"""
-    console.print(welcome_text)
+  python3 raptor.py [bold]--help[/bold] for full documentation
+""")
 
 
 def create_help_text():
-    """Create comprehensive help text"""
-    
-    banner = """
-[bold cyan]
-██████╗  █████╗ ██████╗ ████████╗ ██████╗ ██████╗ 
+    """Return help text — rendered via console.print so markup works"""
+    return """
+[bold cyan]██████╗  █████╗ ██████╗ ████████╗ ██████╗ ██████╗ 
 ██╔══██╗██╔══██╗██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗
 ██████╔╝███████║██████╔╝   ██║   ██║   ██║██████╔╝
 ██╔══██╗██╔══██║██╔══██╗   ██║   ██║   ██║██╔══██╗
 ██║  ██║██║  ██║██║  ██║   ██║   ╚██████╔╝██║  ██║
-╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝
-[/bold cyan]
-[bold yellow]Advanced Web Application Security Testing Framework v2.0[/bold yellow]
-"""
-    
-    description = """
-[bold green]RAPTOR[/bold green] is an S-tier automated security testing framework for 
-comprehensive web application assessment and bug bounty hunting.
-"""
+╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝[/bold cyan]
+[bold yellow]RAPTOR Security Framework v2.0 — Full Power by Default[/bold yellow]
 
-    modules_help = """
-[bold cyan]AVAILABLE MODULES[/bold cyan]
+[bold cyan]MODULES[/bold cyan]
+  [cyan]recon[/cyan]   Subdomain enumeration, tech fingerprinting, endpoint discovery
+  [cyan]server[/cyan]  Security headers, sensitive file exposure, info disclosure
+  [cyan]xss[/cyan]     Reflected, DOM, Blind XSS — all contexts, WAF bypass
+  [cyan]sqli[/cyan]    Error, Boolean, Time-based, UNION — all DB types
+  [cyan]idor[/cyan]    Sequential IDs, REST manipulation, mass assignment
+  [cyan]brute[/cyan]   Credential brute force (requires --enable-brute-force)
+  [cyan]all[/cyan]     Run everything except brute
 
-[bold]recon[/bold]      Reconnaissance & Discovery
-             • Subdomain enumeration
-             • Technology fingerprinting
-             • Endpoint discovery
+[bold cyan]USAGE[/bold cyan]
+  [green]python3 raptor.py -t target.com[/green]
+  [green]python3 raptor.py -t target.com --modules xss,sqli,idor[/green]
+  [green]python3 raptor.py -t target.com --full-scan[/green]
+  [green]python3 raptor.py -t target.com --modules brute --enable-brute-force[/green]
 
-[bold]server[/bold]     Server Misconfiguration
-             • Security header audit
-             • Sensitive file exposure
-             • Information disclosure
+[bold cyan]OPTIONS[/bold cyan]
+  [yellow]-t, --target[/yellow]            Target URL or domain (required)
+  [yellow]--modules[/yellow]               Comma-separated modules (default: all)
+  [yellow]--full-scan[/yellow]             Run all modules
+  [yellow]--enable-brute-force[/yellow]    Enable brute force module
+  [yellow]--stealth[/yellow]               Add delays between requests
+  [yellow]--cookie[/yellow]                Auth cookie string
+  [yellow]--auth-header[/yellow]           Authorization header value
+  [yellow]--proxy[/yellow]                 Proxy URL (e.g. http://127.0.0.1:8080)
+  [yellow]-o, --output[/yellow]            Custom report output path
+  [yellow]--config[/yellow]                Config file path (default: config/config.yaml)
+  [yellow]-v, --verbose[/yellow]           Verbose output
 
-[bold]xss[/bold]        Cross-Site Scripting
-             • Reflected, Stored, DOM-based XSS
-             • Blind XSS with callbacks
-             • WAF evasion techniques
-
-[bold]sqli[/bold]       SQL Injection
-             • Error-based (MySQL, PostgreSQL, MSSQL, Oracle, SQLite)
-             • Boolean/Time-based blind
-             • UNION-based exploitation
-
-[bold]idor[/bold]       Insecure Direct Object Reference
-             • Sequential ID detection
-             • RESTful endpoint manipulation
-             • Mass assignment testing
-
-[bold]brute[/bold]      Brute Force & Authentication
-             • Credential stuffing detection
-             • Rate limit testing
-             [red](Requires --enable-brute-force)[/red]
-
-[bold]all[/bold]         Run all modules (recon,server,xss,sqli,idor)
+[bold red]Only test systems you own or have explicit permission to test.[/bold red]
 """
 
-    usage_examples = """
-[bold cyan]USAGE EXAMPLES[/bold cyan]
-
-[dim]# Quick reconnaissance[/dim]
-[bold green]python3 raptor.py -t example.com --modules recon[/bold green]
-
-[dim]# Standard security scan[/dim]
-[bold green]python3 raptor.py -t example.com --modules recon,server,xss,sqli[/bold green]
-
-[dim]# Full penetration test[/dim]
-[bold green]python3 raptor.py -t example.com --full-scan[/bold green]
-
-[dim]# Stealth mode (evasive)[/dim]
-[bold green]python3 raptor.py -t example.com --full-scan --stealth[/bold green]
-
-[dim]# Bug bounty optimized[/dim]
-[bold green]python3 raptor.py -t target.com --modules xss,sqli,idor --stealth[/bold green]
-"""
-
-    options_help = """
-[bold cyan]COMMAND LINE OPTIONS[/bold cyan]
-
-[bold]Required:[/bold]
-  -t, --target [yellow]TEXT[/yellow]     Target domain or URL
-
-[bold]Modules:[/bold]
-  --modules [yellow]LIST[/yellow]       Comma-separated (default: recon,server)
-  --full-scan              Enable all modules
-  --enable-brute-force     Enable brute force [red](use with caution)[/red]
-
-[bold]Configuration:[/bold]
-  --stealth                Enable stealth mode with evasion
-  --scope [yellow]CHOICE[/yellow]       quick/standard/comprehensive/aggressive
-  --evasion [yellow]1-5[/yellow]        WAF evasion level (default: 2)
-  --rate-limit [yellow]NUM[/yellow]      Requests per second (default: 10)
-  --timeout [yellow]SEC[/yellow]         Request timeout (default: 30)
-  --max-depth [yellow]NUM[/yellow]         Maximum crawl depth (default: 3)
-
-[bold]Auth & Proxy:[/bold]
-  --cookie [yellow]STR[/yellow]          Authentication cookie
-  --auth-header [yellow]STR[/yellow]    Authorization header
-  --proxy [yellow]URL[/yellow]          Proxy URL (e.g., http://127.0.0.1:8080)
-
-[bold]Output:[/bold]
-  --config [yellow]PATH[/yellow]         Config file (default: config/config.yaml)
-  -o, --output [yellow]PATH[/yellow]     Custom report path
-  --format [yellow]CHOICE[/yellow]      json/html/markdown/all
-  -v, --verbose            Verbose output
-  -q, --quiet              Minimal output
-"""
-
-    notes = """
-[bold cyan]IMPORTANT NOTES[/bold cyan]
-
-1. [bold]Legal:[/bold] Only use on systems you own or have explicit permission to test
-2. [bold]Stealth:[/bold] Slower scanning with evasion techniques to avoid detection
-3. [bold]Brute Force:[/bold] Can lock accounts - only use with permission
-4. [bold]Exit Codes:[/bold] 0 = clean, N = number of Critical/High findings
-"""
-    
-    return f"{banner}\n{description}\n{modules_help}\n{usage_examples}\n{options_help}\n{notes}"
 
 
 class Raptor:
@@ -460,135 +379,82 @@ class Raptor:
 
 
 def main():
-    # Check if any arguments provided
+    # No args → show welcome
     if len(sys.argv) == 1:
         show_welcome()
         sys.exit(0)
-    
-    # Custom formatter for rich text help
-    class RichHelpFormatter(argparse.RawDescriptionHelpFormatter):
-        def __init__(self, prog):
-            super().__init__(prog, max_help_position=40, width=100)
-        
-        def format_help(self):
-            return create_help_text()
-    
-    # Create parser with custom formatter
+
     parser = argparse.ArgumentParser(
         description="RAPTOR - Advanced Web Application Security Testing",
-        formatter_class=RichHelpFormatter,
         add_help=False
     )
-    
-    # Help argument
-    parser.add_argument('-h', '--help', action='store_true', 
-                       help='Show this help message and exit')
-    
-    # Required arguments
-    parser.add_argument('-t', '--target', 
-                       help='Target domain or URL (e.g., https://example.com or example.com)')
-    
-    # Module selection
-    parser.add_argument('--modules', default='recon,server',
-                       help='Comma-separated list of modules (default: recon,server)')
-    parser.add_argument('--full-scan', action='store_true',
-                       help='Enable all modules: recon,server,xss,sqli,idor (except brute force)')
-    parser.add_argument('--enable-brute-force', action='store_true',
-                       help='Enable brute force testing module (requires explicit permission)')
-    
-    # Scan configuration
-    parser.add_argument('--stealth', action='store_true',
-                       help='Enable stealth mode: evasion techniques, jitter, random delays')
-    parser.add_argument('--scope', choices=['quick', 'standard', 'comprehensive', 'aggressive'],
-                       default='standard', help='Scan intensity level (default: standard)')
-    parser.add_argument('--evasion', type=int, choices=[1, 2, 3, 4, 5], default=2,
-                       help='WAF evasion level 1-5, higher = more evasive (default: 2)')
-    parser.add_argument('--rate-limit', type=int, default=10,
-                       help='Maximum requests per second (default: 10)')
-    parser.add_argument('--timeout', type=int, default=30,
-                       help='Request request timeout in seconds (default: 30)')
-    parser.add_argument('--max-depth', type=int, default=3,
-                       help='Maximum crawl depth for discovery (default: 3)')
-    
-    # Authentication
-    parser.add_argument('--cookie', help='Authentication cookie string (e.g., "session=abc123")')
-    parser.add_argument('--auth-header', help='Authorization header (e.g., "Bearer token123")')
-    parser.add_argument('--proxy', help='Proxy URL for traffic routing (e.g., http://127.0.0.1:8080)')
-    
-    # Output control
-    parser.add_argument('--config', default='config/config.yaml',
-                       help='Path to YAML configuration file (default: config/config.yaml)')
-    parser.add_argument('-o', '--output', help='Custom output path for reports')
-    parser.add_argument('--format', choices=['json', 'html', 'markdown', 'all'], default='markdown',
-                       help='Report output format (default: markdown)')
-    parser.add_argument('--no-color', action='store_true', help='Disable colored terminal output')
-    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging')
-    parser.add_argument('-q', '--quiet', action='store_true', help='Quiet mode (errors only)')
-    
-    # Version
-    parser.add_argument('--version', action='version', version='%(prog)s 2.0')
-    
+
+    parser.add_argument('-h', '--help', action='store_true')
+    parser.add_argument('-t', '--target')
+    parser.add_argument('--modules', default='recon,server,xss,sqli,idor')
+    parser.add_argument('--full-scan', action='store_true')
+    parser.add_argument('--enable-brute-force', action='store_true')
+    parser.add_argument('--stealth', action='store_true')
+    parser.add_argument('--cookie', default=None)
+    parser.add_argument('--auth-header', default=None)
+    parser.add_argument('--proxy', default=None)
+    parser.add_argument('--config', default='config/config.yaml')
+    parser.add_argument('-o', '--output', default=None)
+    parser.add_argument('-v', '--verbose', action='store_true')
+    parser.add_argument('--version', action='version', version='RAPTOR 2.0')
+
     args = parser.parse_args()
-    
-    # Show help if requested
+
     if args.help:
         console.print(create_help_text())
         sys.exit(0)
-    
-    # Validate target
+
     if not args.target:
         console.print("[red]Error: Target is required. Use -t target.com[/red]")
         sys.exit(1)
-    
+
     if not args.target.startswith(('http://', 'https://')):
         args.target = f"https://{args.target}"
-    
-    # Determine modules
-    if args.full_scan:
+
+    # Modules — default is ALL, full power
+    if args.full_scan or 'all' in args.modules:
         modules = ['recon', 'server', 'xss', 'sqli', 'idor']
     else:
         modules = [m.strip() for m in args.modules.split(',')]
-        valid_modules = {'recon', 'server', 'xss', 'sqli', 'idor', 'brute', 'all'}
-        invalid = set(modules) - valid_modules
+        valid = {'recon', 'server', 'xss', 'sqli', 'idor', 'brute', 'all'}
+        invalid = set(modules) - valid
         if invalid:
             console.print(f"[red]Error: Invalid modules: {', '.join(invalid)}[/red]")
-            console.print(f"[yellow]Valid modules: {', '.join(valid_modules)}[/yellow]")
+            console.print(f"[yellow]Valid: {', '.join(valid)}[/yellow]")
             sys.exit(1)
-        
-        if 'all' in modules:
-            modules = ['recon', 'server', 'xss', 'sqli', 'idor']
-    
-    # Check brute force permission
+
     if 'brute' in modules and not args.enable_brute_force:
-        console.print("[red]Error: Brute force module requires --enable-brute-force flag[/red]")
-        console.print("[yellow]Warning: Only use with explicit permission![/yellow]")
+        console.print("[red]Brute force requires --enable-brute-force flag[/red]")
         sys.exit(1)
-    
-    # Initialize and run
+
     raptor = Raptor(args.config)
-    
+
     try:
         findings = asyncio.run(raptor.run_scan(
             args.target,
             modules,
             stealth_mode=args.stealth,
-            scope=args.scope,
+            scope='aggressive',          # always max power
             enable_brute_force=args.enable_brute_force,
-            evasion_level=args.evasion,
-            rate_limit=args.rate_limit,
-            timeout=args.timeout,
-            max_depth=args.max_depth,
+            evasion_level=5,             # always max evasion
+            rate_limit=50,               # max concurrency
+            timeout=30,
+            max_depth=5,
             cookie=args.cookie,
             auth_header=args.auth_header,
             proxy=args.proxy,
-            output_format=args.format,
+            output_format='markdown',
             output_path=args.output
         ))
-        
-        # Exit code based on findings
+
         critical_high = [f for f in findings if f.get('severity') in ['Critical', 'High']]
         sys.exit(len(critical_high))
-        
+
     except KeyboardInterrupt:
         console.print("\n[red]Scan interrupted by user[/red]")
         sys.exit(130)
