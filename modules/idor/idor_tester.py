@@ -216,7 +216,7 @@ class IDORTester(BaseModule):
         """Crawl target and discover potential IDOR endpoints"""
         to_visit = {target}
         visited = set()
-        max_pages = 50 if scope == 'quick' else 200 if scope == 'standard' else 500
+        max_pages = 10 if scope == 'quick' else 30 if scope == 'standard' else 80
         
         # Common API paths to test
         api_paths = [
