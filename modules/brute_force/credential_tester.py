@@ -196,7 +196,7 @@ class CredentialTester(BaseModule):
                         
                         finding = Finding(
                             module='brute_force',
-                            title=f'Successful Brute Force Login: {username}:{password}',,
+                            title=f'Successful Brute Force Login: {username}:{password}',
                             severity='Critical',
                             description=f'Successfully brute forced credentials on {url}',
                             evidence={
