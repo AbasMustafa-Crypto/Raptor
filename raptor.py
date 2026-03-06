@@ -25,7 +25,10 @@ from core.stealth_manager import StealthManager
 from core.database_manager import DatabaseManager
 from core.report_manager import ReportManager
 from core.graph_manager import GraphManager
-from core.correlator import AttackPathCorrelator
+try:
+    from core.correlator import AttackPathCorrelator
+except ImportError:
+    AttackPathCorrelator = None
 
 # Import modules
 from modules.recon.subdomain_enum import SubdomainEnumerator
