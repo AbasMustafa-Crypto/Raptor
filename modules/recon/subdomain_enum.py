@@ -4,8 +4,6 @@ import json
 import shutil
 from typing import List, Set, Dict
 from core.base_module import BaseModule, Finding
-import aiohttp
-
 class SubdomainEnumerator(BaseModule):
     """Subdomain enumeration using multiple tools"""
     
@@ -187,59 +185,47 @@ class SubdomainEnumerator(BaseModule):
                     break
         
     async def _check_ct_logs(self, target: str, existing_subdomains: Set[str]):
-        """Check Certificate Transparency logs"""
+        """Check Certificate Transparency logs (zero-dep, uses BaseModule._make_request)"""
         try:
             url = f"https://crt.sh/?q=%.{target}&output=json"
-            
-            # Use a fresh session for CT log check to avoid connection issues
-            timeout = aiohttp.ClientTimeout(total=15, connect=5)
-            
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            response = await self._make_request(url)
+
+            if not response:
+                self.logger.warning("CT log check: no response from crt.sh")
+                return
+
+            if response.status == 200:
                 try:
-                    async with session.get(url, ssl=False) as response:
-                        if response.status == 200:
-                            try:
-                                data = await response.json()
-                                
-                                # Extract unique subdomains from CT logs
-                                ct_subdomains = set()
-                                for entry in data:
-                                    name = entry.get('name_value', '').strip()
-                                    if name and '*' not in name:
-                                        ct_subdomains.add(name)
-                                        
-                                self.logger.info(f"Found {len(ct_subdomains)} subdomains in CT logs")
-                                
-                                # Add to existing set
-                                existing_subdomains.update(ct_subdomains)
-                                
-                                # Find new subdomains not discovered by other tools
-                                new_subdomains = ct_subdomains - self.resolved_subdomains
-                                
-                                if new_subdomains:
-                                    finding = Finding(
-                                        module='recon',
-                                        title=f'Hidden Subdomains in CT Logs: {len(new_subdomains)}',
-                                        severity='Low',
-                                        description=f'Found {len(new_subdomains)} subdomains only in Certificate Transparency logs',
-                                        evidence={'subdomains': list(new_subdomains)[:10]},
-                                        poc=f"Check: https://crt.sh/?q=%.{target}",
-                                        remediation='Review all subdomains for proper security controls',
-                                        cvss_score=3.7,
-                                        bounty_score=100,
-                                        target=target
-                                    )
-                                    self.add_finding(finding)
-                            except Exception as e:
-                                self.logger.warning(f"Failed to parse CT log response: {e}")
-                        else:
-                            self.logger.warning(f"CT log check returned status {response.status}")
-                except aiohttp.ClientConnectorError as e:
-                    self.logger.warning(f"Cannot connect to crt.sh: {e}")
-                except asyncio.TimeoutError:
-                    self.logger.warning("CT log check timed out")
+                    data = await response.json()
+
+                    ct_subdomains = set()
+                    for entry in data:
+                        name = entry.get('name_value', '').strip()
+                        if name and '*' not in name:
+                            ct_subdomains.add(name)
+
+                    self.logger.info(f"Found {len(ct_subdomains)} subdomains in CT logs")
+                    existing_subdomains.update(ct_subdomains)
+
+                    new_subdomains = ct_subdomains - self.resolved_subdomains
+                    if new_subdomains:
+                        finding = Finding(
+                            module='recon',
+                            title=f'Hidden Subdomains in CT Logs: {len(new_subdomains)}',
+                            severity='Low',
+                            description=f'Found {len(new_subdomains)} subdomains only in Certificate Transparency logs',
+                            evidence={'subdomains': list(new_subdomains)[:10]},
+                            poc=f"Check: https://crt.sh/?q=%.{target}",
+                            remediation='Review all subdomains for proper security controls',
+                            cvss_score=3.7,
+                            bounty_score=100,
+                            target=target
+                        )
+                        self.add_finding(finding)
                 except Exception as e:
-                    self.logger.warning(f"CT log request failed: {e}")
-                    
+                    self.logger.warning(f"Failed to parse CT log response: {e}")
+            else:
+                self.logger.warning(f"CT log check returned status {response.status}")
+
         except Exception as e:
             self.logger.error(f"CT log check failed: {e}")
