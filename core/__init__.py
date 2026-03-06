@@ -2,7 +2,10 @@ from .base_module import BaseModule, Finding
 from .config_manager import ConfigManager
 from .database_manager import DatabaseManager
 from .report_manager import ReportManager
-from .correlator import AttackPathCorrelator
+try:
+    from .correlator import AttackPathCorrelator
+except ImportError:
+    AttackPathCorrelator = None
 from .graph_manager import GraphManager
 
 # StealthManager lives in its own file; imported lazily to avoid missing-file errors
