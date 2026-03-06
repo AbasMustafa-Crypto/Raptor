@@ -1,52 +1,42 @@
-from typing import List, Dict
-import networkx as nx
-from collections import defaultdict
+"""
+config_manager.py  –  Zero-dependency config loader.
+Uses the bundled _yaml_lite parser instead of PyYAML.
+"""
 
-class AttackPathCorrelator:
-    """Correlate findings into attack paths"""
-    
-    def __init__(self, db_manager):
-        self.db = db_manager
-        self.graph = nx.DiGraph()
-        
-    def analyze(self, findings: List[Dict]) -> List[Dict]:
-        """Analyze findings and identify attack chains"""
-        attack_paths = []
-        
-        # Group findings by target
-        by_target = defaultdict(list)
-        for f in findings:
-            by_target[f.get('target')].append(f)
-            
-        # Look for common attack patterns
-        for target, target_findings in by_target.items():
-            # Pattern 1: Recon -> Misconfig -> Injection
-            recon = [f for f in target_findings if f.get('module') == 'recon']
-            misconfig = [f for f in target_findings if f.get('module') == 'server_misconfig']
-            idor = [f for f in target_findings if f.get('module') == 'idor']
-            
-            if recon and misconfig and idor:
-                path = {
-                    'name': 'Full Application Compromise',
-                    'description': f'Staging environment found with misconfigurations allowing IDOR exploitation',
-                    'chain': [f.get('id') for f in recon + misconfig + idor],
-                    'estimated_bounty': 5000,
-                    'complexity': 'Medium',
-                    'findings': recon[:1] + misconfig[:1] + idor[:1]
-                }
-                attack_paths.append(path)
-                
-            # Pattern 2: Missing headers + IDOR
-            headers = [f for f in target_findings if 'Header' in f.get('title', '')]
-            if headers and idor:
-                path = {
-                    'name': 'Session Hijacking to IDOR',
-                    'description': 'Missing security headers combined with IDOR vulnerability',
-                    'chain': [],
-                    'estimated_bounty': 3000,
-                    'complexity': 'Low',
-                    'findings': headers[:1] + idor[:1]
-                }
-                attack_paths.append(path)
-                
-        return attack_paths
+import os
+import sys
+
+# Allow running from project root or from core/
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from _yaml_lite import safe_load as yaml_load
+from typing import Dict
+
+
+class ConfigManager:
+    """Manage configuration loading and validation."""
+
+    def __init__(self, config_path: str):
+        self.config_path = config_path
+        self.config = self._load()
+
+    def _load(self) -> Dict:
+        """Load configuration from YAML file."""
+        try:
+            with open(self.config_path, 'r') as f:
+                return yaml_load(f.read()) or {}
+        except FileNotFoundError:
+            return {}
+
+    def get(self, key: str, default=None):
+        """Get configuration value using dot-notation key."""
+        keys = key.split('.')
+        value = self.config
+        for k in keys:
+            if isinstance(value, dict):
+                value = value.get(k, default)
+            else:
+                return default
+        return value
