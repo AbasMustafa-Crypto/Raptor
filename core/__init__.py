@@ -12,4 +12,5 @@ __all__ = [
     'StealthManager',
     'ReportManager',
     'AttackPathCorrelator'
+    'GraphManager',
 ]
