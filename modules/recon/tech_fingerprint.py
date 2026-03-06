@@ -10,32 +10,42 @@ class _MiniSoup(HTMLParser):
 
     def __init__(self, html_text: str):
         super().__init__()
-        self.tags: List[Dict] = []        # list of {tag, attrs_dict}
-        self._current = []
+        self.tags: List[Dict] = []
         self.feed(html_text)
 
     def handle_starttag(self, tag: str, attrs):
         self.tags.append({'tag': tag.lower(), 'attrs': dict(attrs)})
 
-    # ── BS4-compatible helpers ──────────────────────────────────────────────
+    def find_all(self, tag: str, attrs: Dict = None, **kwargs):
+        """
+        BS4-compatible find_all.
+        Supports:
+          find_all('script', src=True)          → tags that HAVE a src attr
+          find_all('link',   href=True)          → tags that HAVE an href attr
+          find_all('meta',   attrs={'name': 'generator'})
+        """
+        # merge kwargs into attrs filter
+        attr_filter = dict(attrs or {})
+        attr_filter.update(kwargs)
 
-    def find_all(self, tag: str, attrs: Dict = None, src: bool = False):
-        """Return list of tag-dicts matching tag name and optional attr filter."""
         results = []
         for t in self.tags:
             if t['tag'] != tag.lower():
                 continue
-            if attrs:
-                match = all(
-                    re.search(str(v), str(t['attrs'].get(k, '')), re.I)
-                    if isinstance(v, str) else t['attrs'].get(k) == v
-                    for k, v in attrs.items()
-                )
-                if not match:
-                    continue
-            if src and 'src' not in t['attrs']:
-                continue
-            results.append(_TagProxy(t['attrs']))
+            match = True
+            for k, v in attr_filter.items():
+                actual = t['attrs'].get(k)
+                if v is True:          # just requires the attribute to exist
+                    if actual is None:
+                        match = False; break
+                elif v is False:       # requires the attribute to be absent
+                    if actual is not None:
+                        match = False; break
+                else:                  # value match (regex-friendly)
+                    if not re.search(str(v), str(actual or ''), re.I):
+                        match = False; break
+            if match:
+                results.append(_TagProxy(t['attrs']))
         return results
 
 
@@ -59,6 +69,7 @@ class TechnologyFingerprinter(BaseModule):
     
     def __init__(self, config, stealth=None, db=None, graph_manager=None):
         super().__init__(config, stealth, db)
+        self.graph = graph_manager
         self.tech_signatures = self._load_signatures()
         self.additional_technologies = self._load_technologies_wordlist()
         self.wordlist_path = config.get('wordlist_path', 'wordlists')
