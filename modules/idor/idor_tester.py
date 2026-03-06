@@ -471,3 +471,181 @@ by simply incrementing or decrementing the ID value.
 ### Evidence
 ```json
 {json.dumps(evidence, indent=2)}
+```
+""",
+            evidence=evidence,
+            poc=f"Enumerate IDs: curl 'https://target.com/api/resource/[1-100]'",
+            remediation='Implement proper authorization checks. Use UUIDs instead of sequential IDs. Validate that the authenticated user owns the requested resource.',
+            cvss_score=9.1 if severity == 'Critical' else 7.5,
+            bounty_score=bounty,
+            target=''
+        )
+        self.findings.append(finding)
+        if self.db:
+            self.db.save_finding(finding)
+
+    async def _test_sequential_ids(self):
+        """Test sequential ID manipulation on discovered endpoints"""
+        for endpoint in self.discovered_endpoints:
+            if not endpoint.param_value.isdigit():
+                continue
+
+            base_id = int(endpoint.param_value)
+            test_ids = list(range(max(1, base_id - 5), base_id)) + list(range(base_id + 1, base_id + 6))
+
+            for test_id in test_ids:
+                combo = f"{endpoint.url}:{test_id}"
+                if combo in self.tested_combinations:
+                    continue
+                self.tested_combinations.add(combo)
+
+                try:
+                    parsed = urlparse(endpoint.url)
+                    params = parse_qs(parsed.query)
+
+                    if endpoint.param_name and endpoint.param_name in params:
+                        new_params = {k: v for k, v in params.items()}
+                        new_params[endpoint.param_name] = [str(test_id)]
+                        new_query = urlencode(new_params, doseq=True)
+                        test_url = parsed._replace(query=new_query).geturl()
+                    else:
+                        # Replace last numeric segment in path
+                        test_url = re.sub(r'/\d+(/|$)', f'/{test_id}\\1', endpoint.url)
+
+                    response = await self._make_request(test_url)
+                    if not response or response.status in [401, 403, 404]:
+                        continue
+
+                    body = await response.text()
+                    if len(body) > 50 and not self._is_error_response(body):
+                        finding = Finding(
+                            module='idor',
+                            title=f'IDOR: Sequential ID Access on {endpoint.resource_type}',
+                            severity='Critical',
+                            description=f'Successfully accessed resource with ID {test_id} (original: {base_id}) without authorization check.',
+                            evidence={
+                                'original_id': base_id,
+                                'tested_id': test_id,
+                                'url': test_url,
+                                'resource_type': endpoint.resource_type,
+                                'response_size': len(body)
+                            },
+                            poc=f"curl '{test_url}'",
+                            remediation='Implement object-level authorization. Verify the authenticated user owns the requested resource ID before returning data.',
+                            cvss_score=9.1,
+                            bounty_score=3000,
+                            target=endpoint.url
+                        )
+                        self.add_finding(finding)
+                        return  # one confirmed finding is enough per endpoint
+
+                except Exception as e:
+                    self.logger.debug(f"Sequential ID test error: {e}")
+
+    async def _test_parameter_pollution(self):
+        """Test HTTP parameter pollution for IDOR bypass"""
+        for endpoint in self.discovered_endpoints:
+            if not endpoint.param_name:
+                continue
+            try:
+                polluted_url = f"{endpoint.url}&{endpoint.param_name}=1"
+                response = await self._make_request(polluted_url)
+                if response and response.status == 200:
+                    body = await response.text()
+                    if not self._is_error_response(body):
+                        finding = Finding(
+                            module='idor',
+                            title=f'Parameter Pollution IDOR on {endpoint.param_name}',
+                            severity='High',
+                            description=f'Parameter pollution may bypass authorization on {endpoint.url}',
+                            evidence={'url': polluted_url, 'param': endpoint.param_name},
+                            poc=f"curl '{polluted_url}'",
+                            remediation='Use only the last or first occurrence of each parameter; validate ownership server-side.',
+                            cvss_score=7.5,
+                            bounty_score=2000,
+                            target=endpoint.url
+                        )
+                        self.add_finding(finding)
+            except Exception as e:
+                self.logger.debug(f"Parameter pollution error: {e}")
+
+    async def _test_method_bypass(self):
+        """Test HTTP method override for IDOR bypass"""
+        override_headers = [
+            {'X-HTTP-Method-Override': 'PUT'},
+            {'X-HTTP-Method-Override': 'DELETE'},
+            {'X-Method-Override': 'PATCH'},
+        ]
+        for endpoint in self.discovered_endpoints:
+            for hdrs in override_headers:
+                try:
+                    response = await self._make_request(endpoint.url, headers=hdrs)
+                    if response and response.status not in [401, 403, 404, 405]:
+                        finding = Finding(
+                            module='idor',
+                            title=f'HTTP Method Override Bypass on {endpoint.resource_type}',
+                            severity='High',
+                            description=f'HTTP method override accepted on {endpoint.url}',
+                            evidence={'url': endpoint.url, 'header': hdrs},
+                            poc=f"curl -H '{list(hdrs.keys())[0]}: {list(hdrs.values())[0]}' '{endpoint.url}'",
+                            remediation='Ignore X-HTTP-Method-Override unless explicitly required; enforce authorization per method.',
+                            cvss_score=7.5,
+                            bounty_score=1500,
+                            target=endpoint.url
+                        )
+                        self.add_finding(finding)
+                        break
+                except Exception as e:
+                    self.logger.debug(f"Method bypass error: {e}")
+
+    async def _test_mass_assignment(self):
+        """Test for mass assignment vulnerabilities"""
+        privileged_fields = ['role', 'isAdmin', 'admin', 'is_staff', 'permissions', 'account_type']
+        for endpoint in self.discovered_endpoints:
+            for field in privileged_fields:
+                try:
+                    payload = {field: 'admin'}
+                    response = await self._make_request(endpoint.url, method='POST', data=payload)
+                    if response and response.status in [200, 201]:
+                        body = await response.text()
+                        if field in body:
+                            finding = Finding(
+                                module='idor',
+                                title=f'Mass Assignment: {field} field accepted',
+                                severity='Critical',
+                                description=f'Server accepted privileged field "{field}" in POST body at {endpoint.url}',
+                                evidence={'url': endpoint.url, 'field': field},
+                                poc=f"curl -X POST '{endpoint.url}' -d '{field}=admin'",
+                                remediation='Use allowlists for accepted fields; never bind user input directly to model attributes.',
+                                cvss_score=9.1,
+                                bounty_score=3500,
+                                target=endpoint.url
+                            )
+                            self.add_finding(finding)
+                except Exception as e:
+                    self.logger.debug(f"Mass assignment error: {e}")
+
+    async def _analyze_graph_paths(self, target: str):
+        """Use graph manager to find attack paths if available"""
+        try:
+            if self.graph and getattr(self.graph, 'enabled', False):
+                paths = self.graph.find_attack_paths()
+                for path in paths:
+                    self.logger.info(f"Graph attack path: {path}")
+        except Exception as e:
+            self.logger.debug(f"Graph analysis error: {e}")
+
+    async def _store_findings(self):
+        """Persist findings to database"""
+        if self.db:
+            for finding in self.findings:
+                try:
+                    self.db.save_finding(finding)
+                except Exception:
+                    pass
+
+    def _is_error_response(self, body: str) -> bool:
+        """Check if response body looks like an error page"""
+        error_indicators = ['404', 'not found', 'error', 'forbidden', 'unauthorized', 'invalid']
+        body_lower = body.lower()[:300]
+        return any(ind in body_lower for ind in error_indicators)
