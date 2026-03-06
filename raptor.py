@@ -7,7 +7,13 @@ Optimized for Bug Bounty Hunting & Penetration Testing
 import asyncio
 import argparse
 import sys
-import yaml
+try:
+    import yaml
+except ModuleNotFoundError:
+    print("[!] ERROR: PyYAML module not found")
+    print("[*] Fix: pip install pyyaml")
+    print("[*] Or: pip3 install pyyaml")
+    sys.exit(1)
 from pathlib import Path
 from typing import List, Dict
 from rich.console import Console
