@@ -6,7 +6,9 @@ from pathlib import Path
 class CredentialTester(BaseModule):
     """Test for brute force vulnerabilities with stealth"""
     
-    def __init__(self, config, stealth=None, db=None):
+    def __init__(self, config, stealth=None, db=None, graph_manager=None):
+        super().__init__(config, stealth, db)
+        self.graph = graph_manager
         super().__init__(config, stealth, db)
         self.max_attempts = config.get('max_attempts', 50)  # Increased for actual testing
         self.delay = config.get('delay_between', 1)
