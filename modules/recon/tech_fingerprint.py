@@ -57,7 +57,7 @@ class _TagProxy:
 class TechnologyFingerprinter(BaseModule):
     """Fingerprint web technologies and versions"""
     
-    def __init__(self, config, stealth=None, db=None):
+    def __init__(self, config, stealth=None, db=None, graph_manager=None):
         super().__init__(config, stealth, db)
         self.tech_signatures = self._load_signatures()
         self.additional_technologies = self._load_technologies_wordlist()
