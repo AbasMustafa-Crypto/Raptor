@@ -1,8 +1,58 @@
 from typing import Dict, List, Set
-from bs4 import BeautifulSoup
 import re
 from pathlib import Path
+from html.parser import HTMLParser
 from core.base_module import BaseModule, Finding
+
+
+class _MiniSoup(HTMLParser):
+    """Zero-dependency BeautifulSoup replacement using stdlib html.parser."""
+
+    def __init__(self, html_text: str):
+        super().__init__()
+        self.tags: List[Dict] = []        # list of {tag, attrs_dict}
+        self._current = []
+        self.feed(html_text)
+
+    def handle_starttag(self, tag: str, attrs):
+        self.tags.append({'tag': tag.lower(), 'attrs': dict(attrs)})
+
+    # ── BS4-compatible helpers ──────────────────────────────────────────────
+
+    def find_all(self, tag: str, attrs: Dict = None, src: bool = False):
+        """Return list of tag-dicts matching tag name and optional attr filter."""
+        results = []
+        for t in self.tags:
+            if t['tag'] != tag.lower():
+                continue
+            if attrs:
+                match = all(
+                    re.search(str(v), str(t['attrs'].get(k, '')), re.I)
+                    if isinstance(v, str) else t['attrs'].get(k) == v
+                    for k, v in attrs.items()
+                )
+                if not match:
+                    continue
+            if src and 'src' not in t['attrs']:
+                continue
+            results.append(_TagProxy(t['attrs']))
+        return results
+
+
+class _TagProxy:
+    """Proxy for a single tag — mimics BS4 tag.get() / tag['attr'] API."""
+
+    def __init__(self, attrs: Dict):
+        self._attrs = attrs
+
+    def get(self, key: str, default=None):
+        return self._attrs.get(key, default)
+
+    def __getitem__(self, key: str):
+        return self._attrs[key]
+
+    def __contains__(self, key: str):
+        return key in self._attrs
 
 class TechnologyFingerprinter(BaseModule):
     """Fingerprint web technologies and versions"""
@@ -174,7 +224,7 @@ class TechnologyFingerprinter(BaseModule):
         detected = {}
         
         try:
-            soup = BeautifulSoup(text, 'html.parser')
+            soup = _MiniSoup(text)
         except Exception:
             soup = None
             
