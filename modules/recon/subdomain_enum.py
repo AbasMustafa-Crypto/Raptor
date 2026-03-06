@@ -9,6 +9,7 @@ class SubdomainEnumerator(BaseModule):
     
     def __init__(self, config, stealth=None, db=None, graph_manager=None):
         super().__init__(config, stealth, db)
+        self.graph = graph_manager
         self.tools = ['amass', 'subfinder', 'assetfinder']
         self.resolved_subdomains: Set[str] = set()
         
