@@ -4,8 +4,9 @@ from core.base_module import BaseModule, Finding
 class HeaderAuditor(BaseModule):
     """Audit HTTP security headers"""
     
-    def __init__(self, config, stealth=None, db=None):
+    def __init__(self, config, stealth=None, db=None, graph_manager=None):
         super().__init__(config, stealth, db)
+        self.graph = graph_manager
         
         self.security_headers = {
             'Strict-Transport-Security': {
