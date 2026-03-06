@@ -21,6 +21,7 @@ from core.config_manager import ConfigManager
 from core.stealth_manager import StealthManager
 from core.database_manager import DatabaseManager
 from core.report_manager import ReportManager
+from core.graph_manager import GraphManager
 from core.correlator import AttackPathCorrelator
 
 # Import modules
@@ -161,6 +162,7 @@ comprehensive web application assessment and bug bounty hunting.
   --evasion [yellow]1-5[/yellow]        WAF evasion level (default: 2)
   --rate-limit [yellow]NUM[/yellow]      Requests per second (default: 10)
   --timeout [yellow]SEC[/yellow]         Request timeout (default: 30)
+  --max-depth [yellow]NUM[/yellow]         Maximum crawl depth (default: 3)
 
 [bold]Auth & Proxy:[/bold]
   --cookie [yellow]STR[/yellow]          Authentication cookie
@@ -194,7 +196,8 @@ class Raptor:
         self.config = self._load_config(config_path)
         self.stealth = StealthManager(self.config.get('stealth', {}))
         self.db = DatabaseManager(self.config.get('database', {}).get('sqlite_path', 'data/raptor.db'))
-        self.correlator = AttackPathCorrelator(self.db)
+        self.graph = GraphManager(self.config.get('graph', {}))  # Initialize GraphManager
+        self.correlator = AttackPathCorrelator(self.db, self.graph)  # Pass graph to correlator
         self.findings: List[Dict] = []
         
     def _load_config(self, path: str) -> Dict:
@@ -210,11 +213,15 @@ class Raptor:
                        stealth_mode: bool = False, **kwargs) -> List[Dict]:
         """Execute security scan"""
         
+        # Add target to graph database
+        target_id = self.graph.add_target(target, metadata={'modules': modules})
+        
         console.print(Panel.fit(
             f"[bold cyan]RAPTOR Security Framework v2.0[/bold cyan]\n"
             f"Target: [yellow]{target}[/yellow]\n"
             f"Modules: [green]{', '.join(modules)}[/green]\n"
-            f"Mode: [red]{'Stealth' if stealth_mode else 'Aggressive'}[/red]",
+            f"Mode: [red]{'Stealth' if stealth_mode else 'Aggressive'}[/red]\n"
+            f"Graph DB: [blue]{'Connected' if self.graph.enabled else 'Disabled'}[/blue]",
             box=box.DOUBLE_EDGE
         ))
         
@@ -233,17 +240,19 @@ class Raptor:
                 async with SubdomainEnumerator(
                     self.config.get('modules', {}).get('recon', {}),
                     self.stealth if stealth_mode else None,
-                    self.db
+                    self.db,
+                    self.graph  # Pass graph manager
                 ) as module:
-                    findings = await module.run(target, **kwargs)
+                    findings = await module.run(target, target_id=target_id, **kwargs)
                     all_findings.extend([f.to_dict() for f in findings])
                     
                 async with TechnologyFingerprinter(
                     self.config.get('modules', {}).get('recon', {}),
                     self.stealth if stealth_mode else None,
-                    self.db
+                    self.db,
+                    self.graph
                 ) as module:
-                    findings = await module.run(target, **kwargs)
+                    findings = await module.run(target, target_id=target_id, **kwargs)
                     all_findings.extend([f.to_dict() for f in findings])
                     
                 progress.update(task, completed=True)
@@ -255,17 +264,19 @@ class Raptor:
                 async with HeaderAuditor(
                     self.config.get('modules', {}).get('server_misconfig', {}),
                     self.stealth if stealth_mode else None,
-                    self.db
+                    self.db,
+                    self.graph
                 ) as module:
-                    findings = await module.run(target, **kwargs)
+                    findings = await module.run(target, target_id=target_id, **kwargs)
                     all_findings.extend([f.to_dict() for f in findings])
                     
                 async with SensitiveFileScanner(
                     self.config.get('modules', {}).get('server_misconfig', {}),
                     self.stealth if stealth_mode else None,
-                    self.db
+                    self.db,
+                    self.graph
                 ) as module:
-                    findings = await module.run(target, **kwargs)
+                    findings = await module.run(target, target_id=target_id, **kwargs)
                     all_findings.extend([f.to_dict() for f in findings])
                     
                 progress.update(task, completed=True)
@@ -277,9 +288,10 @@ class Raptor:
                 async with XSSTester(
                     self.config.get('modules', {}).get('xss', {}),
                     self.stealth if stealth_mode else None,
-                    self.db
+                    self.db,
+                    self.graph
                 ) as module:
-                    findings = await module.run(target, **kwargs)
+                    findings = await module.run(target, target_id=target_id, **kwargs)
                     all_findings.extend([f.to_dict() for f in findings])
                     
                 progress.update(task, completed=True)
@@ -291,9 +303,10 @@ class Raptor:
                 async with SQLiTester(
                     self.config.get('modules', {}).get('sqli', {}),
                     self.stealth if stealth_mode else None,
-                    self.db
+                    self.db,
+                    self.graph
                 ) as module:
-                    findings = await module.run(target, **kwargs)
+                    findings = await module.run(target, target_id=target_id, **kwargs)
                     all_findings.extend([f.to_dict() for f in findings])
                     
                 progress.update(task, completed=True)
@@ -305,9 +318,10 @@ class Raptor:
                 async with IDORTester(
                     self.config.get('modules', {}).get('idor', {}),
                     self.stealth if stealth_mode else None,
-                    self.db
+                    self.db,
+                    self.graph
                 ) as module:
-                    findings = await module.run(target, **kwargs)
+                    findings = await module.run(target, target_id=target_id, **kwargs)
                     all_findings.extend([f.to_dict() for f in findings])
                     
                 progress.update(task, completed=True)
@@ -319,19 +333,29 @@ class Raptor:
                 async with CredentialTester(
                     self.config.get('modules', {}).get('brute_force', {}),
                     self.stealth if stealth_mode else None,
-                    self.db
+                    self.db,
+                    self.graph
                 ) as module:
-                    findings = await module.run(target, **kwargs)
+                    findings = await module.run(target, target_id=target_id, **kwargs)
                     all_findings.extend([f.to_dict() for f in findings])
                     
                 progress.update(task, completed=True)
                 
-        # Correlate findings
+        # Correlate findings using graph
         console.print("\n[bold]Correlating attack paths...[/bold]")
         attack_paths = self.correlator.analyze(all_findings)
         
+        # Get high-value targets from graph
+        if self.graph.enabled:
+            high_value = self.graph.get_high_value_targets(min_cvss=7.0)
+            if high_value:
+                console.print(f"[yellow]High-value targets found: {len(high_value)}[/yellow]")
+        
         # Display results
         self._display_results(all_findings, attack_paths)
+        
+        # Close graph connection
+        self.graph.close()
         
         return all_findings
         
@@ -383,8 +407,10 @@ class Raptor:
             console.print("\n[bold red]Discovered Attack Paths:[/bold red]")
             for path in attack_paths:
                 console.print(f"\n[red]Chain: {path.get('name')}[/red]")
-                console.print(f"  Estimated Bounty: [green]${path.get('estimated_bounty')}[/green]")
+                console.print(f"  Estimated Bounty: [green]${path.get('total_bounty', path.get('estimated_bounty', 0))}[/green]")
                 console.print(f"  Complexity: {path.get('complexity')}")
+                if 'node_types' in path:
+                    console.print(f"  Path: {' -> '.join(path['node_types'])}")
                 
         # Save report
         report_path = f"reports/output/raptor_report_{finding.get('target', 'unknown').replace('/', '_')}.md"
@@ -419,10 +445,12 @@ class Raptor:
             if attack_paths:
                 f.write("## Attack Paths\n\n")
                 for path in attack_paths:
-                    f.write(f"### {path.get('name')}\n")
+                    f.write(f"### {path.get('name', 'Attack Chain')}\n")
                     f.write(f"- **Complexity:** {path.get('complexity')}\n")
-                    f.write(f"- **Estimated Bounty:** ${path.get('estimated_bounty')}\n")
-                    f.write(f"- **Description:** {path.get('description')}\n\n")
+                    f.write(f"- **Estimated Bounty:** ${path.get('total_bounty', path.get('estimated_bounty', 0))}\n")
+                    if 'node_types' in path:
+                        f.write(f"- **Chain:** {' -> '.join(path['node_types'])}\n")
+                    f.write(f"- **Description:** {path.get('description', 'Vulnerability chain discovered through graph analysis')}\n\n")
 
 
 def main():
@@ -472,7 +500,7 @@ def main():
     parser.add_argument('--rate-limit', type=int, default=10,
                        help='Maximum requests per second (default: 10)')
     parser.add_argument('--timeout', type=int, default=30,
-                       help='Request timeout in seconds (default: 30)')
+                       help='Request request timeout in seconds (default: 30)')
     parser.add_argument('--max-depth', type=int, default=3,
                        help='Maximum crawl depth for discovery (default: 3)')
     
