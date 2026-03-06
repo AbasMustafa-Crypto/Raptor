@@ -286,29 +286,25 @@ class XSSTester(BaseModule):
     
     async def _test_reflected_xss(self, target: str, params: Dict, scope: str):
         """Test for Reflected XSS vulnerabilities"""
-        url_params = params.get('url_params', [])
-        
-        for param in url_params:
-            if param in self.tested_params:
-                continue
-            
-            self.logger.info(f"   Testing parameter: {param}")
-            
-            # Context detection
-            probe = f"RAPTOR{hash(param) % 10000}"
-            context = await self._detect_context(target, param, probe)
-            
-            if not context.get('reflected'):
-                continue
-            
-            # Select payloads based on context and WAF
-            payloads = self._select_payloads(context['type'])
-            
-            # Test payloads
-            for payload_obj in payloads:
-                if await self._test_payload(target, param, payload_obj, context):
-                    self.tested_params.add(param)
-                    break  # Stop on first success for this param
+        url_params = params.get('url_params', [])[:10]  # cap at 10 params
+
+        semaphore = asyncio.Semaphore(5)
+
+        async def test_param(param):
+            async with semaphore:
+                if param in self.tested_params:
+                    return
+                probe = f"RAPTOR{hash(param) % 10000}"
+                context = await self._detect_context(target, param, probe)
+                if not context.get('reflected'):
+                    return
+                payloads = self._select_payloads(context['type'])
+                for payload_obj in payloads[:5]:  # max 5 payloads per param
+                    if await self._test_payload(target, param, payload_obj, context):
+                        self.tested_params.add(param)
+                        break
+
+        await asyncio.gather(*[test_param(p) for p in url_params], return_exceptions=True)
     
     async def _detect_context(self, target: str, param: str, probe: str) -> Dict:
         """Detect reflection context"""
