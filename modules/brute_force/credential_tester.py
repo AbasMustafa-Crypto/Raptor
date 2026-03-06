@@ -187,7 +187,7 @@ class CredentialTester(BaseModule):
                     is_success = await self._check_login_success(response, url)
                     
                     if is_success:
-                        self.logger.info(f"SUCCESSFUL LOGIN: {username}:{password}")
+                        self.logger.info(f"\n[!] CREDENTIALS FOUND: {username}:{password} @ {url}")
                         successful_logins.append({
                             'username': username,
                             'password': password,
@@ -196,7 +196,7 @@ class CredentialTester(BaseModule):
                         
                         finding = Finding(
                             module='brute_force',
-                            title=f'Successful Brute Force Login: {username}',
+                            title=f'Successful Brute Force Login: {username}:{password}',,
                             severity='Critical',
                             description=f'Successfully brute forced credentials on {url}',
                             evidence={
