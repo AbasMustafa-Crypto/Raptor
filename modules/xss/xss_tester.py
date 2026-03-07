@@ -515,7 +515,7 @@ class XSSTester(BaseModule):
             )
             self.findings.append(f)
             self.add_finding(f)
-
+            
     def _emit_finding(self, target: str, param: str, payload: XSSPayload, 
                       context: str, xss_type: str, poc_url: str):
         """Create and save a finding."""
@@ -535,18 +535,43 @@ class XSSTester(BaseModule):
         
         base_type = xss_type.split('(')[0].strip()
         
+        # Build description separately to avoid f-string issues
+        description = (
+            f"## Cross-Site Scripting ({xss_type})\n\n"
+            f"**Parameter:** `{param}`\n"
+            f"**Context:** `{context}`\n"
+            f"**Payload:** `{payload.raw[:100]}`\n"
+            f"**WAF Bypass:** {', '.join(payload.waf_bypass) if payload.waf_bypass else 'None'}\n\n"
+            f"### Verification\n"
+            f"Canary `{payload.canary}` was reflected unescaped in response.\n\n"
+            f"### Proof of Concept\n"
+            f"```\n{poc_url[:120]}...\n```\n\n"
+            f"### Impact\n"
+            f"{xss_type} XSS allows arbitrary JavaScript execution in victim's browser.\n\n"
+            f"### Remediation\n"
+            f"- HTML-encode all output based on context\n"
+            f"- Implement Content-Security-Policy\n"
+            f"- Use HTTPOnly cookies for session tokens"
+        )
+        
         f = Finding(
             module='xss',
             title=f'XSS in "{param}" ({context} context) [{xss_type}]',
             severity=severity_map.get(base_type, 'High'),
-            description=f'''## Cross-Site Scripting ({xss_type})
-
-**Parameter:** `{param}`
-**Context:** `{context}`
-**Payload:** `{payload.raw[:100]}`
-**WAF Bypass:** {', '.join(payload.waf_bypass) if payload.waf_bypass else 'None'}
-
-### Verification
-Canary `{payload.canary}` was reflected unescaped in response.
-
-### Proof of Concept
+            description=description,
+            evidence={
+                'parameter': param,
+                'payload': payload.raw,
+                'context': context,
+                'type': xss_type,
+                'canary': payload.canary,
+                'waf': self.waf_name
+            },
+            poc=poc_url,
+            remediation='HTML-encode output; CSP; HTTPOnly cookies',
+            cvss_score=cvss_map.get(base_type, 6.1),
+            bounty_score=bounty_map.get(base_type, 1500),
+            target=target,
+        )
+        self.findings.append(f)
+        self.add_finding(f)
