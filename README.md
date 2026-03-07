@@ -17,7 +17,7 @@
 ![Platform](https://img.shields.io/badge/Platform-Kali%20Linux-557C94?style=flat-square&logo=linux)
 ![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
 ![Dependencies](https://img.shields.io/badge/Dependencies-Zero-brightgreen?style=flat-square)
-![Version](https://img.shields.io/badge/Version-2.0-red?style=flat-square)
+![Version](https://img.shields.io/badge/Version-3.0-red?style=flat-square)
 
 *A zero-dependency, async Python security framework for bug bounty hunters and penetration testers.*
 
