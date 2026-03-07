@@ -5,12 +5,12 @@ from pathlib import Path
 
 
 class CredentialTester(BaseModule):
-    """Test for brute force vulnerabilities with stealth - Universal Version"""
+    """Test for brute force vulnerabilities with stealth - NO DELAY VERSION"""
 
     def __init__(self, config, stealth=None, db=None, graph_manager=None):
         super().__init__(config, stealth, db, graph_manager)
-        self.max_attempts   = config.get('max_attempts', 50)
-        self.delay          = config.get('delay_between', 1)
+        self.max_attempts   = config.get('max_attempts', 1000)  # Increased default
+        self.delay          = 0  # FORCE NO DELAY - ignore config
         self.wordlist_path  = config.get('wordlist_path', 'wordlists')
 
     async def run(self, target: str, **kwargs) -> List[Finding]:
@@ -21,15 +21,10 @@ class CredentialTester(BaseModule):
             self.logger.info("Brute force testing disabled (use --enable-brute-force to enable)")
             return self.findings
 
-        # UNIVERSAL APPROACH: Always test the target URL directly
-        # plus discover any additional endpoints
         login_endpoints = await self._discover_login_forms(target)
         
-        # Always add the target URL as a direct test endpoint
-        # This ensures we test even if no forms are detected
         target_url = target if target.startswith(('http://', 'https://')) else f"https://{target}"
         
-        # Check if target is already in the list
         target_exists = any(ep['url'] == target_url for ep in login_endpoints)
         
         if not target_exists:
@@ -47,10 +42,10 @@ class CredentialTester(BaseModule):
             })
 
         if not login_endpoints:
-            self.logger.warning("No login endpoints discovered - this should never happen with universal mode")
+            self.logger.warning("No login endpoints discovered")
             return self.findings
 
-        self.logger.info(f"Testing {len(login_endpoints)} endpoint(s)")
+        self.logger.info(f"Testing {len(login_endpoints)} endpoint(s) with NO DELAY")
 
         for endpoint in login_endpoints:
             await self._test_rate_limiting(endpoint)
@@ -71,10 +66,8 @@ class CredentialTester(BaseModule):
         parsed = urlparse(target)
         base = f"{parsed.scheme}://{parsed.netloc}"
 
-        # Strategy 1: Test the target URL itself
         candidate_urls = [target]
         
-        # Strategy 2: Common login paths
         common_paths = [
             '/login', '/signin', '/auth', '/authenticate',
             '/admin', '/admin/login', '/user/login', '/account/login',
@@ -83,7 +76,6 @@ class CredentialTester(BaseModule):
             '/admin.html', '/login.html', '/signin.html',
             '/auth/login', '/user/signin', '/member/login',
             '/dashboard/login', '/manage/login', '/control/login',
-            # API endpoints
             '/api/v1/login', '/api/v2/login', '/graphql',
             '/rest/login', '/json/login', '/ajax/login'
         ]
@@ -91,7 +83,6 @@ class CredentialTester(BaseModule):
         for path in common_paths:
             candidate_urls.append(base + path)
 
-        # Strategy 3: Check for query parameters that might indicate login
         if parsed.query:
             candidate_urls.append(target)
 
@@ -107,7 +98,6 @@ class CredentialTester(BaseModule):
                 if not response:
                     continue
 
-                # Accept more status codes (including 401, 403 which might indicate protected login)
                 if response.status not in [200, 301, 302, 401, 403, 405, 500]:
                     continue
 
@@ -115,7 +105,6 @@ class CredentialTester(BaseModule):
                 if not text:
                     continue
 
-                # Strategy A: Look for login indicators in HTML/JS
                 indicators = [
                     'password', 'login', 'username', 'email', 'sign in', 'log in',
                     'signin', 'passwd', 'credentials', 'authentication',
@@ -124,21 +113,16 @@ class CredentialTester(BaseModule):
                 
                 has_login_indicators = any(ind in text.lower() for ind in indicators)
                 
-                # Strategy B: Look for form fields (even hidden or JS-generated)
                 fields = self._extract_form_fields(text)
                 
-                # Strategy C: Check if it's an API endpoint (JSON response)
                 is_api = 'application/json' in response.headers.get('Content-Type', '') or \
                          text.strip().startswith(('{', '['))
                 
-                # Strategy D: Check for JavaScript frameworks that might render login forms
                 js_frameworks = ['react', 'vue', 'angular', 'ember', 'next.js', 'nuxt']
                 has_js_framework = any(fw in text.lower() for fw in js_frameworks)
                 
-                # ACCEPT if any strategy indicates this might be a login endpoint
                 if has_login_indicators or fields['inputs'] or is_api or has_js_framework:
                     
-                    # Determine post URL
                     post_url = url
                     if fields.get('action'):
                         action = fields['action']
@@ -164,7 +148,6 @@ class CredentialTester(BaseModule):
             except Exception as e:
                 self.logger.debug(f"Login discovery error on {url}: {e}")
 
-        # Remove duplicates
         seen = set()
         unique = []
         for ep in endpoints:
@@ -188,14 +171,10 @@ class CredentialTester(BaseModule):
         if not html:
             return fields
         
-        # Find all input fields (including those in JavaScript)
-        # Pattern 1: Standard HTML inputs
         inputs = re.findall(r'<input[^>]+name=["\']([^"\']+)["\'][^>]*>', html, re.IGNORECASE)
         
-        # Pattern 2: Inputs in JavaScript/React (name=, name:, etc.)
         js_inputs = re.findall(r'name["\']?\s*[:=]\s*["\']([^"\']+)["\']', html)
         
-        # Pattern 3: Look for common field names in the entire text
         common_patterns = [
             r'["\'](email|username|user|login|name)["\']',
             r'["\'](password|passwd|pwd|pass)["\']',
@@ -207,17 +186,14 @@ class CredentialTester(BaseModule):
         
         fields['inputs'] = list(set(inputs + js_inputs))
         
-        # Find form action
         action_match = re.search(r'<form[^>]+action=["\']([^"\']+)["\']', html, re.IGNORECASE)
         if action_match:
             fields['action'] = action_match.group(1)
         
-        # Find form method
         method_match = re.search(r'<form[^>]+method=["\']([^"\']+)["\']', html, re.IGNORECASE)
         if method_match:
             fields['method'] = method_match.group(1).upper()
         
-        # Categorize fields with extensive patterns
         username_patterns = [
             'email', 'mail', 'e-mail', 'username', 'user', 'uname', 
             'login', 'name', 'account', 'userid', 'user_id', 'auth_user',
@@ -229,7 +205,6 @@ class CredentialTester(BaseModule):
             'auth_pass', 'secret', 'key', 'credential'
         ]
         
-        # Detect username fields
         for inp in fields['inputs']:
             inp_lower = inp.lower()
             for pattern in username_patterns:
@@ -237,7 +212,6 @@ class CredentialTester(BaseModule):
                     fields['username_fields'].append(inp)
                     break
         
-        # Detect password field (take the first match)
         for inp in fields['inputs']:
             inp_lower = inp.lower()
             for pattern in password_patterns:
@@ -247,22 +221,18 @@ class CredentialTester(BaseModule):
             if fields['password_field']:
                 break
         
-        # If no fields detected, use universal defaults
         if not fields['username_fields']:
-            # Check if page mentions email vs username
             html_lower = html.lower()
             if 'email' in html_lower or 'e-mail' in html_lower:
                 fields['username_fields'] = ['email', 'username', 'user']
             elif 'username' in html_lower:
                 fields['username_fields'] = ['username', 'email', 'user']
             else:
-                # Universal fallback - try all common names
                 fields['username_fields'] = ['email', 'username', 'user', 'login', 'name']
         
         if not fields['password_field']:
             fields['password_field'] = 'password'
         
-        # Set backward compatibility fields
         fields['username_field'] = fields['username_fields'][0]
         fields['email_field'] = fields['username_fields'][0]
         
@@ -315,22 +285,23 @@ class CredentialTester(BaseModule):
         return variations
 
     async def _test_brute_force(self, endpoint: Dict):
-        """Universal brute force test - works with any endpoint type"""
+        """Universal brute force test - NO DELAYS, MAXIMUM SPEED"""
         url = endpoint['url']
         fields = endpoint.get('fields', {})
         
-        # Get username fields with universal fallback
         username_fields = fields.get('username_fields', ['email', 'username', 'user', 'login'])
         password_field = fields.get('password_field', 'password')
         is_api = endpoint.get('is_api', False)
         
-        self.logger.info(f"Starting brute force on {url}")
+        self.logger.info(f"Starting HIGH-SPEED brute force on {url}")
         self.logger.info(f"Fields: usernames={username_fields}, password={password_field}")
 
         base_usernames, passwords = self._load_wordlists()
         all_usernames = self._generate_username_variations(base_usernames)
         
-        self.logger.info(f"Testing {len(all_usernames)} usernames × {len(passwords)} passwords")
+        total_attempts = len(all_usernames) * len(passwords)
+        self.logger.info(f"Testing {len(all_usernames)} usernames × {len(passwords)} passwords = {total_attempts} total attempts")
+        self.logger.warning("NO DELAY MODE: Requests will be sent as fast as possible!")
 
         successful_logins = []
         rate_limited = False
@@ -340,21 +311,18 @@ class CredentialTester(BaseModule):
             for password in passwords:
                 attempt_count += 1
                 
-                # UNIVERSAL STRATEGY: Send data in multiple formats
-                # Format 1: Form data (standard)
                 login_data = {password_field: password}
                 for field in username_fields:
                     login_data[field] = username
                 
-                # Ensure common field names are covered
                 for standard_name in ['email', 'username', 'user', 'login']:
                     if standard_name not in login_data:
                         login_data[standard_name] = username
 
                 try:
-                    self.logger.debug(f"Attempt {attempt_count}: {username}:{password}")
+                    if attempt_count % 10 == 0:
+                        self.logger.info(f"Progress: {attempt_count}/{total_attempts} attempts...")
                     
-                    # Try form-encoded POST first
                     response = await self._make_request(
                         url, 
                         method='POST', 
@@ -363,7 +331,6 @@ class CredentialTester(BaseModule):
                         headers={'Content-Type': 'application/x-www-form-urlencoded'}
                     )
 
-                    # If form fails, try JSON (for APIs)
                     if not response and is_api:
                         response = await self._make_request(
                             url,
@@ -382,13 +349,11 @@ class CredentialTester(BaseModule):
                         self._report_success(username, password, url, attempt_count, username_fields, password_field)
                         return
 
-                    # Rate limiting check
                     if response.status in [429, 503, 403]:
                         rate_limited = True
                         self.logger.warning(f"Rate limited (HTTP {response.status}) after {attempt_count} attempts")
                         break
 
-                    # Check response text for lockout
                     text = await response.text()
                     lockout_indicators = [
                         'locked', 'blocked', 'too many attempts',
@@ -456,7 +421,6 @@ class CredentialTester(BaseModule):
         try:
             status = response.status
             
-            # Redirect-based success
             if status in [301, 302, 303, 307, 308]:
                 location = response.headers.get('Location', '')
                 if location:
@@ -469,22 +433,18 @@ class CredentialTester(BaseModule):
                     if any(p in location.lower() for p in failure_paths):
                         return False
 
-            # Content-based success (200 OK)
             if status == 200:
                 text = await response.text()
                 text_lower = text.lower()
 
-                # Immediate failure indicators
                 failures = ['invalid', 'incorrect', 'failed', 'error', 'wrong', 'denied', 'unauthorized', 'try again']
                 for f in failures:
                     if f in text_lower:
                         return False
 
-                # Success indicators
                 successes = ['welcome', 'dashboard', 'logout', 'profile', 'admin panel', 'successful', 'session', 'token']
                 success_count = sum(1 for s in successes if s in text_lower)
 
-                # Session cookie check
                 cookies = response.headers.get('Set-Cookie', '').lower()
                 if any(c in cookies for c in ['session', 'token', 'auth', 'jwt']):
                     return True
@@ -492,7 +452,6 @@ class CredentialTester(BaseModule):
                 if success_count >= 2:
                     return True
 
-            # API success (JSON with token)
             if status in [200, 201] and 'application/json' in response.headers.get('Content-Type', ''):
                 text = await response.text()
                 if any(k in text.lower() for k in ['token', 'access_token', 'auth_token', 'session']):
@@ -505,9 +464,11 @@ class CredentialTester(BaseModule):
             return False
 
     async def _test_rate_limiting(self, endpoint: Dict):
-        """Test rate limiting"""
+        """Test rate limiting - NO DELAY"""
         url = endpoint['url']
         responses = []
+
+        self.logger.info(f"Testing rate limiting on {url} (no delay)")
 
         for i in range(min(5, self.max_attempts)):
             try:
@@ -520,7 +481,7 @@ class CredentialTester(BaseModule):
                     responses.append(response.status)
             except:
                 responses.append('error')
-            await asyncio.sleep(0.5)
+            # NO SLEEP HERE - REMOVED await asyncio.sleep(0.5)
 
         if 429 in responses or 503 in responses or 403 in responses:
             self.logger.info(f"Rate limiting detected on {url}")
