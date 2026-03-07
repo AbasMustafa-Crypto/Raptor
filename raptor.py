@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 RAPTOR - Advanced Automated Web Application Security Testing Framework
-Optimized for Bug Bounty Hunting & Penetration Testing
+Optimised for Bug Bounty Hunting & Penetration Testing
 """
 
 import asyncio
@@ -9,39 +9,54 @@ import argparse
 import sys
 import os
 
-# ── Zero-dependency bundled libraries (no pip needed) ──────────────────────
+# ── Zero-dependency bundled libraries ──────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(_HERE, 'core'))
+_CORE = os.path.join(_HERE, 'core')
+for _p in [_HERE, _CORE]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from _yaml_lite import safe_load as _yaml_safe_load
-from _console  import Console, Table, Panel, Progress, SpinnerColumn, TextColumn, box
+from _console   import Console, Table, Panel, Progress, SpinnerColumn, TextColumn, box
 
 from pathlib import Path
-from typing import List, Dict
+from typing  import List, Dict, Optional
 
-# Import core components
-from core.config_manager import ConfigManager
-from core.stealth_manager import StealthManager
+# ── Core components ─────────────────────────────────────────────────────────
+from core.config_manager   import ConfigManager
+from core.stealth_manager  import StealthManager
 from core.database_manager import DatabaseManager
-from core.report_manager import ReportManager
-from core.graph_manager import GraphManager
-from core.correlator import AttackPathCorrelator
+from core.report_manager   import ReportManager
+from core.correlator       import AttackPathCorrelator
 
-# Import modules
-from modules.recon.subdomain_enum import SubdomainEnumerator
-from modules.recon.tech_fingerprint import TechnologyFingerprinter
-from modules.server_misconfig.header_audit import HeaderAuditor
+# GraphManager is optional — if the file doesn't exist / neo4j isn't installed
+# we fall back to a no-op stub so the rest of the framework keeps running.
+try:
+    from core.graph_manager import GraphManager
+except ImportError:
+    class GraphManager:                        # type: ignore[no-redef]
+        enabled = False
+        def __init__(self, *a, **kw): pass
+        def add_target(self, *a, **kw): return None
+        def get_high_value_targets(self, **kw): return []
+        def close(self): pass
+
+# ── Modules ─────────────────────────────────────────────────────────────────
+from modules.recon.subdomain_enum            import SubdomainEnumerator
+from modules.recon.tech_fingerprint          import TechnologyFingerprinter
+from modules.server_misconfig.header_audit   import HeaderAuditor
 from modules.server_misconfig.sensitive_files import SensitiveFileScanner
-from modules.idor.idor_tester import IDORTester
-from modules.brute_force.credential_tester import CredentialTester
-from modules.xss.xss_tester import XSSTester
-from modules.sqli.sqli_tester import SQLiTester
+from modules.idor.idor_tester                import IDORTester
+from modules.brute_force.credential_tester   import CredentialTester
+from modules.xss.xss_tester                 import XSSTester
+from modules.sqli.sqli_tester               import SQLiTester
 
 console = Console()
 
 
+# ── Welcome / help text ─────────────────────────────────────────────────────
+
 def show_welcome():
-    """Show welcome screen when no arguments provided"""
     console.print("""
 [bold cyan]██████╗  █████╗ ██████╗ ████████╗ ██████╗ ██████╗ 
 ██╔══██╗██╔══██╗██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗
@@ -64,14 +79,13 @@ def show_welcome():
   [cyan]xss[/cyan]     Cross-Site Scripting
   [cyan]sqli[/cyan]    SQL Injection
   [cyan]idor[/cyan]    Insecure Direct Object Reference
-  [cyan]brute[/cyan]   Brute Force (--enable-brute-force)
+  [cyan]brute[/cyan]   Brute Force (--enable-brute-force required)
 
   python3 raptor.py [bold]--help[/bold] for full documentation
 """)
 
 
 def create_help_text():
-    """Return help text — rendered via console.print so markup works"""
     return """
 [bold cyan]██████╗  █████╗ ██████╗ ████████╗ ██████╗ ██████╗ 
 ██╔══██╗██╔══██╗██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗
@@ -113,34 +127,56 @@ def create_help_text():
 """
 
 
+# ── Raptor controller ───────────────────────────────────────────────────────
 
 class Raptor:
     """Main RAPTOR Framework Controller"""
-    
+
     def __init__(self, config_path: str = "config/config.yaml"):
-        self.config = self._load_config(config_path)
-        self.stealth = StealthManager(self.config.get('stealth', {}))
-        self.db = DatabaseManager(self.config.get('database', {}).get('sqlite_path', 'data/raptor.db'))
-        self.graph = GraphManager(self.config.get('graph', {}))  # Initialize GraphManager
-        self.correlator = AttackPathCorrelator(self.db, self.graph)  # Pass graph to correlator
-        self.findings: List[Dict] = []
-        
+        self.config     = self._load_config(config_path)
+        self.stealth    = StealthManager(self.config.get('stealth', {}))
+        # ── FIX: correct nested key lookup for database path ───────────────
+        db_path         = (
+            self.config.get('database', {}).get('path') or
+            'data/raptor.db'
+        )
+        self.db         = DatabaseManager(db_path)
+        self.graph      = GraphManager(self.config.get('graph', {}))
+        self.correlator = AttackPathCorrelator(self.db, self.graph)
+        self.findings:  List[Dict] = []
+
     def _load_config(self, path: str) -> Dict:
         """Load configuration from YAML (bundled zero-dep parser)"""
+        # Resolve relative to script location if not found in cwd
+        if not os.path.isabs(path) and not os.path.exists(path):
+            candidate = os.path.join(_HERE, path)
+            if os.path.exists(candidate):
+                path = candidate
         try:
             with open(path, 'r') as f:
                 return _yaml_safe_load(f.read()) or {}
         except FileNotFoundError:
-            console.print(f"[red]Config file not found: {path}[/red]")
+            console.print(f"[yellow]Config file not found: {path} — using defaults[/yellow]")
             return {}
-            
-    async def run_scan(self, target: str, modules: List[str], 
+
+    # ── _module_cfg: safe nested config lookup ──────────────────────────────
+
+    def _module_cfg(self, *keys) -> Dict:
+        """Walk self.config by keys, returning {} if any step is missing."""
+        node = self.config
+        for k in keys:
+            if not isinstance(node, dict):
+                return {}
+            node = node.get(k, {})
+        return node if isinstance(node, dict) else {}
+
+    async def run_scan(self, target: str, modules: List[str],
                        stealth_mode: bool = False, **kwargs) -> List[Dict]:
         """Execute security scan"""
-        
-        # Add target to graph database
-        target_id = self.graph.add_target(target, metadata={'modules': modules})
-        
+
+        target_id = self.graph.add_target(target, metadata={'modules': modules}) \
+                    if self.graph.enabled else None
+
         console.print(Panel.fit(
             f"[bold cyan]RAPTOR Security Framework v2.0[/bold cyan]\n"
             f"Target: [yellow]{target}[/yellow]\n"
@@ -149,215 +185,248 @@ class Raptor:
             f"Graph DB: [blue]{'Connected' if self.graph.enabled else 'Disabled'}[/blue]",
             box=box.DOUBLE_EDGE
         ))
-        
+
         all_findings = []
-        
+        stealth      = self.stealth if stealth_mode else None
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             console=console
         ) as progress:
-            
-            # Reconnaissance Module
+
+            # ── Recon ──────────────────────────────────────────────────────
             if 'recon' in modules:
                 task = progress.add_task("[cyan]Running Reconnaissance...", total=None)
-                
+
                 async with SubdomainEnumerator(
-                    self.config.get('modules', {}).get('recon', {}),
-                    self.stealth if stealth_mode else None,
-                    self.db,
-                    self.graph  # Pass graph manager
-                ) as module:
-                    findings = await module.run(target, target_id=target_id, **kwargs)
-                    all_findings.extend([f.to_dict() for f in findings])
-                    
+                    self._module_cfg('modules', 'recon'),
+                    stealth, self.db, self.graph
+                ) as mod:
+                    all_findings.extend(
+                        [f.to_dict() for f in await mod.run(target, **kwargs)]
+                    )
+
                 async with TechnologyFingerprinter(
-                    self.config.get('modules', {}).get('recon', {}),
-                    self.stealth if stealth_mode else None,
-                    self.db,
-                    self.graph
-                ) as module:
-                    findings = await module.run(target, target_id=target_id, **kwargs)
-                    all_findings.extend([f.to_dict() for f in findings])
-                    
+                    self._module_cfg('modules', 'recon'),
+                    stealth, self.db, self.graph
+                ) as mod:
+                    all_findings.extend(
+                        [f.to_dict() for f in await mod.run(target, **kwargs)]
+                    )
+
                 progress.update(task, completed=True)
-                
-            # Server Misconfiguration Module
+
+            # ── Server misconfig ───────────────────────────────────────────
             if 'server' in modules:
                 task = progress.add_task("[cyan]Auditing Server Configuration...", total=None)
-                
+
                 async with HeaderAuditor(
-                    self.config.get('modules', {}).get('server_misconfig', {}),
-                    self.stealth if stealth_mode else None,
-                    self.db,
-                    self.graph
-                ) as module:
-                    findings = await module.run(target, target_id=target_id, **kwargs)
-                    all_findings.extend([f.to_dict() for f in findings])
-                    
+                    self._module_cfg('modules', 'server'),
+                    stealth, self.db, self.graph
+                ) as mod:
+                    all_findings.extend(
+                        [f.to_dict() for f in await mod.run(target, **kwargs)]
+                    )
+
                 async with SensitiveFileScanner(
-                    self.config.get('modules', {}).get('server_misconfig', {}),
-                    self.stealth if stealth_mode else None,
-                    self.db,
-                    self.graph
-                ) as module:
-                    findings = await module.run(target, target_id=target_id, **kwargs)
-                    all_findings.extend([f.to_dict() for f in findings])
-                    
+                    self._module_cfg('modules', 'server'),
+                    stealth, self.db, self.graph
+                ) as mod:
+                    all_findings.extend(
+                        [f.to_dict() for f in await mod.run(target, **kwargs)]
+                    )
+
                 progress.update(task, completed=True)
-                
-            # XSS Module
+
+            # ── XSS ───────────────────────────────────────────────────────
             if 'xss' in modules:
                 task = progress.add_task("[cyan]Testing for XSS...", total=None)
-                
+
                 async with XSSTester(
-                    self.config.get('modules', {}).get('xss', {}),
-                    self.stealth if stealth_mode else None,
-                    self.db,
-                    self.graph
-                ) as module:
-                    findings = await module.run(target, target_id=target_id, **kwargs)
-                    all_findings.extend([f.to_dict() for f in findings])
-                    
+                    self._module_cfg('modules', 'xss'),
+                    stealth, self.db, self.graph
+                ) as mod:
+                    all_findings.extend(
+                        [f.to_dict() for f in await mod.run(target, **kwargs)]
+                    )
+
                 progress.update(task, completed=True)
-                
-            # SQLi Module
+
+            # ── SQLi ───────────────────────────────────────────────────────
             if 'sqli' in modules:
                 task = progress.add_task("[cyan]Testing for SQL Injection...", total=None)
-                
+
                 async with SQLiTester(
-                    self.config.get('modules', {}).get('sqli', {}),
-                    self.stealth if stealth_mode else None,
-                    self.db,
-                    self.graph
-                ) as module:
-                    findings = await module.run(target, target_id=target_id, **kwargs)
-                    all_findings.extend([f.to_dict() for f in findings])
-                    
+                    self._module_cfg('modules', 'sqli'),
+                    stealth, self.db, self.graph
+                ) as mod:
+                    all_findings.extend(
+                        [f.to_dict() for f in await mod.run(target, **kwargs)]
+                    )
+
                 progress.update(task, completed=True)
-                
-            # IDOR Module
+
+            # ── IDOR ───────────────────────────────────────────────────────
             if 'idor' in modules:
                 task = progress.add_task("[cyan]Testing for IDOR...", total=None)
-                
+
                 async with IDORTester(
-                    self.config.get('modules', {}).get('idor', {}),
-                    self.stealth if stealth_mode else None,
-                    self.db,
-                    self.graph
-                ) as module:
-                    findings = await module.run(target, target_id=target_id, **kwargs)
-                    all_findings.extend([f.to_dict() for f in findings])
-                    
+                    self._module_cfg('modules', 'idor'),
+                    stealth, self.db, self.graph
+                ) as mod:
+                    all_findings.extend(
+                        [f.to_dict() for f in await mod.run(target, **kwargs)]
+                    )
+
                 progress.update(task, completed=True)
-                
-            # Brute Force Module
+
+            # ── Brute force ────────────────────────────────────────────────
             if 'brute' in modules and kwargs.get('enable_brute_force'):
                 task = progress.add_task("[cyan]Testing Brute Force Protections...", total=None)
-                
+
+                # ── FIX: pass wordlist_path from config if available ───────
+                brute_cfg = dict(self._module_cfg('modules', 'brute_force'))
+                if 'wordlist_path' not in brute_cfg:
+                    brute_cfg['wordlist_path'] = 'wordlists'
+
                 async with CredentialTester(
-                    self.config.get('modules', {}).get('brute_force', {}),
-                    self.stealth if stealth_mode else None,
-                    self.db,
-                    self.graph
-                ) as module:
-                    findings = await module.run(target, target_id=target_id, **kwargs)
-                    all_findings.extend([f.to_dict() for f in findings])
-                    
+                    brute_cfg, stealth, self.db, self.graph
+                ) as mod:
+                    all_findings.extend(
+                        [f.to_dict() for f in await mod.run(target, **kwargs)]
+                    )
+
                 progress.update(task, completed=True)
-                
-        # Correlate findings using graph
+
+        # ── Correlate ──────────────────────────────────────────────────────
         console.print("\n[bold]Correlating attack paths...[/bold]")
         attack_paths = self.correlator.analyze(all_findings)
-        
-        # Get high-value targets from graph
+
         if self.graph.enabled:
             high_value = self.graph.get_high_value_targets(min_cvss=7.0)
             if high_value:
                 console.print(f"[yellow]High-value targets found: {len(high_value)}[/yellow]")
-        
-        # Display results
+
         self._display_results(all_findings, attack_paths)
-        
-        # Close graph connection
         self.graph.close()
-        
+
         return all_findings
-        
+
+    # ── Display ─────────────────────────────────────────────────────────────
+
     def _display_results(self, findings: List[Dict], attack_paths: List[Dict]):
-        """Display scan results"""
         if not findings:
             console.print("[yellow]No findings discovered.[/yellow]")
             return
-            
-        # Summary table
+
+        # ── Summary table ──────────────────────────────────────────────────
         table = Table(title="Security Findings Summary", box=box.ROUNDED)
         table.add_column("Severity", style="bold")
         table.add_column("Count", justify="right")
-        
+
         severity_counts = {'Critical': 0, 'High': 0, 'Medium': 0, 'Low': 0, 'Info': 0}
         for f in findings:
             sev = f.get('severity', 'Info')
             severity_counts[sev] = severity_counts.get(sev, 0) + 1
-            
+
+        colour_map = {
+            'Critical': 'red', 'High': 'bright_red',
+            'Medium':   'yellow', 'Low': 'green', 'Info': 'blue'
+        }
         for sev, count in severity_counts.items():
-            color = {
-                'Critical': 'red',
-                'High': 'bright_red',
-                'Medium': 'yellow',
-                'Low': 'green',
-                'Info': 'blue'
-            }.get(sev, 'white')
-            table.add_row(f"[{color}]{sev}[/{color}]", str(count))
-            
+            colour = colour_map.get(sev, 'white')
+            table.add_row(f"[{colour}]{sev}[/{colour}]", str(count))
+
         console.print(table)
-        
-        # Detailed findings
+
+        # ── Brute force results get their own prominent block ──────────────
+        brute_findings = [f for f in findings if f.get('module') == 'brute_force'
+                          and 'CREDENTIALS FOUND' in f.get('title', '')]
+        if brute_findings:
+            console.print("\n[bold red]╔══ CREDENTIALS FOUND ══╗[/bold red]")
+            for bf in brute_findings:
+                ev = bf.get('evidence', {})
+                console.print(
+                    f"[bold green]  ✓ Username : {ev.get('username')}[/bold green]\n"
+                    f"[bold green]    Password : {ev.get('password')}[/bold green]\n"
+                    f"[bold green]    URL      : {ev.get('url')}[/bold green]\n"
+                    f"[bold green]    Attempts : {ev.get('attempts')}[/bold green]"
+                )
+            console.print("[bold red]╚════════════════════════╝[/bold red]\n")
+
+        # ── Detailed findings ──────────────────────────────────────────────
         console.print("\n[bold]Detailed Findings:[/bold]")
-        for finding in sorted(findings, key=lambda x: x.get('cvss_score', 0), reverse=True):
-            color = {
-                'Critical': 'red',
-                'High': 'bright_red',
-                'Medium': 'yellow',
-                'Low': 'green',
-                'Info': 'blue'
-            }.get(finding.get('severity'), 'white')
-            
-            console.print(f"\n[{color}]▶ {finding.get('title')} ({finding.get('severity')})[/{color}]")
-            console.print(f"  [dim]{finding.get('description')[:100]}...[/dim]")
-            console.print(f"  [cyan]PoC:[/cyan] {finding.get('poc', 'N/A')[:80]}...")
-            
-        # Attack paths
+        sorted_findings = sorted(findings, key=lambda x: x.get('cvss_score', 0), reverse=True)
+
+        for finding in sorted_findings:
+            colour = colour_map.get(finding.get('severity'), 'white')
+            title  = finding.get('title', 'Unknown')
+            desc   = finding.get('description', '')[:100]
+            poc    = finding.get('poc', 'N/A')[:80]
+            console.print(f"\n[{colour}]▶ {title} ({finding.get('severity')})[/{colour}]")
+            if desc:
+                console.print(f"  [dim]{desc}...[/dim]")
+            if poc and poc != 'N/A':
+                console.print(f"  [cyan]PoC:[/cyan] {poc}...")
+
+        # ── Attack paths ───────────────────────────────────────────────────
         if attack_paths:
             console.print("\n[bold red]Discovered Attack Paths:[/bold red]")
             for path in attack_paths:
                 console.print(f"\n[red]Chain: {path.get('name')}[/red]")
-                console.print(f"  Estimated Bounty: [green]${path.get('total_bounty', path.get('estimated_bounty', 0))}[/green]")
+                console.print(
+                    f"  Estimated Bounty: "
+                    f"[green]${path.get('total_bounty', path.get('estimated_bounty', 0))}[/green]"
+                )
                 console.print(f"  Complexity: {path.get('complexity')}")
                 if 'node_types' in path:
                     console.print(f"  Path: {' -> '.join(path['node_types'])}")
-                
-        # Save report
-        report_path = f"reports/output/raptor_report_{finding.get('target', 'unknown').replace('/', '_')}.md"
+
+        # ── Save report ────────────────────────────────────────────────────
+        # Guard against empty findings before accessing last element
+        if sorted_findings:
+            report_target = sorted_findings[0].get('target', 'unknown')
+        else:
+            report_target = 'unknown'
+
+        safe_target = report_target.replace('/', '_').replace(':', '_')
+        report_path = f"reports/output/raptor_report_{safe_target}.md"
         self._generate_report(findings, attack_paths, report_path)
         console.print(f"\n[green]Report saved to: {report_path}[/green]")
-        
+
     def _generate_report(self, findings: List[Dict], attack_paths: List[Dict], path: str):
         """Generate markdown report"""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        
+
         with open(path, 'w') as f:
             f.write("# RAPTOR Security Assessment Report\n\n")
             f.write(f"**Target:** {findings[0].get('target', 'Unknown') if findings else 'N/A'}\n\n")
             f.write(f"**Total Findings:** {len(findings)}\n\n")
             f.write("## Executive Summary\n\n")
-            
-            critical_high = [f for f in findings if f.get('severity') in ['Critical', 'High']]
+
+            critical_high = [x for x in findings if x.get('severity') in ['Critical', 'High']]
             if critical_high:
                 f.write(f"⚠️ **{len(critical_high)} Critical/High severity issues found**\n\n")
-                
+
+            # Highlight brute force success
+            bf_success = [x for x in findings
+                          if x.get('module') == 'brute_force'
+                          and 'CREDENTIALS FOUND' in x.get('title', '')]
+            if bf_success:
+                f.write("### 🔑 Valid Credentials Found\n\n")
+                for bf in bf_success:
+                    ev = bf.get('evidence', {})
+                    f.write(
+                        f"| Field    | Value |\n"
+                        f"|----------|-------|\n"
+                        f"| Username | `{ev.get('username')}` |\n"
+                        f"| Password | `{ev.get('password')}` |\n"
+                        f"| URL      | {ev.get('url')} |\n"
+                        f"| Attempts | {ev.get('attempts')} |\n\n"
+                    )
+
             f.write("## Findings\n\n")
-            
             for finding in sorted(findings, key=lambda x: x.get('cvss_score', 0), reverse=True):
                 f.write(f"### {finding.get('title')}\n\n")
                 f.write(f"- **Severity:** {finding.get('severity')}\n")
@@ -366,20 +435,27 @@ class Raptor:
                 f.write(f"- **Description:** {finding.get('description')}\n")
                 f.write(f"- **Proof of Concept:**\n```\n{finding.get('poc', 'N/A')}\n```\n")
                 f.write(f"- **Remediation:** {finding.get('remediation')}\n\n")
-                
+
             if attack_paths:
                 f.write("## Attack Paths\n\n")
-                for path in attack_paths:
-                    f.write(f"### {path.get('name', 'Attack Chain')}\n")
-                    f.write(f"- **Complexity:** {path.get('complexity')}\n")
-                    f.write(f"- **Estimated Bounty:** ${path.get('total_bounty', path.get('estimated_bounty', 0))}\n")
-                    if 'node_types' in path:
-                        f.write(f"- **Chain:** {' -> '.join(path['node_types'])}\n")
-                    f.write(f"- **Description:** {path.get('description', 'Vulnerability chain discovered through graph analysis')}\n\n")
+                for ap in attack_paths:
+                    f.write(f"### {ap.get('name', 'Attack Chain')}\n")
+                    f.write(f"- **Complexity:** {ap.get('complexity')}\n")
+                    f.write(
+                        f"- **Estimated Bounty:** "
+                        f"${ap.get('total_bounty', ap.get('estimated_bounty', 0))}\n"
+                    )
+                    if 'node_types' in ap:
+                        f.write(f"- **Chain:** {' -> '.join(ap['node_types'])}\n")
+                    f.write(
+                        f"- **Description:** "
+                        f"{ap.get('description', 'Vulnerability chain discovered')}\n\n"
+                    )
 
+
+# ── Entry point ─────────────────────────────────────────────────────────────
 
 def main():
-    # No args → show welcome
     if len(sys.argv) == 1:
         show_welcome()
         sys.exit(0)
@@ -388,20 +464,19 @@ def main():
         description="RAPTOR - Advanced Web Application Security Testing",
         add_help=False
     )
-
-    parser.add_argument('-h', '--help', action='store_true')
+    parser.add_argument('-h', '--help',              action='store_true')
     parser.add_argument('-t', '--target')
-    parser.add_argument('--modules', default='recon,server,xss,sqli,idor')
-    parser.add_argument('--full-scan', action='store_true')
-    parser.add_argument('--enable-brute-force', action='store_true')
-    parser.add_argument('--stealth', action='store_true')
-    parser.add_argument('--cookie', default=None)
-    parser.add_argument('--auth-header', default=None)
-    parser.add_argument('--proxy', default=None)
-    parser.add_argument('--config', default='config/config.yaml')
-    parser.add_argument('-o', '--output', default=None)
-    parser.add_argument('-v', '--verbose', action='store_true')
-    parser.add_argument('--version', action='version', version='RAPTOR 2.0')
+    parser.add_argument('--modules',                 default='recon,server,xss,sqli,idor')
+    parser.add_argument('--full-scan',               action='store_true')
+    parser.add_argument('--enable-brute-force',      action='store_true')
+    parser.add_argument('--stealth',                 action='store_true')
+    parser.add_argument('--cookie',                  default=None)
+    parser.add_argument('--auth-header',             default=None)
+    parser.add_argument('--proxy',                   default=None)
+    parser.add_argument('--config',                  default='config/config.yaml')
+    parser.add_argument('-o', '--output',            default=None)
+    parser.add_argument('-v', '--verbose',           action='store_true')
+    parser.add_argument('--version',                 action='version', version='RAPTOR 2.0')
 
     args = parser.parse_args()
 
@@ -416,16 +491,15 @@ def main():
     if not args.target.startswith(('http://', 'https://')):
         args.target = f"https://{args.target}"
 
-    # Modules — default is ALL, full power
     if args.full_scan or 'all' in args.modules:
         modules = ['recon', 'server', 'xss', 'sqli', 'idor']
     else:
         modules = [m.strip() for m in args.modules.split(',')]
-        valid = {'recon', 'server', 'xss', 'sqli', 'idor', 'brute', 'all'}
+        valid   = {'recon', 'server', 'xss', 'sqli', 'idor', 'brute', 'all'}
         invalid = set(modules) - valid
         if invalid:
             console.print(f"[red]Error: Invalid modules: {', '.join(invalid)}[/red]")
-            console.print(f"[yellow]Valid: {', '.join(valid)}[/yellow]")
+            console.print(f"[yellow]Valid: {', '.join(sorted(valid))}[/yellow]")
             sys.exit(1)
 
     if 'brute' in modules and not args.enable_brute_force:
@@ -438,18 +512,18 @@ def main():
         findings = asyncio.run(raptor.run_scan(
             args.target,
             modules,
-            stealth_mode=args.stealth,
-            scope='aggressive',          # always max power
-            enable_brute_force=args.enable_brute_force,
-            evasion_level=5,             # always max evasion
-            rate_limit=50,               # max concurrency
-            timeout=30,
-            max_depth=5,
-            cookie=args.cookie,
-            auth_header=args.auth_header,
-            proxy=args.proxy,
-            output_format='markdown',
-            output_path=args.output
+            stealth_mode        = args.stealth,
+            scope               = 'aggressive',
+            enable_brute_force  = args.enable_brute_force,
+            evasion_level       = 5,
+            rate_limit          = 50,
+            timeout             = 30,
+            max_depth           = 5,
+            cookie              = args.cookie,
+            auth_header         = args.auth_header,
+            proxy               = args.proxy,
+            output_format       = 'markdown',
+            output_path         = args.output
         ))
 
         critical_high = [f for f in findings if f.get('severity') in ['Critical', 'High']]
@@ -460,6 +534,8 @@ def main():
         sys.exit(130)
     except Exception as e:
         console.print(f"\n[red]Fatal Error: {e}[/red]")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
