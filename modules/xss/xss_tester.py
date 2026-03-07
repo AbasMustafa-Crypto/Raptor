@@ -2,8 +2,6 @@
 """
 RAPTOR XSS Testing Module v3.0
 ================================
-Cross-Site Scripting detection — XSStrike-grade intelligence inside RAPTOR.
-
 Usage (CLI):
     python3 raptor.py -t example.com --modules xss
 
@@ -993,3 +991,4 @@ class XSSTester(BaseModule):
             f'{k}={quote(v[0], safe="")}' for k, v in qs.items()
         )
         return parsed._replace(query=new_query).geturl()
+
