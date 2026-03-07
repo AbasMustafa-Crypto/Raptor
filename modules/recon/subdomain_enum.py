@@ -2,8 +2,135 @@ import asyncio
 import subprocess
 import json
 import shutil
+import os
+import stat
+import platform
+import urllib.request
+import zipfile
+import tarfile
+import tempfile
 from typing import List, Set, Dict
 from core.base_module import BaseModule, Finding
+
+# ── Auto-installer for recon tools ────────────────────────────────────────────
+
+# Install destination — raptor/bin/ so we never need sudo
+_BIN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), 'bin')
+
+# Latest release download URLs (linux/amd64)
+_TOOL_URLS = {
+    'subfinder': (
+        'https://github.com/projectdiscovery/subfinder/releases/latest/download/'
+        'subfinder_linux_amd64.zip',
+        'zip', 'subfinder'
+    ),
+    'assetfinder': (
+        'https://github.com/tomnomnom/assetfinder/releases/download/v0.1.1/'
+        'assetfinder-linux-amd64-0.1.1.tgz',
+        'tgz', 'assetfinder'
+    ),
+    'amass': (
+        'https://github.com/owasp-amass/amass/releases/latest/download/'
+        'amass_linux_amd64.zip',
+        'zip', 'amass'
+    ),
+}
+
+
+def _ensure_bin_dir():
+    """Create raptor/bin/ and add it to PATH for this process."""
+    os.makedirs(_BIN_DIR, exist_ok=True)
+    if _BIN_DIR not in os.environ.get('PATH', '').split(os.pathsep):
+        os.environ['PATH'] = _BIN_DIR + os.pathsep + os.environ.get('PATH', '')
+
+
+def _make_executable(path: str):
+    """Set executable bit on a file."""
+    st = os.stat(path)
+    os.chmod(path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _install_tool(tool: str) -> bool:
+    """
+    Download and install a single recon tool into raptor/bin/.
+    Returns True on success, False on failure.
+    """
+    if tool not in _TOOL_URLS:
+        return False
+
+    url, fmt, binary_name = _TOOL_URLS[tool]
+    dest = os.path.join(_BIN_DIR, tool)
+
+    print(f"  [*] Auto-installing {tool} → {dest}")
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            archive = os.path.join(tmpdir, f'{tool}_dl')
+            # Download
+            urllib.request.urlretrieve(url, archive)
+
+            if fmt == 'zip':
+                with zipfile.ZipFile(archive, 'r') as zf:
+                    zf.extractall(tmpdir)
+            elif fmt == 'tgz':
+                with tarfile.open(archive, 'r:gz') as tf:
+                    tf.extractall(tmpdir)
+
+            # Find the binary in the extracted tree
+            found = None
+            for root, _dirs, files in os.walk(tmpdir):
+                for fname in files:
+                    if fname == binary_name or fname == tool:
+                        found = os.path.join(root, fname)
+                        break
+                if found:
+                    break
+
+            if not found:
+                print(f"  [!] Could not locate {binary_name} binary in archive")
+                return False
+
+            import shutil as _shutil
+            _shutil.copy2(found, dest)
+            _make_executable(dest)
+
+        print(f"  [+] {tool} installed successfully")
+        return True
+
+    except Exception as e:
+        print(f"  [!] Failed to install {tool}: {e}")
+        return False
+
+
+def auto_install_recon_tools():
+    """
+    Check for amass, subfinder, assetfinder.
+    Automatically download and install any that are missing into raptor/bin/.
+    Called once at startup before any scan begins.
+    """
+    _ensure_bin_dir()
+
+    missing = [t for t in ('amass', 'subfinder', 'assetfinder') if not shutil.which(t)]
+    if not missing:
+        return  # All tools already present
+
+    print(f"\n  [!] Missing recon tools: {', '.join(missing)}")
+    print(f"  [*] Auto-installing into {_BIN_DIR} ...\n")
+
+    for tool in missing:
+        _install_tool(tool)
+
+    # Re-check after install
+    still_missing = [t for t in missing if not shutil.which(t)]
+    if still_missing:
+        print(f"  [!] Could not auto-install: {', '.join(still_missing)}")
+        print(f"      Install manually: sudo apt install amass  |  see wiki for others\n")
+    else:
+        print(f"  [+] All recon tools ready.\n")
+
+
+# ── Module ─────────────────────────────────────────────────────────────────────
+
 class SubdomainEnumerator(BaseModule):
     """Subdomain enumeration using multiple tools"""
     
@@ -12,6 +139,8 @@ class SubdomainEnumerator(BaseModule):
         self.graph = graph_manager
         self.tools = ['amass', 'subfinder', 'assetfinder']
         self.resolved_subdomains: Set[str] = set()
+        # Auto-install missing tools on first instantiation
+        auto_install_recon_tools()
         
     async def run(self, target: str, **kwargs) -> List[Finding]:
         """Run subdomain enumeration"""
