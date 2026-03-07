@@ -1,248 +1,227 @@
 """
-_console.py  –  Zero-dependency Rich replacement for RAPTOR
+_console.py — Zero-dependency Rich-like console for RAPTOR.
 Provides: Console, Table, Panel, Progress, SpinnerColumn, TextColumn, box
-All formatting is done with standard ANSI escape codes.
+All terminal output works with plain Python stdlib (sys, shutil, itertools).
 """
 
 import sys
-import time
+import shutil
+import itertools
 import threading
+import time
 import re
 from typing import List, Optional, Any
 
 
-# ── ANSI colour map ────────────────────────────────────────────────────────────
+# ── Markup stripper ─────────────────────────────────────────────────────────
 
-_ANSI = {
-    'bold':          '\033[1m',
-    'dim':           '\033[2m',
-    'red':           '\033[31m',
-    'green':         '\033[32m',
-    'yellow':        '\033[33m',
-    'blue':          '\033[34m',
-    'magenta':       '\033[35m',
-    'cyan':          '\033[36m',
-    'white':         '\033[37m',
-    'bright_red':    '\033[91m',
-    'bright_green':  '\033[92m',
-    'bright_yellow': '\033[93m',
-    'bright_blue':   '\033[94m',
-    'bright_cyan':   '\033[96m',
-    'bright_white':  '\033[97m',
-    'reset':         '\033[0m',
-}
-
-_TAG_RE = re.compile(r'\[/?([a-zA-Z0-9_ ]+)\]')
-
-
-def _render(text: str) -> str:
-    """Convert [bold cyan]...[/bold cyan] markup to ANSI codes."""
-    result = []
-    pos = 0
-    for m in _TAG_RE.finditer(text):
-        result.append(text[pos:m.start()])
-        tag = m.group(1).strip()
-        if tag.startswith('/'):
-            result.append(_ANSI['reset'])
-        else:
-            for part in tag.split():
-                code = _ANSI.get(part.lower())
-                if code:
-                    result.append(code)
-        pos = m.end()
-    result.append(text[pos:])
-    return ''.join(result) + _ANSI['reset']
-
+_MARKUP_RE = re.compile(r'\[/?[^\[\]]*\]')
 
 def _strip(text: str) -> str:
-    """Remove all markup tags, return plain text."""
-    return _TAG_RE.sub('', text)
+    """Remove [bold], [/red], etc. markup tags."""
+    return _MARKUP_RE.sub('', str(text))
 
 
-# ── Box styles ─────────────────────────────────────────────────────────────────
+# ── ANSI colour map ──────────────────────────────────────────────────────────
+
+_ANSI = {
+    'bold':       '\033[1m',
+    'dim':        '\033[2m',
+    'red':        '\033[31m',
+    'green':      '\033[32m',
+    'yellow':     '\033[33m',
+    'blue':       '\033[34m',
+    'cyan':       '\033[36m',
+    'white':      '\033[37m',
+    'bright_red': '\033[91m',
+    '/':          '\033[0m',   # reset (used for closing tags)
+}
+_RESET = '\033[0m'
+
+def _apply_markup(text: str) -> str:
+    """Convert [cyan]...[/cyan] markup to ANSI codes."""
+    def replace(m: re.Match) -> str:
+        tag = m.group(0)[1:-1]          # strip [ ]
+        if tag.startswith('/'):
+            return _RESET
+        parts = tag.split()
+        codes = ''.join(_ANSI.get(p, '') for p in parts)
+        return codes
+    return _MARKUP_RE.sub(replace, str(text)) + _RESET
+
+
+# ── box ──────────────────────────────────────────────────────────────────────
 
 class _Box:
-    ROUNDED   = {'tl':'╭','tr':'╮','bl':'╰','br':'╯','h':'─','v':'│','lm':'├','rm':'┤','tm':'┬','bm':'┴','c':'┼'}
-    DOUBLE_EDGE = {'tl':'╔','tr':'╗','bl':'╚','br':'╝','h':'═','v':'║','lm':'╠','rm':'╣','tm':'╦','bm':'╩','c':'╬'}
-    SIMPLE    = {'tl':'+','tr':'+','bl':'+','br':'+','h':'-','v':'|','lm':'+','rm':'+','tm':'+','bm':'+','c':'+'}
+    DOUBLE_EDGE = 'double'
+    ROUNDED     = 'rounded'
+    SIMPLE      = 'simple'
 
-box = type('box', (), {
-    'ROUNDED':     _Box.ROUNDED,
-    'DOUBLE_EDGE': _Box.DOUBLE_EDGE,
-    'SIMPLE':      _Box.SIMPLE,
-})()
+box = _Box()
 
 
-# ── Console ────────────────────────────────────────────────────────────────────
+# ── Panel ────────────────────────────────────────────────────────────────────
 
-class Console:
-    def __init__(self, no_color: bool = False):
-        self.no_color = no_color
+class Panel:
+    def __init__(self, text: str, box=None):
+        self.text = text
+        self._box = box
 
-    def print(self, *args, **kwargs):
-        text = ' '.join(str(a) for a in args)
-        if self.no_color:
-            sys.stdout.write(_strip(text) + '\n')
-        else:
-            sys.stdout.write(_render(text) + '\n')
-        sys.stdout.flush()
+    @staticmethod
+    def fit(text: str, box=None) -> 'Panel':
+        return Panel(text, box)
+
+    def __str__(self) -> str:
+        lines   = [_strip(l) for l in self.text.splitlines()]
+        width   = min(max((len(l) for l in lines), default=0) + 4, 80)
+        top     = '╔' + '═' * (width - 2) + '╗'
+        bottom  = '╚' + '═' * (width - 2) + '╝'
+        rows    = [top]
+        for l in lines:
+            rows.append('║ ' + l.ljust(width - 4) + ' ║')
+        rows.append(bottom)
+        return '\n'.join(rows)
 
 
-# ── Table ──────────────────────────────────────────────────────────────────────
+# ── Table ────────────────────────────────────────────────────────────────────
 
 class Table:
-    def __init__(self, title: str = '', box=None, **kwargs):
-        self.title = title
-        self.box_style = box or _Box.SIMPLE
-        self._cols: List[dict] = []
-        self._rows: List[List[str]] = []
+    def __init__(self, title: str = '', box=None):
+        self.title   = title
+        self._box    = box
+        self._cols:  List[dict] = []
+        self._rows:  List[List[str]] = []
 
-    def add_column(self, header: str, style: str = '', justify: str = 'left', **kw):
+    def add_column(self, header: str, style: str = '', justify: str = 'left'):
         self._cols.append({'header': header, 'style': style, 'justify': justify})
 
     def add_row(self, *cells):
-        self._rows.append([str(c) for c in cells])
+        self._rows.append([_strip(str(c)) for c in cells])
 
     def __str__(self) -> str:
-        b = self.box_style
-        # calculate column widths
-        widths = [len(_strip(c['header'])) for c in self._cols]
+        headers = [c['header'] for c in self._cols]
+        widths  = [len(h) for h in headers]
         for row in self._rows:
             for i, cell in enumerate(row):
                 if i < len(widths):
                     widths[i] = max(widths[i], len(_strip(cell)))
 
-        def hline(left, mid, right, fill):
-            parts = [fill * (w + 2) for w in widths]
-            return left + mid.join(parts) + right
+        def row_str(cells: List[str]) -> str:
+            parts = []
+            for i, cell in enumerate(cells):
+                w    = widths[i] if i < len(widths) else 10
+                just = self._cols[i]['justify'] if i < len(self._cols) else 'left'
+                s    = _strip(cell)
+                parts.append(s.rjust(w) if just == 'right' else s.ljust(w))
+            return '│ ' + ' │ '.join(parts) + ' │'
+
+        sep  = '├' + '┼'.join('─' * (w + 2) for w in widths) + '┤'
+        top  = '╭' + '┬'.join('─' * (w + 2) for w in widths) + '╮'
+        bot  = '╰' + '┴'.join('─' * (w + 2) for w in widths) + '╯'
 
         lines = []
         if self.title:
-            total = sum(widths) + 3 * len(widths) - 1
-            lines.append(_render(f'[bold]{self.title}[/bold]'))
-
-        lines.append(hline(b['tl'], b['tm'], b['tr'], b['h']))
-
-        # header
-        header_cells = []
-        for i, col in enumerate(self._cols):
-            plain = _strip(col['header'])
-            pad = widths[i] - len(plain)
-            header_cells.append(f" {_render('[bold]' + col['header'] + '[/bold]')}{' ' * pad} ")
-        lines.append(b['v'] + b['v'].join(header_cells) + b['v'])
-        lines.append(hline(b['lm'], b['c'], b['rm'], b['h']))
-
+            lines.append(self.title)
+        lines.append(top)
+        lines.append(row_str(headers))
+        lines.append(sep)
         for row in self._rows:
-            cells = []
-            for i in range(len(self._cols)):
-                cell = row[i] if i < len(row) else ''
-                plain_len = len(_strip(cell))
-                pad = widths[i] - plain_len
-                rendered = _render(cell)
-                if self._cols[i]['justify'] == 'right':
-                    cells.append(f"{' ' * (pad + 1)}{rendered} ")
-                else:
-                    cells.append(f" {rendered}{' ' * pad} ")
-            lines.append(b['v'] + b['v'].join(cells) + b['v'])
-
-        lines.append(hline(b['bl'], b['bm'], b['br'], b['h']))
+            lines.append(row_str(row + [''] * (len(self._cols) - len(row))))
+        lines.append(bot)
         return '\n'.join(lines)
 
 
-# ── Panel ──────────────────────────────────────────────────────────────────────
-
-class Panel:
-    def __init__(self, content: str, box=None, title: str = '', **kwargs):
-        self.content = content
-        self.box_style = box or _Box.ROUNDED
-        self.title = title
-
-    @classmethod
-    def fit(cls, content: str, box=None, **kwargs):
-        return cls(content, box=box, **kwargs)
-
-    def __str__(self) -> str:
-        b = self.box_style
-        plain_lines = _strip(self.content).splitlines()
-        width = max((len(l) for l in plain_lines), default=40) + 2
-
-        top = b['tl'] + b['h'] * width + b['tr']
-        bot = b['bl'] + b['h'] * width + b['br']
-
-        rendered_lines = []
-        for line in self.content.splitlines():
-            plain = _strip(line)
-            rendered = _render(line)
-            pad = width - 2 - len(plain)
-            rendered_lines.append(b['v'] + ' ' + rendered + ' ' * max(pad, 0) + ' ' + b['v'])
-
-        return '\n'.join([top] + rendered_lines + [bot])
-
-
-# ── Progress (spinner) ─────────────────────────────────────────────────────────
+# ── Progress / Spinner ────────────────────────────────────────────────────────
 
 class SpinnerColumn:
-    pass
+    _frames = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']
+    def __init__(self):
+        self._iter = itertools.cycle(self._frames)
+    def next_frame(self) -> str:
+        return next(self._iter)
 
 class TextColumn:
-    def __init__(self, fmt: str = '', **kw):
-        self.fmt = fmt
+    def __init__(self, template: str):
+        self.template = template
+    def render(self, description: str) -> str:
+        return _strip(self.template.replace('{task.description}', description))
+
 
 class _Task:
-    def __init__(self, tid: int, description: str):
-        self.id = tid
+    def __init__(self, description: str):
         self.description = description
-        self.completed = False
+        self.completed   = False
+
 
 class Progress:
-    _FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']
+    """Context-manager spinner that writes to stderr."""
 
-    def __init__(self, *columns, console: Optional[Console] = None, **kwargs):
-        self._console = console or Console()
-        self._tasks: List[_Task] = []
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._frame = 0
-        self._lock = threading.Lock()
+    def __init__(self, *columns, console=None):
+        self._columns   = columns
+        self._tasks:    List[_Task] = []
+        self._stop      = threading.Event()
+        self._thread:   Optional[threading.Thread] = None
+        self._lock      = threading.Lock()
 
     def __enter__(self):
-        self._running = True
+        self._stop.clear()
         self._thread = threading.Thread(target=self._spin, daemon=True)
         self._thread.start()
         return self
 
     def __exit__(self, *_):
-        self._running = False
+        self._stop.set()
         if self._thread:
             self._thread.join(timeout=1)
-        # clear spinner line
-        sys.stdout.write('\r' + ' ' * 80 + '\r')
-        sys.stdout.flush()
+        sys.stderr.write('\r' + ' ' * 80 + '\r')
+        sys.stderr.flush()
 
-    def add_task(self, description: str, total=None, **kw) -> int:
+    def add_task(self, description: str, total=None) -> int:
         with self._lock:
-            tid = len(self._tasks)
-            self._tasks.append(_Task(tid, description))
-        return tid
+            idx = len(self._tasks)
+            self._tasks.append(_Task(_strip(description)))
+        return idx
 
-    def update(self, task_id: int, completed: bool = False, **kw):
+    def update(self, task_id: int, completed=False, description: str = ''):
         with self._lock:
             if task_id < len(self._tasks):
-                self._tasks[task_id].completed = completed
                 if completed:
-                    desc = _strip(self._tasks[task_id].description)
-                    sys.stdout.write('\r' + ' ' * 80 + '\r')
-                    sys.stdout.write(_render(f'[green]✓[/green] {desc}\n'))
-                    sys.stdout.flush()
+                    self._tasks[task_id].completed = True
+                    # Print completion marker
+                    sys.stderr.write('\r✓ ' + self._tasks[task_id].description + '\n')
+                    sys.stderr.flush()
+                if description:
+                    self._tasks[task_id].description = _strip(description)
 
     def _spin(self):
-        while self._running:
+        spinner_col = next((c for c in self._columns if isinstance(c, SpinnerColumn)), SpinnerColumn())
+        while not self._stop.is_set():
+            frame = spinner_col.next_frame()
             with self._lock:
                 active = [t for t in self._tasks if not t.completed]
-                if active:
-                    desc = _strip(active[-1].description)
-                    frame = self._FRAMES[self._frame % len(self._FRAMES)]
-                    sys.stdout.write(f'\r{frame} {desc}   ')
-                    sys.stdout.flush()
-                    self._frame += 1
+                desc   = active[-1].description if active else ''
+            line = f'\r{frame} {desc[:70]}'
+            sys.stderr.write(line)
+            sys.stderr.flush()
             time.sleep(0.1)
+
+
+# ── Console ───────────────────────────────────────────────────────────────────
+
+class Console:
+    """Drop-in for rich.console.Console."""
+
+    def print(self, *args, **kwargs):
+        text = ' '.join(str(a) for a in args)
+        # Render panel objects directly
+        if len(args) == 1 and isinstance(args[0], Panel):
+            print(str(args[0]))
+            return
+        if len(args) == 1 and isinstance(args[0], Table):
+            print(str(args[0]))
+            return
+        # Strip markup for plain output, or apply ANSI if terminal
+        if sys.stdout.isatty():
+            print(_apply_markup(text))
+        else:
+            print(_strip(text))
