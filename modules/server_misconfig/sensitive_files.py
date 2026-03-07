@@ -96,12 +96,12 @@ class SensitiveFileScanner(BaseModule):
         return self.findings
         
     def _is_error_page(self, content: str) -> bool:
-        """Check if content is an error page"""
+        """Check if content is a generic error/404 page (not a real file)."""
         error_indicators = [
-            '404', 'not found', 'error', 'page not found',
-            'does not exist', 'no such file', 'not exist'
+            'page not found', 'does not exist', 'no such file',
+            'object not found', '404 not found', 'file not found',
         ]
-        content_lower = content.lower()[:500]  # Check first 500 chars
+        content_lower = content.lower()[:500]
         return any(indicator in content_lower for indicator in error_indicators)
         
     def _classify_severity(self, path: str) -> str:
