@@ -35,6 +35,7 @@
 - [Modules](#modules)
 - [Output & Reports](#output--reports)
 - [Configuration](#configuration)
+- [Neo4j Setup](#neo4j-setup)
 - [Legal & Ethics](#legal--ethics)
 
 ---
@@ -370,12 +371,58 @@ stealth:
   rotate_user_agents: true
 
 database:
-  sqlite_path: data/raptor.db
+  path: data/raptor.db
 
 modules:
   brute_force:
     max_attempts: 200
     wordlist_path: wordlists/
+```
+
+---
+
+## Neo4j Setup
+
+Neo4j is **optional** — RAPTOR falls back to SQLite-based correlation automatically if it is not installed. The warning `[!] Neo4j driver not installed. Graph features disabled.` is harmless if graph mapping is not needed.
+
+To enable visual attack path mapping, follow these three steps:
+
+### Step 1 — Install the Python driver
+
+```bash
+pip install neo4j
+```
+
+### Step 2 — Install the Neo4j database server
+
+On Kali Linux / Debian:
+
+```bash
+# Add the Neo4j repository
+wget -O - https://debian.neo4j.com/neotechnology.gpg.key | sudo apt-key add -
+echo 'deb https://debian.neo4j.com stable latest' | sudo tee /etc/apt/sources.list.d/neo4j.list
+
+# Install
+sudo apt update
+sudo apt install neo4j -y
+
+# Start and enable on boot
+sudo systemctl start neo4j
+sudo systemctl enable neo4j
+```
+
+On first start, open **http://localhost:7474** in a browser. Default login is `neo4j / neo4j` — you will be forced to change the password immediately.
+
+### Step 3 — Configure RAPTOR
+
+Add to `config/config.yaml`:
+
+```yaml
+graph:
+  uri:      "neo4j://localhost:7687"
+  username: "neo4j"
+  password: "your_new_password"
+  enabled:  true
 ```
 
 ---
