@@ -1,7 +1,7 @@
 import asyncio
 from typing import List, Dict, Optional, Tuple, Set
 from core.base_module import BaseModule, Finding
-from pathlib
+from pathlib import Path
 
 
 class CredentialTester(BaseModule):
