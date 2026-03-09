@@ -214,13 +214,13 @@ class CredentialTester(BaseModule):
                 print(f"\033[96m     python3 raptor.py -t \"<paste URL here>\" --modules brute --enable-brute-force ...\033[0m")
                 print()
                 # Return a dummy endpoint that will produce 0 attempts
-                return {{
+                return {
                     'url':       url,
                     'type':      'firebase_key_missing',
                     'form_type': 'firebase_key_missing',
                     'fields':    default_fields,
                     'is_api':    False,
-                }}
+                }
 
         # ── Standard form / API detection ─────────────────────────────────────
         ft     = self._detect_form_type(url, text, headers)
