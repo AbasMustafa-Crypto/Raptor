@@ -655,7 +655,7 @@ class CredentialTester(BaseModule):
                         found_event.set()
                         return
 
-                    text = await response.text()
+                    text = _cached_text if _cached_text else await response.text()
                     if any(i in text.lower() for i in ['locked','blocked','too many attempts',
                                                         'try again later','suspended','account disabled']):
                         sys.stdout.write('\n')
@@ -664,7 +664,7 @@ class CredentialTester(BaseModule):
                         return
 
                     # ── Success check ─────────────────────────────────────
-                    if await self._check_login_success(response, url):
+                    if await self._check_login_success_with_text(response, url, text):
                         sys.stdout.write('\n')
                         self._report_success(username, password, url, counter[0], username_fields, password_field)
                         found_event.set()
