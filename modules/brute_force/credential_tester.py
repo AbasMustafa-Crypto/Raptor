@@ -125,10 +125,9 @@ class CredentialTester(BaseModule):
             self.logger.warning("No login endpoints discovered")
             return self.findings
 
-        self.logger.info(f"Testing {len(login_endpoints)} endpoint(s) with NO DELAY")
+        self.logger.info(f"Brute forcing {len(login_endpoints)} endpoint(s) directly — NO DELAY")
 
         for endpoint in login_endpoints:
-            await self._test_rate_limiting(endpoint)
             await self._test_brute_force(endpoint)
 
         return self.findings
