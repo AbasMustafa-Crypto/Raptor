@@ -85,6 +85,10 @@ class CredentialTester(BaseModule):
         self.max_attempts   = config.get('max_attempts', 1000)
         self.delay          = 0  # FORCE NO DELAY
         self.wordlist_path  = config.get('wordlist_path', 'wordlists')
+        # ── Concurrency: how many requests fly simultaneously ──
+        # 50 is safe for CTF targets; raise to 100-200 if the
+        # target is local / doesn't throttle connections.
+        self.concurrency    = config.get('concurrency', 50)
 
     # ─────────────────────────────────────────────────────────
     # Entry point
@@ -597,128 +601,148 @@ class CredentialTester(BaseModule):
     # Core brute-force loop  (enhanced with form-type dispatch)
     # ─────────────────────────────────────────────────────────
     async def _test_brute_force(self, endpoint: Dict):
-        """Universal brute force test - NO DELAYS, MAXIMUM SPEED"""
-        url        = endpoint['url']
-        fields     = endpoint.get('fields', {})
-        form_type  = endpoint.get('form_type', 'html_form')
+        """
+        Concurrent brute force — fires self.concurrency requests simultaneously.
 
+        Architecture
+        ────────────
+        • A semaphore caps parallel in-flight requests.
+        • All (username, password) pairs are turned into asyncio Tasks and
+          gathered at once — no serial outer loop waiting for each response.
+        • A shared Event (_found) lets every task abort the moment one
+          succeeds or a hard rate-limit is hit.
+        • Attempt counter is updated atomically via a list (avoids nonlocal
+          rebinding issues with asyncio).
+        """
+        import itertools
+
+        url             = endpoint['url']
+        fields          = endpoint.get('fields', {})
+        form_type       = endpoint.get('form_type', 'html_form')
         username_fields = fields.get('username_fields', ['email', 'username', 'user', 'login'])
         password_field  = fields.get('password_field', 'password')
 
         self.logger.info(
-            f"Starting HIGH-SPEED brute force on {url} "
-            f"[form_type={form_type}] "
+            f"Starting CONCURRENT brute force on {url} "
+            f"[form_type={form_type}] [concurrency={self.concurrency}] "
             f"[fields: {username_fields} / {password_field}]"
         )
-        self.logger.warning("NO DELAY MODE: Requests sent as fast as possible!")
 
         base_usernames, passwords = self._load_wordlists()
-        all_usernames = self._generate_username_variations(base_usernames)
-
+        all_usernames  = list(self._generate_username_variations(base_usernames))
         total_attempts = len(all_usernames) * len(passwords)
+
         self.logger.info(
-            f"Testing {len(all_usernames)} usernames × "
-            f"{len(passwords)} passwords = {total_attempts} total attempts"
+            f"{len(all_usernames)} usernames × {len(passwords)} passwords "
+            f"= {total_attempts} total attempts  |  "
+            f"{self.concurrency} concurrent workers"
         )
 
-        rate_limited   = False
-        attempt_count  = 0
+        # ── Shared state ──────────────────────────────────────
+        semaphore     = asyncio.Semaphore(self.concurrency)
+        found_event   = asyncio.Event()          # set when creds found or hard-stop
+        rate_limited  = [False]                  # mutable flag shared across tasks
+        counter       = [0]                      # atomic-ish attempt counter
 
-        for username in all_usernames:
-            for password in passwords:
-                attempt_count += 1
+        # ── Single-attempt coroutine ──────────────────────────
+        async def attempt(username: str, password: str):
+            if found_event.is_set():
+                return                           # abort early if already done
 
-                # Build the correct payload for this form type
+            async with semaphore:
+                if found_event.is_set():
+                    return                       # double-check after acquiring sem
+
+                counter[0] += 1
+                attempt_num = counter[0]
+
+                if attempt_num % 50 == 0:
+                    self.logger.info(f"Progress: {attempt_num}/{total_attempts} attempts...")
+
                 p = self._build_payload(
                     form_type, username, password,
                     username_fields, password_field
                 )
 
                 try:
-                    if attempt_count % 10 == 0:
-                        self.logger.info(f"Progress: {attempt_count}/{total_attempts} attempts...")
-
                     response = None
 
-                    # ── HTTP Basic / Digest Auth ───────────────────────
                     if p['use_basic_auth']:
                         response = await self._make_request(
-                            url,
-                            method=p['method'],
+                            url, method=p['method'],
                             auth=p['basic_auth_tuple'],
-                            allow_redirects=False,
-                            headers=p['headers'],
+                            allow_redirects=False, headers=p['headers'],
                         )
-
-                    # ── XML / SOAP (raw string body) ───────────────────
-                    elif isinstance(p['data'], str):
+                    elif isinstance(p['data'], str):          # SOAP / XML
                         response = await self._make_request(
-                            url,
-                            method=p['method'],
+                            url, method=p['method'],
                             data=p['data'],
-                            allow_redirects=False,
-                            headers=p['headers'],
+                            allow_redirects=False, headers=p['headers'],
                         )
-
-                    # ── JSON body ─────────────────────────────────────
                     elif p['use_json']:
                         response = await self._make_request(
-                            url,
-                            method=p['method'],
+                            url, method=p['method'],
                             json=p['data'],
-                            allow_redirects=False,
-                            headers=p['headers'],
+                            allow_redirects=False, headers=p['headers'],
                         )
-
-                    # ── Form-encoded / multipart ───────────────────────
                     else:
                         response = await self._make_request(
-                            url,
-                            method=p['method'],
+                            url, method=p['method'],
                             data=p['data'],
-                            allow_redirects=False,
-                            headers=p['headers'],
+                            allow_redirects=False, headers=p['headers'],
                         )
 
                     if not response:
-                        continue
-
-                    is_success = await self._check_login_success(response, url)
-
-                    if is_success:
-                        self._report_success(
-                            username, password, url, attempt_count,
-                            username_fields, password_field
-                        )
                         return
 
-                    if response.status in [429, 503, 403]:
-                        rate_limited = True
+                    # ── Hard rate-limit: stop everything ──────
+                    if response.status in [429, 503]:
+                        rate_limited[0] = True
                         self.logger.warning(
-                            f"Rate limited (HTTP {response.status}) after {attempt_count} attempts"
+                            f"Rate limited (HTTP {response.status}) "
+                            f"after {attempt_num} attempts — stopping all workers"
                         )
-                        break
+                        found_event.set()
+                        return
 
+                    # ── Account lockout ───────────────────────
                     text = await response.text()
                     lockout_indicators = [
                         'locked', 'blocked', 'too many attempts',
                         'try again later', 'suspended', 'account disabled'
                     ]
                     if any(ind in text.lower() for ind in lockout_indicators):
-                        self.logger.warning("Account lockout detected")
-                        break
+                        self.logger.warning(f"Lockout detected at attempt {attempt_num}")
+                        found_event.set()
+                        return
+
+                    # ── Success check ─────────────────────────
+                    if await self._check_login_success(response, url):
+                        self._report_success(
+                            username, password, url, attempt_num,
+                            username_fields, password_field
+                        )
+                        found_event.set()
 
                 except Exception as e:
-                    self.logger.error(f"Attempt {attempt_count} error: {e}")
+                    self.logger.error(f"Attempt {attempt_num} error: {e}")
 
-            if rate_limited:
-                break
+        # ── Launch all tasks concurrently ─────────────────────
+        tasks = [
+            asyncio.create_task(attempt(u, p))
+            for u, p in itertools.product(all_usernames, passwords)
+        ]
 
-        if not rate_limited:
-            self.logger.info(f"No credentials found after {attempt_count} attempts")
+        # gather() runs everything; exceptions inside tasks are caught above
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-        if rate_limited:
-            self._add_rate_limit_finding(url, attempt_count)
+        # ── Summary ───────────────────────────────────────────
+        if rate_limited[0]:
+            self._add_rate_limit_finding(url, counter[0])
+        elif not found_event.is_set():
+            self.logger.info(
+                f"No credentials found after {counter[0]} attempts on {url}"
+            )
 
     # ─────────────────────────────────────────────────────────
     # Rate-limit test (unchanged from original)
