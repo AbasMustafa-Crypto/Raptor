@@ -29,12 +29,10 @@ from core.database_manager import DatabaseManager
 from core.report_manager   import ReportManager
 from core.correlator       import AttackPathCorrelator
 
-# GraphManager is optional — if the file doesn't exist / neo4j isn't installed
-# we fall back to a no-op stub so the rest of the framework keeps running.
 try:
     from core.graph_manager import GraphManager
 except ImportError:
-    class GraphManager:                        # type: ignore[no-redef]
+    class GraphManager:
         enabled = False
         def __init__(self, *a, **kw): pass
         def add_target(self, *a, **kw): return None
@@ -72,6 +70,7 @@ def show_welcome():
   python3 raptor.py -t [cyan]target.com[/cyan]
   python3 raptor.py -t [cyan]target.com[/cyan] --modules [green]xss,sqli,idor[/green]
   python3 raptor.py -t [cyan]target.com[/cyan] --modules [green]brute[/green] --enable-brute-force
+  python3 raptor.py -t [cyan]target.com[/cyan] --modules [green]brute[/green] --enable-brute-force [yellow]--userlist users.txt --passlist passwords.txt[/yellow]
 
 [bold green]Modules:[/bold green]
   [cyan]recon[/cyan]   Reconnaissance & Discovery
@@ -80,6 +79,11 @@ def show_welcome():
   [cyan]sqli[/cyan]    SQL Injection
   [cyan]idor[/cyan]    Insecure Direct Object Reference
   [cyan]brute[/cyan]   Brute Force (--enable-brute-force required)
+
+[bold green]Brute Force Wordlists:[/bold green]
+  Default path  : [cyan]wordlists/usernames.txt[/cyan]  +  [cyan]wordlists/passwords.txt[/cyan]
+  Custom files  : [yellow]--userlist /path/to/users.txt[/yellow]
+                  [yellow]--passlist /path/to/passwords.txt[/yellow]
 
   python3 raptor.py [bold]--help[/bold] for full documentation
 """)
@@ -109,12 +113,17 @@ def create_help_text():
   [green]python3 raptor.py -t target.com --modules xss,sqli,idor[/green]
   [green]python3 raptor.py -t target.com --full-scan[/green]
   [green]python3 raptor.py -t target.com --modules brute --enable-brute-force[/green]
+  [green]python3 raptor.py -t target.com --modules brute --enable-brute-force --userlist users.txt --passlist passwords.txt[/green]
 
 [bold cyan]OPTIONS[/bold cyan]
   [yellow]-t, --target[/yellow]            Target URL or domain (required)
   [yellow]--modules[/yellow]               Comma-separated modules (default: all)
   [yellow]--full-scan[/yellow]             Run all modules
   [yellow]--enable-brute-force[/yellow]    Enable brute force module
+  [yellow]--userlist[/yellow]              Path to custom usernames file
+                          (default: wordlists/usernames.txt)
+  [yellow]--passlist[/yellow]              Path to custom passwords file
+                          (default: wordlists/passwords.txt)
   [yellow]--stealth[/yellow]               Add delays between requests
   [yellow]--cookie[/yellow]                Auth cookie string
   [yellow]--auth-header[/yellow]           Authorization header value
@@ -122,6 +131,18 @@ def create_help_text():
   [yellow]-o, --output[/yellow]            Custom report output path
   [yellow]--config[/yellow]                Config file path (default: config/config.yaml)
   [yellow]-v, --verbose[/yellow]           Verbose output
+
+[bold cyan]WORDLIST EXAMPLES[/bold cyan]
+  Use default wordlists (auto-detected from wordlists/ folder):
+    [green]python3 raptor.py -t target.com --modules brute --enable-brute-force[/green]
+
+  Use your own files:
+    [green]python3 raptor.py -t target.com --modules brute --enable-brute-force \\[/green]
+    [green]  --userlist /home/user/users.txt --passlist /home/user/rockyou.txt[/green]
+
+  Use files inside the project:
+    [green]python3 raptor.py -t target.com --modules brute --enable-brute-force \\[/green]
+    [green]  --userlist wordlists/usernames.txt --passlist wordlists/passwords.txt[/green]
 
 [bold red]Only test systems you own or have explicit permission to test.[/bold red]
 """
@@ -135,7 +156,6 @@ class Raptor:
     def __init__(self, config_path: str = "config/config.yaml"):
         self.config     = self._load_config(config_path)
         self.stealth    = StealthManager(self.config.get('stealth', {}))
-        # ── FIX: correct nested key lookup for database path ───────────────
         db_path         = (
             self.config.get('database', {}).get('path') or
             'data/raptor.db'
@@ -146,8 +166,6 @@ class Raptor:
         self.findings:  List[Dict] = []
 
     def _load_config(self, path: str) -> Dict:
-        """Load configuration from YAML (bundled zero-dep parser)"""
-        # Resolve relative to script location if not found in cwd
         if not os.path.isabs(path) and not os.path.exists(path):
             candidate = os.path.join(_HERE, path)
             if os.path.exists(candidate):
@@ -159,10 +177,7 @@ class Raptor:
             console.print(f"[yellow]Config file not found: {path} — using defaults[/yellow]")
             return {}
 
-    # ── _module_cfg: safe nested config lookup ──────────────────────────────
-
     def _module_cfg(self, *keys) -> Dict:
-        """Walk self.config by keys, returning {} if any step is missing."""
         node = self.config
         for k in keys:
             if not isinstance(node, dict):
@@ -283,12 +298,17 @@ class Raptor:
 
             # ── Brute force ────────────────────────────────────────────────
             if 'brute' in modules and kwargs.get('enable_brute_force'):
-                task = progress.add_task("[cyan]Testing Brute Force Protections...", total=None)
+                task = progress.add_task("[cyan]Brute Forcing...", total=None)
 
-                # ── FIX: pass wordlist_path from config if available ───────
                 brute_cfg = dict(self._module_cfg('modules', 'brute_force'))
                 if 'wordlist_path' not in brute_cfg:
                     brute_cfg['wordlist_path'] = 'wordlists'
+
+                # ── Forward --userlist / --passlist into the module config ─
+                if kwargs.get('userlist'):
+                    brute_cfg['userlist'] = kwargs['userlist']
+                if kwargs.get('passlist'):
+                    brute_cfg['passlist'] = kwargs['passlist']
 
                 async with CredentialTester(
                     brute_cfg, stealth, self.db, self.graph
@@ -320,7 +340,6 @@ class Raptor:
             console.print("[yellow]No findings discovered.[/yellow]")
             return
 
-        # ── Summary table ──────────────────────────────────────────────────
         table = Table(title="Security Findings Summary", box=box.ROUNDED)
         table.add_column("Severity", style="bold")
         table.add_column("Count", justify="right")
@@ -340,7 +359,6 @@ class Raptor:
 
         console.print(table)
 
-        # ── Brute force results get their own prominent block ──────────────
         brute_findings = [f for f in findings if f.get('module') == 'brute_force'
                           and 'CREDENTIALS FOUND' in f.get('title', '')]
         if brute_findings:
@@ -355,7 +373,6 @@ class Raptor:
                 )
             console.print("[bold red]╚════════════════════════╝[/bold red]\n")
 
-        # ── Detailed findings ──────────────────────────────────────────────
         console.print("\n[bold]Detailed Findings:[/bold]")
         sorted_findings = sorted(findings, key=lambda x: x.get('cvss_score', 0), reverse=True)
 
@@ -370,7 +387,6 @@ class Raptor:
             if poc and poc != 'N/A':
                 console.print(f"  [cyan]PoC:[/cyan] {poc}...")
 
-        # ── Attack paths ───────────────────────────────────────────────────
         if attack_paths:
             console.print("\n[bold red]Discovered Attack Paths:[/bold red]")
             for path in attack_paths:
@@ -383,8 +399,6 @@ class Raptor:
                 if 'node_types' in path:
                     console.print(f"  Path: {' -> '.join(path['node_types'])}")
 
-        # ── Save report ────────────────────────────────────────────────────
-        # Guard against empty findings before accessing last element
         if sorted_findings:
             report_target = sorted_findings[0].get('target', 'unknown')
         else:
@@ -396,7 +410,6 @@ class Raptor:
         console.print(f"\n[green]Report saved to: {report_path}[/green]")
 
     def _generate_report(self, findings: List[Dict], attack_paths: List[Dict], path: str):
-        """Generate markdown report"""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
 
         with open(path, 'w') as f:
@@ -409,7 +422,6 @@ class Raptor:
             if critical_high:
                 f.write(f"⚠️ **{len(critical_high)} Critical/High severity issues found**\n\n")
 
-            # Highlight brute force success
             bf_success = [x for x in findings
                           if x.get('module') == 'brute_force'
                           and 'CREDENTIALS FOUND' in x.get('title', '')]
@@ -469,6 +481,12 @@ def main():
     parser.add_argument('--modules',                 default='recon,server,xss,sqli,idor')
     parser.add_argument('--full-scan',               action='store_true')
     parser.add_argument('--enable-brute-force',      action='store_true')
+    # ── Wordlist flags ────────────────────────────────────────────────────
+    parser.add_argument('--userlist',                default=None,
+                        help='Path to custom usernames file (default: wordlists/usernames.txt)')
+    parser.add_argument('--passlist',                default=None,
+                        help='Path to custom passwords file (default: wordlists/passwords.txt)')
+    # ─────────────────────────────────────────────────────────────────────
     parser.add_argument('--stealth',                 action='store_true')
     parser.add_argument('--cookie',                  default=None)
     parser.add_argument('--auth-header',             default=None)
@@ -515,6 +533,10 @@ def main():
             stealth_mode        = args.stealth,
             scope               = 'aggressive',
             enable_brute_force  = args.enable_brute_force,
+            # ── Pass wordlist paths all the way through to the module ──
+            userlist            = args.userlist,
+            passlist            = args.passlist,
+            # ──────────────────────────────────────────────────────────
             evasion_level       = 5,
             rate_limit          = 50,
             timeout             = 30,
