@@ -121,8 +121,25 @@ class CredentialTester(BaseModule):
 
         parsed  = urlparse(url)
         base    = f"{parsed.scheme}://{parsed.netloc}"
-        text    = ''
+        text    = ""
         headers = {}
+
+        # ── Fast-path: user passed the Firebase endpoint URL directly ─────────
+        if 'identitytoolkit.googleapis.com' in url:
+            print(f"\033[92m[+] Firebase Identity Toolkit URL detected directly\033[0m")
+            return {
+                'url':       url,
+                'type':      'firebase',
+                'form_type': 'firebase',
+                'fields': {
+                    'username_fields': ['email'],
+                    'password_field':  'password',
+                    'username_field':  'email',
+                    'email_field':     'email',
+                    'inputs': [], 'action': '', 'method': 'POST',
+                },
+                'is_api': True,
+            }
 
         try:
             response = await self._make_request(url)
@@ -479,17 +496,34 @@ class CredentialTester(BaseModule):
             print(f"\033[92m[+] {label}: {path} ({len(lines)} entries{flag})\033[0m")
             return lines
 
+        # ── Resolve paths: try as-given first, then relative to script dir ─
+        import os
+        script_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+
+        def _resolve(raw_path: str) -> Optional[Path]:
+            """Return the first existing Path for raw_path, or None."""
+            candidates = [
+                Path(raw_path),                        # absolute or relative to cwd
+                script_dir / raw_path,                 # relative to raptor root
+                Path(raw_path).expanduser(),           # ~/...
+            ]
+            for c in candidates:
+                if c.exists():
+                    return c
+            return None
+
         # ── Usernames ─────────────────────────────────────────
         if self.custom_userlist:
-            upath = Path(self.custom_userlist)
-            if upath.exists():
+            upath = _resolve(self.custom_userlist)
+            if upath:
                 usernames = _load_capped(upath, 'Custom userlist', MAX_U)
             else:
-                self.logger.warning(f"Custom userlist not found: {upath}, falling back to default")
+                print(f"\033[91m[!] Userlist not found: {self.custom_userlist}\033[0m")
+                print(f"\033[91m    Tried: {self.custom_userlist}, {script_dir / self.custom_userlist}\033[0m")
 
         if not usernames:
-            upath = Path(self.wordlist_path) / 'usernames.txt'
-            if upath.exists():
+            upath = _resolve(str(Path(self.wordlist_path) / 'usernames.txt'))
+            if upath:
                 usernames = _load_capped(upath, 'Userlist      ', MAX_U)
             else:
                 usernames = ['admin', 'administrator', 'user', 'test', 'root', 'admin@email.com']
@@ -497,15 +531,16 @@ class CredentialTester(BaseModule):
 
         # ── Passwords ─────────────────────────────────────────
         if self.custom_passlist:
-            ppath = Path(self.custom_passlist)
-            if ppath.exists():
+            ppath = _resolve(self.custom_passlist)
+            if ppath:
                 passwords = _load_capped(ppath, 'Custom passlist', MAX_P)
             else:
-                self.logger.warning(f"Custom passlist not found: {ppath}, falling back to default")
+                print(f"\033[91m[!] Passlist not found: {self.custom_passlist}\033[0m")
+                print(f"\033[91m    Tried: {self.custom_passlist}, {script_dir / self.custom_passlist}\033[0m")
 
         if not passwords:
-            ppath = Path(self.wordlist_path) / 'passwords.txt'
-            if ppath.exists():
+            ppath = _resolve(str(Path(self.wordlist_path) / 'passwords.txt'))
+            if ppath:
                 passwords = _load_capped(ppath, 'Passlist       ', MAX_P)
             else:
                 passwords = ['admin', 'password', '123456', 'login', 'admin123']
