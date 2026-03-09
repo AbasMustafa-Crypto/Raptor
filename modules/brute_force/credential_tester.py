@@ -565,137 +565,140 @@ class CredentialTester(BaseModule):
     # Core brute-force loop — concurrent with live progress bar
     # ─────────────────────────────────────────────────────────────────────────
     async def _test_brute_force(self, endpoint: Dict):
-        """
-        Concurrent brute force with live progress bar.
-        • asyncio.Semaphore caps parallel in-flight requests.
-        • asyncio.Event stops all workers the instant creds are found.
-        • Progress bar updates in-place on every completed attempt.
-        """
+        """Concurrent brute force with live progress bar."""
         import itertools
+        import aiohttp
 
-        url             = endpoint['url']
-        fields          = endpoint.get('fields', {})
-        form_type       = endpoint.get('form_type', 'html_form')
-        username_fields = fields.get('username_fields', ['email', 'username', 'user', 'login'])
-        password_field  = fields.get('password_field',  'password')
-
-        # ── Abort early for unresolvable Firebase apps ──────────────────────
         if endpoint.get('form_type') == 'firebase_key_missing':
             return
 
+        url        = endpoint['url']
+        form_type  = endpoint.get('form_type', 'html_form')
+        fields     = endpoint.get('fields', {})
+        ufields    = fields.get('username_fields', ['email'])
+        pfield     = fields.get('password_field', 'password')
+
         base_usernames, passwords = self._load_wordlists()
-        # Variations disabled — wordlist already has the right entries
-        all_usernames  = list(dict.fromkeys(base_usernames))  # deduplicate, preserve order
+        all_usernames  = list(dict.fromkeys(base_usernames))
         total_attempts = len(all_usernames) * len(passwords)
 
         print(f"\033[96m[*] Usernames  : {len(all_usernames)}\033[0m")
-        print(f"\033[96m[*] Passwords                   : {len(passwords)}\033[0m")
-        print(f"\033[96m[*] Total attempts              : {total_attempts}\033[0m")
-        print(f"\033[96m[*] Concurrent workers          : {self.concurrency}\033[0m\n")
+        print(f"\033[96m[*] Passwords  : {len(passwords)}\033[0m")
+        print(f"\033[96m[*] Total      : {total_attempts}\033[0m")
+        print(f"\033[96m[*] Workers    : {self.concurrency}\033[0m\n")
 
-        semaphore    = asyncio.Semaphore(self.concurrency)
-        found_event  = asyncio.Event()
+        semaphore   = asyncio.Semaphore(self.concurrency)
+        found_event = asyncio.Event()
+        counter     = [0]
         rate_limited = [False]
-        counter      = [0]          # completed attempts (thread-safe via GIL + asyncio)
 
         async def attempt(username: str, password: str):
             if found_event.is_set():
                 return
-
             async with semaphore:
                 if found_event.is_set():
                     return
-
                 try:
-                    response = None
-
-                    # ── Firebase: JSON body with email + password ─────────
+                    # ── Build request ─────────────────────────────────────
                     if form_type == 'firebase':
-                        response = await self._make_request(
-                            url, method='POST',
-                            json={'email': username, 'password': password, 'returnSecureToken': True},
-                            allow_redirects=False,
-                            headers={'Content-Type': 'application/json'})
-
-                    # ── JSON API ──────────────────────────────────────────
-                    elif form_type in ('json_api', 'jwt_login', 'ajax_form', 'graphql'):
-                        body = {password_field: password}
-                        for f in username_fields:
-                            body[f] = username
-                        response = await self._make_request(
-                            url, method='POST', json=body,
-                            allow_redirects=False,
-                            headers={'Content-Type': 'application/json'})
-
-                    # ── Standard HTML form POST ───────────────────────────
+                        body    = {'email': username, 'password': password, 'returnSecureToken': True}
+                        req_kw  = {'json': body}
+                        hdrs    = {'Content-Type': 'application/json'}
+                    elif form_type in ('json_api', 'jwt_login', 'ajax_form'):
+                        body    = {pfield: password}
+                        for f in ufields: body[f] = username
+                        req_kw  = {'json': body}
+                        hdrs    = {'Content-Type': 'application/json'}
                     else:
-                        body = {password_field: password}
-                        for f in username_fields:
-                            body[f] = username
-                        response = await self._make_request(
-                            url, method='POST', data=body,
-                            allow_redirects=False,
-                            headers={'Content-Type': 'application/x-www-form-urlencoded'})
+                        body    = {pfield: password}
+                        for f in ufields: body[f] = username
+                        req_kw  = {'data': body}
+                        hdrs    = {'Content-Type': 'application/x-www-form-urlencoded'}
 
-                    # ── Progress bar ──────────────────────────────────────
+                    # ── Send request directly via aiohttp ─────────────────
+                    timeout = aiohttp.ClientTimeout(total=15)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.post(url, headers=hdrs,
+                                                ssl=False, allow_redirects=False,
+                                                **req_kw) as resp:
+                            status  = resp.status
+                            text    = await resp.text()
+                            resp_hdrs = resp.headers
+
                     counter[0] += 1
-                    self._print_progress(
-                        counter[0], total_attempts,
-                        prefix=f'  \033[96m{username[:20]:<20}\033[0m'
-                    )
+                    self._print_progress(counter[0], total_attempts,
+                                         prefix=f'  \033[96m{username[:22]:<22}\033[0m')
 
-                    if not response:
-                        return
+                    # ── Always show response on first attempt for debugging ─
+                    if counter[0] == 1:
+                        sys.stdout.write('\n')
+                        print(f"\033[90m[debug] HTTP {status} | {text[:200]}\033[0m\n")
 
-                    # ── Rate-limit / lockout ──────────────────────────────
-                    if response.status in [429, 503]:
+                    # ── Rate limit ────────────────────────────────────────
+                    if status == 429:
                         rate_limited[0] = True
-                        sys.stdout.write('\n')
-                        self.logger.warning(f"Rate limited (HTTP {response.status}) after {counter[0]} attempts")
                         found_event.set()
                         return
 
-                    text = _cached_text if _cached_text else await response.text()
-                    if any(i in text.lower() for i in ['locked','blocked','too many attempts',
-                                                        'try again later','suspended','account disabled']):
+                    # ── Success detection ─────────────────────────────────
+                    tl = text.lower()
+
+                    # Firebase success: contains idToken
+                    if any(k in tl for k in ['idtoken', 'localid', 'refreshtoken']):
                         sys.stdout.write('\n')
-                        self.logger.warning(f"Lockout detected at attempt {counter[0]}")
+                        self._report_success(username, password, url, counter[0], ufields, pfield)
                         found_event.set()
                         return
 
-                    # ── Success check ─────────────────────────────────────
-                    if await self._check_login_success_with_text(response, url, text):
-                        sys.stdout.write('\n')
-                        self._report_success(username, password, url, counter[0], username_fields, password_field)
-                        found_event.set()
+                    # Redirect to dashboard
+                    if status in [301, 302, 303, 307, 308]:
+                        loc = resp_hdrs.get('Location', '').lower()
+                        if any(p in loc for p in ['/dashboard','/admin','/home','/panel','/welcome']):
+                            sys.stdout.write('\n')
+                            self._report_success(username, password, url, counter[0], ufields, pfield)
+                            found_event.set()
+                            return
 
+                    # JSON token response
+                    if 'application/json' in resp_hdrs.get('Content-Type',''):
+                        if any(k in tl for k in ['access_token','auth_token','"token"']) and '"error"' not in tl:
+                            sys.stdout.write('\n')
+                            self._report_success(username, password, url, counter[0], ufields, pfield)
+                            found_event.set()
+                            return
+
+                    # Session cookie set
+                    cookie = resp_hdrs.get('Set-Cookie','').lower()
+                    if status == 200 and any(c in cookie for c in ['session','token','auth','jwt']):
+                        fail_words = ['invalid','incorrect','failed','wrong','denied','error']
+                        if not any(f in tl for f in fail_words):
+                            sys.stdout.write('\n')
+                            self._report_success(username, password, url, counter[0], ufields, pfield)
+                            found_event.set()
+
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     counter[0] += 1
-                    self.logger.debug(f"Attempt {counter[0]} error: {e}")
+                    sys.stdout.write('\n')
+                    print(f"\033[91m[error] {username}:{password} → {e}\033[0m")
 
-        # ── Launch all tasks ──────────────────────────────────────────────────
         tasks = [asyncio.create_task(attempt(u, p))
                  for u, p in itertools.product(all_usernames, passwords)]
         try:
             await asyncio.gather(*tasks, return_exceptions=True)
         except (KeyboardInterrupt, asyncio.CancelledError):
-            # Cancel every pending task immediately so Ctrl+C exits fast
-            for t in tasks:
-                t.cancel()
+            for t in tasks: t.cancel()
             sys.stdout.write('\n')
-            print(f"\033[93m[!] Brute force interrupted after {counter[0]} attempts\033[0m")
+            print(f"\033[93m[!] Interrupted after {counter[0]} attempts\033[0m")
             return
 
-        # Ensure progress bar ends on its own line
-        if counter[0] < total_attempts:
-            self._print_progress(counter[0], total_attempts)
-
-        print()  # blank line after bar
-
+        sys.stdout.write('\n')
         if rate_limited[0]:
             self._add_rate_limit_finding(url, counter[0])
         elif not found_event.is_set():
-            print(f"\033[93m[-] No credentials found after {counter[0]} attempts on {url}\033[0m")
+            print(f"\033[93m[-] No credentials found after {counter[0]} attempts\033[0m")
+
 
     # ─────────────────────────────────────────────────────────────────────────
     # Rate-limit test (kept for compatibility — not called in run())
