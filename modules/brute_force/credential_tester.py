@@ -201,11 +201,26 @@ class CredentialTester(BaseModule):
                     'is_api':    True,
                 }
             else:
-                # Firebase app but couldn't extract key — warn and use best-guess
-                print(f"\033[93m[!] Firebase app detected but API key not found in source.\033[0m")
-                print(f"\033[93m    The login may be handled by a bundled JS file.\033[0m")
-                print(f"\033[93m    Tip: open DevTools → Network tab → filter 'signInWithPassword'\033[0m")
-                print(f"\033[93m         then pass the full URL as target instead of admin.html\033[0m")
+                # Firebase app but key not found — tell user exactly what to do and stop
+                print(f"\033[91m[!] Firebase app detected but API key not found automatically.\033[0m")
+                print(f"\033[93m")
+                print(f"  HOW TO GET THE CORRECT TARGET URL:\033[0m")
+                print(f"\033[93m  1. Open Chrome/Firefox and go to: {url}\033[0m")
+                print(f"\033[93m  2. Press F12 → Network tab → clear log\033[0m")
+                print(f"\033[93m  3. Try logging in with ANY credentials\033[0m")
+                print(f"\033[93m  4. Look for a request to: identitytoolkit.googleapis.com\033[0m")
+                print(f"\033[93m  5. Right-click it → Copy → Copy as URL\033[0m")
+                print(f"\033[93m  6. Run raptor with that URL as the target:\033[0m")
+                print(f"\033[96m     python3 raptor.py -t \"<paste URL here>\" --modules brute --enable-brute-force ...\033[0m")
+                print()
+                # Return a dummy endpoint that will produce 0 attempts
+                return {{
+                    'url':       url,
+                    'type':      'firebase_key_missing',
+                    'form_type': 'firebase_key_missing',
+                    'fields':    default_fields,
+                    'is_api':    False,
+                }}
 
         # ── Standard form / API detection ─────────────────────────────────────
         ft     = self._detect_form_type(url, text, headers)
@@ -496,20 +511,23 @@ class CredentialTester(BaseModule):
             print(f"\033[92m[+] {label}: {path} ({len(lines)} entries{flag})\033[0m")
             return lines
 
-        # ── Resolve paths: try as-given first, then relative to script dir ─
+        # ── Resolve paths from CWD (where the user runs raptor.py from) ────
         import os
-        script_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+        cwd = Path(os.getcwd())   # always ~/raptor when run as: python3 raptor.py
 
         def _resolve(raw_path: str) -> Optional[Path]:
-            """Return the first existing Path for raw_path, or None."""
+            """Return the first existing Path, trying cwd-relative first."""
             candidates = [
-                Path(raw_path),                        # absolute or relative to cwd
-                script_dir / raw_path,                 # relative to raptor root
-                Path(raw_path).expanduser(),           # ~/...
+                Path(raw_path),           # absolute path  /home/...
+                cwd / raw_path,           # relative to ~/raptor  ← most common
+                Path(raw_path).expanduser(),
             ]
             for c in candidates:
-                if c.exists():
-                    return c
+                try:
+                    if c.exists():
+                        return c.resolve()
+                except Exception:
+                    pass
             return None
 
         # ── Usernames ─────────────────────────────────────────
@@ -518,13 +536,13 @@ class CredentialTester(BaseModule):
             if upath:
                 usernames = _load_capped(upath, 'Custom userlist', MAX_U)
             else:
-                print(f"\033[91m[!] Userlist not found: {self.custom_userlist}\033[0m")
-                print(f"\033[91m    Tried: {self.custom_userlist}, {script_dir / self.custom_userlist}\033[0m")
+                print(f"\033[91m[!] Userlist not found: '{self.custom_userlist}'\033[0m")
+                print(f"\033[91m    Make sure the file exists at: {cwd / self.custom_userlist}\033[0m")
 
         if not usernames:
             upath = _resolve(str(Path(self.wordlist_path) / 'usernames.txt'))
             if upath:
-                usernames = _load_capped(upath, 'Userlist      ', MAX_U)
+                usernames = _load_capped(upath, 'Userlist (default)', MAX_U)
             else:
                 usernames = ['admin', 'administrator', 'user', 'test', 'root', 'admin@email.com']
                 print(f"\033[93m[!] No userlist found — using {len(usernames)} built-in defaults\033[0m")
@@ -535,13 +553,13 @@ class CredentialTester(BaseModule):
             if ppath:
                 passwords = _load_capped(ppath, 'Custom passlist', MAX_P)
             else:
-                print(f"\033[91m[!] Passlist not found: {self.custom_passlist}\033[0m")
-                print(f"\033[91m    Tried: {self.custom_passlist}, {script_dir / self.custom_passlist}\033[0m")
+                print(f"\033[91m[!] Passlist not found: '{self.custom_passlist}'\033[0m")
+                print(f"\033[91m    Make sure the file exists at: {cwd / self.custom_passlist}\033[0m")
 
         if not passwords:
             ppath = _resolve(str(Path(self.wordlist_path) / 'passwords.txt'))
             if ppath:
-                passwords = _load_capped(ppath, 'Passlist       ', MAX_P)
+                passwords = _load_capped(ppath, 'Passlist (default)', MAX_P)
             else:
                 passwords = ['admin', 'password', '123456', 'login', 'admin123']
                 print(f"\033[93m[!] No passlist found — using {len(passwords)} built-in defaults\033[0m")
@@ -581,6 +599,10 @@ class CredentialTester(BaseModule):
         form_type       = endpoint.get('form_type', 'html_form')
         username_fields = fields.get('username_fields', ['email', 'username', 'user', 'login'])
         password_field  = fields.get('password_field',  'password')
+
+        # ── Abort early for unresolvable Firebase apps ──────────────────────
+        if endpoint.get('form_type') == 'firebase_key_missing':
+            return
 
         base_usernames, passwords = self._load_wordlists()
         # Variations disabled — wordlist already has the right entries
