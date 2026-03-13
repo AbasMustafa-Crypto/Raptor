@@ -1,86 +1,109 @@
+"""
+subdomain_enum.py — Subdomain enumeration module for RAPTOR.
+
+FIXES vs original
+─────────────────
+ 1. super().__init__() now passes graph_manager correctly
+ 2. auto_install_recon_tools() moved out of __init__ into run() to avoid
+    blocking network I/O in the constructor
+ 3. _validate_subdomains uses a thread-safe asyncio.Lock for list appends
+ 4. amass command corrected for v4+ (no '-json -'; output is plain text)
+ 5. stdout.decode() uses errors='replace' to handle non-UTF-8 tool output
+ 6. _check_ct_logs: crt.sh response is decoded with errors='replace' rather
+    than relying on response.json() which fails on gzip-compressed body
+ 7. tarfile.extractall uses filter='data' (Python 3.12 TarSlip mitigation)
+    with a fallback for older Python versions
+ 8. _validate_subdomains: status code logic tightened (2xx/3xx only)
+"""
+
 import asyncio
 import json
-import shutil
 import os
+import shutil
 import stat
-import urllib.request
-import urllib.parse
-import zipfile
+import sys
 import tarfile
 import tempfile
-from typing import List, Set, Dict
+import urllib.parse
+import urllib.request
+import zipfile
+from typing import Dict, List, Optional, Set
+
 from core.base_module import BaseModule, Finding
 
-# ── Auto-installer for recon tools ────────────────────────────────────────────
+
+# ── Tool installer ────────────────────────────────────────────────────────────
 
 _BIN_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    'bin'
+    "bin",
 )
 
-# GitHub API — resolves the REAL latest release URL at runtime (no more 404s)
-_TOOL_APIS = {
-    'subfinder':   'https://api.github.com/repos/projectdiscovery/subfinder/releases/latest',
-    'assetfinder': 'https://api.github.com/repos/tomnomnom/assetfinder/releases/latest',
-    'amass':       'https://api.github.com/repos/owasp-amass/amass/releases/latest',
+_TOOL_APIS: Dict[str, str] = {
+    "subfinder":   "https://api.github.com/repos/projectdiscovery/subfinder/releases/latest",
+    "assetfinder": "https://api.github.com/repos/tomnomnom/assetfinder/releases/latest",
+    "amass":       "https://api.github.com/repos/owasp-amass/amass/releases/latest",
 }
 
-# Keywords to find the right asset in the release
-_TOOL_ASSET_KEYWORDS = {
-    'subfinder':   ('linux_amd64', '.zip'),
-    'assetfinder': ('linux-amd64', '.tgz'),
-    'amass':       ('linux_amd64', '.zip'),
+# (keyword-in-asset-url, extension)
+_TOOL_ASSET_KEYWORDS: Dict[str, tuple] = {
+    "subfinder":   ("linux_amd64", ".zip"),
+    "assetfinder": ("linux-amd64", ".tgz"),
+    "amass":       ("linux_amd64", ".zip"),
 }
 
-# Hardcoded fallback if API is unreachable
-_TOOL_FALLBACK = {
-    'subfinder': (
-        'https://github.com/projectdiscovery/subfinder/releases/download/'
-        'v2.6.6/subfinder_linux_amd64.zip', 'zip', 'subfinder'
+_TOOL_FALLBACK: Dict[str, tuple] = {
+    "subfinder": (
+        "https://github.com/projectdiscovery/subfinder/releases/download/"
+        "v2.6.6/subfinder_linux_amd64.zip",
+        "zip", "subfinder",
     ),
-    'assetfinder': (
-        'https://github.com/tomnomnom/assetfinder/releases/download/'
-        'v0.1.1/assetfinder-linux-amd64-0.1.1.tgz', 'tgz', 'assetfinder'
+    "assetfinder": (
+        "https://github.com/tomnomnom/assetfinder/releases/download/"
+        "v0.1.1/assetfinder-linux-amd64-0.1.1.tgz",
+        "tgz", "assetfinder",
     ),
-    'amass': (
-        'https://github.com/owasp-amass/amass/releases/download/'
-        'v4.2.0/amass_linux_amd64.zip', 'zip', 'amass'
+    "amass": (
+        "https://github.com/owasp-amass/amass/releases/download/"
+        "v4.2.0/amass_linux_amd64.zip",
+        "zip", "amass",
     ),
 }
 
 
-def _ensure_bin_dir():
+def _ensure_bin_dir() -> None:
     os.makedirs(_BIN_DIR, exist_ok=True)
-    if _BIN_DIR not in os.environ.get('PATH', '').split(os.pathsep):
-        os.environ['PATH'] = _BIN_DIR + os.pathsep + os.environ.get('PATH', '')
+    if _BIN_DIR not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = _BIN_DIR + os.pathsep + os.environ.get("PATH", "")
 
 
-def _make_executable(path: str):
+def _make_executable(path: str) -> None:
     st = os.stat(path)
     os.chmod(path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _resolve_download_url(tool: str):
-    """Query GitHub API for the real latest release URL. Falls back to hardcoded if API fails."""
-    api_url = _TOOL_APIS[tool]
-    kw1, ext = _TOOL_ASSET_KEYWORDS[tool]
+def _resolve_download_url(tool: str) -> tuple:
+    """Query GitHub API for the latest release asset URL; fall back if needed."""
+    api_url    = _TOOL_APIS[tool]
+    kw, ext    = _TOOL_ASSET_KEYWORDS[tool]
 
     try:
-        req = urllib.request.Request(api_url, headers={'User-Agent': 'RAPTOR-installer'})
+        req = urllib.request.Request(
+            api_url, headers={"User-Agent": "RAPTOR-installer"}
+        )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
 
-        for asset in data.get('assets', []):
-            url = asset.get('browser_download_url', '')
-            if kw1 in url and ext in url:
-                fmt = 'zip' if url.endswith('.zip') else 'tgz'
-                tag = data.get('tag_name', 'latest')
-                print(f"  [*] {tool} latest release: {tag}")
-                return (url, fmt, tool)
+        for asset in data.get("assets", []):
+            asset_url = asset.get("browser_download_url", "")
+            if kw in asset_url and ext in asset_url:
+                fmt = "zip" if asset_url.endswith(".zip") else "tgz"
+                print(f"  [*] {tool} latest release: {data.get('tag_name', '?')}")
+                return (asset_url, fmt, tool)
 
-        print(f"  [!] No matching asset in latest release for {tool} — using fallback")
-    except Exception as e:
-        print(f"  [!] GitHub API failed for {tool} ({e}) — using fallback URL")
+        print(f"  [!] No matching asset for {tool} in latest release — using fallback")
+    except Exception as exc:
+        print(f"  [!] GitHub API error for {tool} ({exc}) — using fallback")
 
     return _TOOL_FALLBACK[tool]
 
@@ -93,23 +116,28 @@ def _install_tool(tool: str) -> bool:
         url, fmt, binary_name = _resolve_download_url(tool)
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            archive = os.path.join(tmpdir, 'archive')
+            archive = os.path.join(tmpdir, "archive")
             urllib.request.urlretrieve(url, archive)
 
-            if fmt == 'zip':
-                with zipfile.ZipFile(archive, 'r') as zf:
+            if fmt == "zip":
+                with zipfile.ZipFile(archive, "r") as zf:
                     zf.extractall(tmpdir)
             else:
-                with tarfile.open(archive, 'r:gz') as tf:
-                    tf.extractall(tmpdir)
+                with tarfile.open(archive, "r:gz") as tf:
+                    # FIX 7: filter='data' prevents TarSlip path traversal.
+                    # Falls back gracefully on Python < 3.12.
+                    try:
+                        tf.extractall(tmpdir, filter="data")
+                    except TypeError:
+                        tf.extractall(tmpdir)  # pragma: no cover
 
-            # Walk extracted files and find the binary
-            found = None
+            # Walk extracted tree to locate the binary
+            found: Optional[str] = None
             for root, _dirs, files in os.walk(tmpdir):
                 for fname in files:
-                    if fname == tool or fname == binary_name:
+                    if fname in (tool, binary_name):
                         candidate = os.path.join(root, fname)
-                        if os.path.getsize(candidate) > 1000:  # skip README/txt files
+                        if os.path.getsize(candidate) > 1_000:
                             found = candidate
                             break
                 if found:
@@ -119,21 +147,20 @@ def _install_tool(tool: str) -> bool:
                 print(f"  [!] Could not locate {tool} binary in archive")
                 return False
 
-            import shutil as _sh
-            _sh.copy2(found, dest)
+            shutil.copy2(found, dest)
             _make_executable(dest)
 
         print(f"  [+] {tool} installed successfully")
         return True
 
-    except Exception as e:
-        print(f"  [!] Failed to install {tool}: {e}")
+    except Exception as exc:
+        print(f"  [!] Failed to install {tool}: {exc}")
         return False
 
 
-def auto_install_recon_tools():
+def _auto_install_recon_tools() -> None:
     _ensure_bin_dir()
-    missing = [t for t in ('amass', 'subfinder', 'assetfinder') if not shutil.which(t)]
+    missing = [t for t in ("amass", "subfinder", "assetfinder") if not shutil.which(t)]
     if not missing:
         return
 
@@ -146,56 +173,58 @@ def auto_install_recon_tools():
     still_missing = [t for t in missing if not shutil.which(t)]
     if still_missing:
         print(f"\n  [!] Could not auto-install: {', '.join(still_missing)}")
-        print(f"      Try manually: sudo apt install amass\n")
+        print("      Try manually: sudo apt install amass\n")
     else:
-        print(f"\n  [+] All recon tools ready.\n")
+        print("\n  [+] All recon tools ready.\n")
 
 
-# ── Domain extraction helper ──────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _extract_domain(target: str) -> str:
     """
-    Extract bare hostname from any input.
-    'https://example.com/path' → 'example.com'
-    'example.com/path'         → 'example.com'
-    'example.com'              → 'example.com'
+    Return a bare hostname from any input:
+      'https://example.com/path' → 'example.com'
+      'example.com/path'         → 'example.com'
+      'example.com'              → 'example.com'
     """
-    if '://' not in target:
-        target = 'https://' + target
-    host = urllib.parse.urlparse(target).hostname or ''
-    return host.split(':')[0].strip()
+    if "://" not in target:
+        target = "https://" + target
+    host = urllib.parse.urlparse(target).hostname or ""
+    return host.split(":")[0].strip()
 
 
 # ── Module ────────────────────────────────────────────────────────────────────
 
 class SubdomainEnumerator(BaseModule):
-    """Subdomain enumeration using multiple tools"""
+    """Subdomain enumeration via amass / subfinder / assetfinder + CT logs."""
 
-    # FIX 1: Pass graph_manager to super().__init__() so BaseModule.graph is
-    #         correctly set — previously it was omitted, leaving BaseModule.graph
-    #         as None and then overwritten manually below, breaking the base
-    #         class contract and any future BaseModule methods that use self.graph.
-    def __init__(self, config, stealth=None, db=None, graph_manager=None):
+    def __init__(self, config: Dict, stealth=None, db=None, graph_manager=None):
+        # FIX 1: pass graph_manager to BaseModule so self.graph is set correctly
         super().__init__(config, stealth, db, graph_manager)
-        self.tools = ['amass', 'subfinder', 'assetfinder']
+        self.tools = ["amass", "subfinder", "assetfinder"]
         self.resolved_subdomains: Set[str] = set()
-        auto_install_recon_tools()
+        # FIX 2: installer called in run(), not __init__, to avoid blocking I/O
+        # in the constructor (urllib.urlretrieve downloads large binaries)
 
     async def run(self, target: str, **kwargs) -> List[Finding]:
-        """Run subdomain enumeration"""
-        # ALWAYS pass bare domain to tools and CT logs — never a full URL
+        # FIX 2: install here — still synchronous but only runs when scan starts,
+        # not when the object is constructed during import/config phase
+        _auto_install_recon_tools()
+
         domain = _extract_domain(target)
-        self.logger.info(f"Starting subdomain enumeration for domain: {domain}")
+        self.logger.info("Starting subdomain enumeration for: %s", domain)
 
         all_subdomains: Set[str] = set()
 
-        available_tools = self._get_available_tools()
+        available = self._get_available_tools()
+        if not available:
+            self.logger.warning("No external tools available — CT logs only")
 
-        if not available_tools:
-            self.logger.warning("No external subdomain tools found. Using CT logs only.")
-
-        tasks = [self._run_tool(tool, domain) for tool in available_tools
-                 if kwargs.get(f'use_{tool}', True)]
+        tasks = [
+            self._run_tool(tool, domain)
+            for tool in available
+            if kwargs.get(f"use_{tool}", True)
+        ]
 
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -203,24 +232,24 @@ class SubdomainEnumerator(BaseModule):
                 if isinstance(result, set):
                     all_subdomains.update(result)
                 elif isinstance(result, Exception):
-                    self.logger.error(f"Tool error: {result}")
+                    self.logger.error("Tool error: %s", result)
 
-        # CT logs — always runs, uses clean domain
         await self._check_ct_logs(domain, all_subdomains)
 
-        self.logger.info(f"Found {len(all_subdomains)} unique subdomains")
+        self.logger.info("Found %d unique subdomains (pre-validation)", len(all_subdomains))
 
-        valid_subdomains = await self._validate_subdomains(all_subdomains) if all_subdomains else []
+        valid = await self._validate_subdomains(all_subdomains) if all_subdomains else []
 
-        for subdomain in valid_subdomains:
+        for sub in valid:
             if self.db:
-                self.db.save_asset('subdomain', subdomain, 'recon',
-                                   metadata={'resolved': True})
+                self.db.save_asset("subdomain", sub, "recon", metadata={"resolved": True})
 
-        if valid_subdomains:
-            await self._analyze_subdomains(valid_subdomains, domain)
+        if valid:
+            await self._analyze_subdomains(valid, domain)
 
         return self.findings
+
+    # ── Tool management ───────────────────────────────────────────────────────
 
     def _get_available_tools(self) -> List[str]:
         available = []
@@ -228,154 +257,188 @@ class SubdomainEnumerator(BaseModule):
             if shutil.which(tool):
                 available.append(tool)
             else:
-                self.logger.warning(f"{tool} not found in PATH - skipping")
+                self.logger.warning("%s not in PATH — skipping", tool)
         return available
 
     async def _run_tool(self, tool: str, domain: str) -> Set[str]:
-        """Run a recon tool against a bare domain (no scheme, no path)"""
-        subdomains = set()
+        """Run one recon tool against a bare domain; return set of subdomains."""
+        subdomains: Set[str] = set()
         try:
-            if tool == 'amass':
-                cmd = ['amass', 'enum', '-passive', '-d', domain, '-json', '-']
-            elif tool == 'subfinder':
-                cmd = ['subfinder', '-d', domain, '-all', '-silent', '-json']
-            elif tool == 'assetfinder':
-                cmd = ['assetfinder', '--subs-only', domain]
+            if tool == "subfinder":
+                # subfinder -json outputs one JSON object per line
+                cmd = ["subfinder", "-d", domain, "-all", "-silent", "-json"]
+            elif tool == "assetfinder":
+                # assetfinder outputs plain text, one subdomain per line
+                cmd = ["assetfinder", "--subs-only", domain]
+            elif tool == "amass":
+                # FIX 4: amass v4+ no longer supports '-json -' (stdout JSON).
+                # Plain text output is reliable across all versions.
+                cmd = ["amass", "enum", "-passive", "-d", domain]
             else:
                 return subdomains
 
-            self.logger.info(f"Running {tool} against {domain}...")
-
+            self.logger.info("Running %s against %s …", tool, domain)
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
             )
 
             try:
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
             except asyncio.TimeoutError:
-                self.logger.warning(f"{tool} timed out")
+                self.logger.warning("%s timed out — killing", tool)
                 proc.kill()
                 await proc.wait()
                 return subdomains
 
-            if tool == 'assetfinder':
-                for line in stdout.decode().strip().split('\n'):
+            # FIX 5: always decode with errors='replace'; tool output may be
+            # non-UTF-8 on certain locales or for IDN domains.
+            raw = stdout.decode("utf-8", errors="replace").strip()
+
+            if tool == "assetfinder" or tool == "amass":
+                for line in raw.splitlines():
                     line = line.strip()
                     if line and domain in line:
-                        subdomains.add(line)
-            else:
-                for line in stdout.decode().strip().split('\n'):
+                        subdomains.add(line.lower())
+            elif tool == "subfinder":
+                for line in raw.splitlines():
                     if not line:
                         continue
                     try:
-                        data = json.loads(line)
-                        name = data.get('name', '') if tool == 'amass' else data.get('host', '')
+                        obj  = json.loads(line)
+                        name = obj.get("host", "")
                         if name and domain in name:
-                            subdomains.add(name)
+                            subdomains.add(name.lower())
                     except json.JSONDecodeError:
-                        continue
+                        # subfinder sometimes emits non-JSON status lines
+                        if domain in line:
+                            subdomains.add(line.strip().lower())
 
         except FileNotFoundError:
-            self.logger.warning(f"{tool} not found in PATH")
-        except Exception as e:
-            self.logger.error(f"Error running {tool}: {e}")
+            self.logger.warning("%s not found in PATH", tool)
+        except Exception as exc:
+            self.logger.error("Error running %s: %s", tool, exc)
 
         return subdomains
 
+    # ── Validation ────────────────────────────────────────────────────────────
+
     async def _validate_subdomains(self, subdomains: Set[str]) -> List[str]:
         """
-        Validate subdomains by probing HTTP — returns only those that respond.
+        HTTP-probe each subdomain; return only those that respond with 2xx/3xx.
 
-        FIX 2: Separated the append from the request so a failed HTTP probe
-                (non-exception path, e.g. status >= 500) still logs correctly,
-                and exception handling is scoped only to the request itself so
-                a crash in one check never silently kills the whole batch.
+        FIX 3: uses asyncio.Lock to guard the shared 'valid' list so concurrent
+        appends are safe even if CPython's GIL is ever removed.
+        FIX 8: status check tightened to < 400 (success + redirect only).
         """
-        valid = []
+        valid: List[str] = []
+        lock      = asyncio.Lock()
         semaphore = asyncio.Semaphore(20)
 
-        async def check(sub):
+        async def probe(sub: str) -> None:
             async with semaphore:
                 try:
-                    resp = await self._make_request(f"http://{sub}", allow_redirects=True)
-                    if resp and resp.status < 500:
-                        valid.append(sub)
+                    resp = await self._make_request(
+                        f"http://{sub}", allow_redirects=True, timeout=8
+                    )
+                    if resp and resp.status < 400:
+                        async with lock:
+                            valid.append(sub)
                         self.resolved_subdomains.add(sub)
                     elif resp:
-                        self.logger.debug(f"Skipping {sub}: HTTP {resp.status}")
-                except Exception as e:
-                    self.logger.debug(f"Validation error for {sub}: {e}")
+                        self.logger.debug("Skip %s — HTTP %d", sub, resp.status)
+                except Exception as exc:
+                    self.logger.debug("Probe error %s: %s", sub, exc)
 
-        await asyncio.gather(*[check(s) for s in subdomains], return_exceptions=True)
+        await asyncio.gather(*[probe(s) for s in subdomains], return_exceptions=True)
         return valid
 
-    async def _analyze_subdomains(self, subdomains: List[str], domain: str):
-        staging_keywords = ['staging', 'dev', 'test', 'uat', 'qa', 'preprod', 'preview']
-        for subdomain in subdomains:
-            for keyword in staging_keywords:
-                if keyword in subdomain.lower():
+    # ── Analysis ──────────────────────────────────────────────────────────────
+
+    async def _analyze_subdomains(self, subdomains: List[str], domain: str) -> None:
+        staging_keywords = ["staging", "dev", "test", "uat", "qa", "preprod", "preview"]
+        for sub in subdomains:
+            sub_lower = sub.lower()
+            for kw in staging_keywords:
+                if kw in sub_lower:
                     self.add_finding(Finding(
-                        module='recon',
-                        title=f'Staging/Dev Environment Found: {subdomain}',
-                        severity='Medium',
-                        description=f'Discovered {keyword} environment which may have weaker security controls',
-                        evidence={'subdomain': subdomain, 'type': keyword},
-                        poc=f"Visit: http://{subdomain}",
-                        remediation='Ensure staging environments have equivalent security controls to production',
+                        module="recon",
+                        title=f"Staging/Dev Environment Exposed: {sub}",
+                        severity="Medium",
+                        description=(
+                            f"Discovered a '{kw}' environment that may have "
+                            "weaker security controls than production."
+                        ),
+                        evidence={"subdomain": sub, "keyword": kw},
+                        poc=f"http://{sub}",
+                        remediation=(
+                            "Apply the same security controls (auth, headers, TLS) "
+                            "to non-production environments as production."
+                        ),
                         cvss_score=5.3,
                         bounty_score=500,
-                        target=subdomain
+                        target=sub,
                     ))
-                    break
+                    break  # one finding per subdomain
 
-    async def _check_ct_logs(self, domain: str, existing_subdomains: Set[str]):
-        """Query crt.sh Certificate Transparency logs using a bare domain."""
+    # ── CT logs ───────────────────────────────────────────────────────────────
+
+    async def _check_ct_logs(self, domain: str, existing: Set[str]) -> None:
+        """
+        Query crt.sh Certificate Transparency logs for the bare domain.
+
+        FIX 6: crt.sh sends gzip-compressed JSON when the request headers
+        include 'Accept-Encoding: gzip'. BaseModule._make_request uses urllib
+        which transparently decompresses gzip responses, so response.body is
+        already plain bytes — but to be safe we decode manually and parse
+        rather than relying on response.json() which re-encodes to bytes first.
+        """
+        clean = _extract_domain(domain) if ("/" in domain or "://" in domain) else domain
+        url   = f"https://crt.sh/?q=%.{clean}&output=json"
+        self.logger.info("Checking CT logs: %s", url)
+
+        resp = await self._make_request(url, timeout=15)
+        if not resp:
+            self.logger.warning("CT logs: no response from crt.sh")
+            return
+
+        if resp.status != 200:
+            self.logger.warning("CT logs: crt.sh returned HTTP %d", resp.status)
+            return
+
         try:
-            # Extra safety: strip any accidental scheme/path
-            clean = _extract_domain(domain) if '/' in domain or '://' in domain else domain
-            url = f"https://crt.sh/?q=%.{clean}&output=json"
-            self.logger.info(f"Checking CT logs: crt.sh/?q=%.{clean}")
+            # Decode body ourselves — handles both compressed and plain responses
+            raw  = resp._body.decode("utf-8", errors="replace")
+            data = json.loads(raw)
+        except Exception as exc:
+            self.logger.warning("CT logs: failed to parse crt.sh response: %s", exc)
+            return
 
-            response = await self._make_request(url)
-            if not response:
-                self.logger.warning("CT log check: no response from crt.sh")
-                return
+        ct_found: Set[str] = set()
+        for entry in data:
+            for name in entry.get("name_value", "").split("\n"):
+                name = name.strip().lower()
+                if name and "*" not in name and clean in name:
+                    ct_found.add(name)
 
-            if response.status == 200:
-                try:
-                    data = await response.json()
-                    ct_subdomains = set()
+        self.logger.info("CT logs returned %d subdomains", len(ct_found))
+        existing.update(ct_found)
 
-                    for entry in data:
-                        # name_value can contain multiple lines
-                        for name in entry.get('name_value', '').split('\n'):
-                            name = name.strip()
-                            if name and '*' not in name and clean in name:
-                                ct_subdomains.add(name)
-
-                    self.logger.info(f"CT logs returned {len(ct_subdomains)} subdomains")
-                    existing_subdomains.update(ct_subdomains)
-
-                    new = ct_subdomains - self.resolved_subdomains
-                    if new:
-                        self.add_finding(Finding(
-                            module='recon',
-                            title=f'Subdomains Found via CT Logs: {len(new)}',
-                            severity='Low',
-                            description=f'Found {len(new)} subdomains in Certificate Transparency logs',
-                            evidence={'subdomains': list(new)[:10]},
-                            poc=f"https://crt.sh/?q=%.{clean}",
-                            remediation='Review all subdomains for proper security controls',
-                            cvss_score=3.7,
-                            bounty_score=100,
-                            target=clean
-                        ))
-                except Exception as e:
-                    self.logger.warning(f"Failed to parse CT log response: {e}")
-            else:
-                self.logger.warning(f"crt.sh returned status {response.status}")
-
-        except Exception as e:
-            self.logger.error(f"CT log check failed: {e}")
+        new = ct_found - self.resolved_subdomains
+        if new:
+            self.add_finding(Finding(
+                module="recon",
+                title=f"Subdomains Discovered via CT Logs ({len(new)})",
+                severity="Low",
+                description=(
+                    f"Found {len(new)} subdomains in Certificate Transparency logs. "
+                    "These may expose historical or forgotten infrastructure."
+                ),
+                evidence={"subdomains": sorted(new)[:10], "total": len(new)},
+                poc=f"https://crt.sh/?q=%.{clean}",
+                remediation="Review all subdomains and ensure they are intentional and secured.",
+                cvss_score=3.7,
+                bounty_score=100,
+                target=clean,
+            ))
