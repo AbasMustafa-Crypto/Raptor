@@ -68,18 +68,33 @@ class GraphManager:
             self._connect()
             
     def _connect(self):
-        """Establish Neo4j connection"""
+        """Establish Neo4j connection with environment variable priority"""
+        import os
         try:
-            uri = self.config.get('neo4j_uri', 'bolt://localhost:7687')
-            user = self.config.get('neo4j_user', 'neo4j')
-            password = self.config.get('neo4j_password', 'password')
+            # Priority: 1. Env Vars, 2. Config (new style), 3. Config (README style), 4. Defaults
+            uri = os.environ.get('NEO4J_URI') or self.config.get('neo4j_uri') or \
+                  self.config.get('uri', 'bolt://localhost:7687')
             
+            user = os.environ.get('NEO4J_USER') or self.config.get('neo4j_user') or \
+                   self.config.get('username', 'neo4j')
+            
+            password = os.environ.get('NEO4J_PASSWORD') or self.config.get('neo4j_password') or \
+                       self.config.get('password', 'password')
+            
+            # Support for bolt+s:// or neo4j+s:// if users have SSL-only setups
             self.driver = GraphDatabase.driver(uri, auth=(user, password))
             self.driver.verify_connectivity()
             print(f"[+] Neo4j connected: {uri}")
             self._init_schema()
+        except Neo4jError as e:
+            if "unauthorized" in str(e).lower():
+                print(f"[-] Neo4j Auth Failed: Check NEO4J_PASSWORD environment variable or config.yaml")
+            else:
+                print(f"[-] Neo4j Error: {e}")
+            self.enabled = False
         except Exception as e:
             print(f"[-] Neo4j connection failed: {e}")
+            print(f"    Hint: Use 'export NEO4J_PASSWORD=your_pass' before running.")
             self.enabled = False
             
     def _init_schema(self):
@@ -388,6 +403,30 @@ class GraphManager:
             result = session.run(query, {'cred_id': credential_id})
             return [dict(record) for record in result]
             
+    def sync_findings(self, target: str, findings: List[Dict]):
+        """Sync a list of findings to the graph at once (for post-scan sync)"""
+        if not self.enabled:
+            return
+            
+        print(f"[*] Syncing {len(findings)} findings to Neo4j...")
+        target_id = self.add_target(target.replace('https://', '').replace('http://', '').split('/')[0])
+        
+        for finding in findings:
+            # 1. Add Endpoint
+            url = finding.get('poc', target) if finding.get('poc') and finding.get('poc').startswith('http') else target
+            ep_id = self.add_endpoint(url, target_id=target_id)
+            
+            # 2. Add Vulnerability
+            self.add_vulnerability(
+                vuln_type=finding.get('title', 'Unknown'),
+                severity=finding.get('severity', 'Info'),
+                endpoint_id=ep_id,
+                evidence=finding.get('evidence', {}),
+                cvss_score=finding.get('cvss_score', 0.0),
+                bounty_score=finding.get('bounty_score', 0)
+            )
+        print(f"[+] Sync complete!")
+
     def close(self):
         """Close Neo4j connection"""
         if self.driver:

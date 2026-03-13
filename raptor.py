@@ -69,8 +69,9 @@ def show_welcome():
 [bold green]Quick Start:[/bold green]
   python3 raptor.py -t [cyan]target.com[/cyan]
   python3 raptor.py -t [cyan]target.com[/cyan] --modules [green]xss,sqli,idor[/green]
-  python3 raptor.py -t [cyan]target.com[/cyan] --modules [green]brute[/green] --enable-brute-force
-  python3 raptor.py -t [cyan]target.com[/cyan] --modules [green]brute[/green] --enable-brute-force [yellow]--userlist users.txt --passlist passwords.txt[/yellow]
+  
+[bold green]New Features:[/bold green]
+  [yellow]Interactive Neo4j Sync[/yellow] — Visualize attack paths at the end of any scan!
 
 [bold green]Modules:[/bold green]
   [cyan]recon[/cyan]   Reconnaissance & Discovery
@@ -107,6 +108,11 @@ def create_help_text():
   [cyan]idor[/cyan]    Sequential IDs, REST manipulation, mass assignment
   [cyan]brute[/cyan]   Credential brute force (requires --enable-brute-force)
   [cyan]all[/cyan]     Run everything except brute
+
+[bold cyan]NEO4J VISUALIZATION[/bold cyan]
+  RAPTOR now supports interactive Neo4j synchronization. At the end of a scan, 
+  you will be prompted to sync findings to your graph database for visual 
+  attack path analysis.
 
 [bold cyan]USAGE[/bold cyan]
   [green]python3 raptor.py -t target.com[/green]
@@ -153,8 +159,11 @@ def create_help_text():
 class Raptor:
     """Main RAPTOR Framework Controller"""
 
-    def __init__(self, config_path: str = "config/config.yaml"):
+    def __init__(self, config_path: str = "config/config.yaml", config_overrides: Dict = None):
         self.config     = self._load_config(config_path)
+        if config_overrides:
+            self._apply_overrides(self.config, config_overrides)
+            
         self.stealth    = StealthManager(self.config.get('stealth', {}))
         db_path         = (
             self.config.get('database', {}).get('path') or
@@ -164,6 +173,14 @@ class Raptor:
         self.graph      = GraphManager(self.config.get('graph', {}))
         self.correlator = AttackPathCorrelator(self.db, self.graph)
         self.findings:  List[Dict] = []
+
+    def _apply_overrides(self, config: Dict, overrides: Dict):
+        """Deep merge overrides into config"""
+        for k, v in overrides.items():
+            if isinstance(v, dict) and k in config:
+                self._apply_overrides(config[k], v)
+            else:
+                config[k] = v
 
     def _load_config(self, path: str) -> Dict:
         if not os.path.isabs(path) and not os.path.exists(path):
@@ -488,6 +505,11 @@ def main():
                         help='Path to custom passwords file (default: wordlists/passwords.txt)')
     # ─────────────────────────────────────────────────────────────────────
     parser.add_argument('--stealth',                 action='store_true')
+    # ── Neo4j flags ───────────────────────────────────────────────────────
+    parser.add_argument('--neo4j-uri',               help='Neo4j URI (bolt://, bolt+s://, neo4j://)')
+    parser.add_argument('--neo4j-user',              help='Neo4j Username')
+    parser.add_argument('--neo4j-pass',              help='Neo4j Password')
+    # ─────────────────────────────────────────────────────────────────────
     parser.add_argument('--cookie',                  default=None)
     parser.add_argument('--auth-header',             default=None)
     parser.add_argument('--proxy',                   default=None)
@@ -524,7 +546,14 @@ def main():
         console.print("[red]Brute force requires --enable-brute-force flag[/red]")
         sys.exit(1)
 
-    raptor = Raptor(args.config)
+    # ── Handle Neo4j Overrides ───────────────────────────────────────────
+    overrides = {'graph': {}}
+    if args.neo4j_uri:  overrides['graph']['neo4j_uri'] = args.neo4j_uri
+    if args.neo4j_user: overrides['graph']['neo4j_user'] = args.neo4j_user
+    if args.neo4j_pass: overrides['graph']['neo4j_password'] = args.neo4j_pass
+    # ─────────────────────────────────────────────────────────────────────
+
+    raptor = Raptor(args.config, config_overrides=overrides)
 
     try:
         findings = asyncio.run(raptor.run_scan(
@@ -549,6 +578,58 @@ def main():
         ))
 
         critical_high = [f for f in findings if f.get('severity') in ['Critical', 'High']]
+
+        # ── Interactive Neo4j Prompt (at the end) ───────────────────────────
+        from core.graph_manager import NEO4J_AVAILABLE
+        if NEO4J_AVAILABLE and not raptor.graph.enabled:
+            console.print("\n[bold cyan]Would you like to sync results to Neo4j for visual representation? (y/n)[/bold cyan]")
+            choice = input(" > ").lower()
+            if choice in ['y', 'yes']:
+                import getpass
+                uri = input(" Neo4j URI [bolt://localhost:7687]: ") or "bolt://localhost:7687"
+                user = input(" Neo4j User [neo4j]: ") or "neo4j"
+                pwd = getpass.getpass(" Neo4j Password: ")
+                
+                # Re-init GraphManager interactively
+                raptor.graph.config = {
+                    'neo4j_uri': uri,
+                    'neo4j_user': user,
+                    'neo4j_password': pwd,
+                    'enabled': True
+                }
+                raptor.graph.enabled = True
+                raptor.graph._connect()
+                
+                if raptor.graph.enabled:
+                    raptor.graph.sync_findings(args.target, findings)
+                    
+                    # ── Dynamic Browser Link Calculation ──────────────────
+                    import urllib.parse
+                    try:
+                        parsed = urllib.parse.urlparse(uri if "://" in uri else f"bolt://{uri}")
+                        host = parsed.hostname or "localhost"
+                        # Browser is usually on 7474, Bolt on 7687
+                        browser_url = f"http://{host}:7474"
+                        console.print(f"\n[bold green]📊 Graph Synced![/bold green] Open your browser to view the visualization:")
+                        console.print(f"   👉 [bold cyan underline]{browser_url}[/bold cyan underline]")
+                    except:
+                        console.print(f"\n[bold green]📊 Graph Synced![/bold green] View at: [bold cyan]http://localhost:7474[/bold cyan]")
+                    
+                    # ── Neo4j Tutorial ──────────────────────────────────
+                    console.print(Panel(
+                        "[bold yellow]Neo4j uses Cypher.[/bold yellow]\n\n"
+                        "[bold cyan]Show all nodes:[/bold cyan]\n"
+                        "[white]MATCH (n) RETURN n LIMIT 100[/white]\n\n"
+                        "[bold cyan]Show all relationships:[/bold cyan]\n"
+                        "[white]MATCH (n)-[r]->(m) RETURN n,r,m LIMIT 100[/white]",
+                        title="[bold green]Neo4j Quick Start[/bold green]",
+                        border_style="green"
+                    ))
+                    # ─────────────────────────────────────────────────────
+                else:
+                    console.print("[red]Failed to connect to Neo4j. Check credentials.[/red]")
+        # ─────────────────────────────────────────────────────────────────────
+
         sys.exit(len(critical_high))
 
     except KeyboardInterrupt:

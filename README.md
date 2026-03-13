@@ -415,14 +415,35 @@ On first start, open **http://localhost:7474** in a browser. Default login is `n
 
 ### Step 3 — Configure RAPTOR
 
-Add to `config/config.yaml`:
+You have two ways to connect RAPTOR to Neo4j:
+
+#### Option A: Interactive Sync (Easiest)
+Simply run your scan. At the end, RAPTOR will detect if Neo4j is available and ask if you'd like to sync the results:
+```text
+Would you like to sync results to Neo4j for visual representation? (y/n)
+ > y
+ Neo4j URI [bolt://localhost:7687]: 
+ Neo4j User [neo4j]: 
+ Neo4j Password: 
+```
+This is perfect for one-off syncs or when using different Neo4j instances.
+
+#### Option B: Persistent Configuration
+Add to `config/config.yaml` or use Environment Variables:
 
 ```yaml
 graph:
-  uri:      "neo4j://localhost:7687"
-  username: "neo4j"
-  password: "your_new_password"
   enabled:  true
+  neo4j_uri: "bolt://localhost:7687"
+  neo4j_user: "neo4j"
+  neo4j_password: "your_password"
+```
+
+**Environment Variables:**
+```bash
+export NEO4J_URI="bolt://localhost:7687"
+export NEO4J_USER="neo4j"
+export NEO4J_PASSWORD="your_password"
 ```
 
 ---
