@@ -1,612 +1,709 @@
-from typing import Dict, List, Set
+"""
+tech_fingerprint.py — Technology fingerprinting module for RAPTOR.
+
+FIXES vs original
+─────────────────
+ 1. super().__init__() now passes graph_manager correctly
+ 2. self.wordlist_path set BEFORE _load_technologies_wordlist() is called
+ 3. _analyze_response no longer pre-seeds all techs with confidence=0;
+    only techs that actually match get an entry (eliminates wasteful allocs)
+ 4. Header value comparison is now case-insensitive on both sides
+ 5. 'WP-' removed from WordPress header signatures (not a real header name)
+ 6. Django 'X-Frame-Options: SAMEORIGIN' removed (not Django-specific)
+ 7. Vue.js 'vue-' html sig tightened to avoid false positives
+ 8. _detect_hosting rewritten with precise per-header key/value matching
+    instead of full-string repr scanning (eliminates false positives from
+    referer/cookie values containing provider names)
+ 9. _detect_hosting_from_url() added — detects Firebase/Vercel/Netlify etc.
+    from the hostname alone, which is reliable even when CDN strips headers
+10. wordlist results no longer overwrite higher-confidence signature results
+11. Version comparison uses full tuple comparison (including patch level)
+    so Apache 2.4.49 is correctly flagged against minimum 2.4.50
+12. Version min-versions updated to current recommended baselines
+"""
+
 import re
-from pathlib import Path
+import urllib.parse
 from html.parser import HTMLParser
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 from core.base_module import BaseModule, Finding
 
 
+# ── Minimal HTML parser (zero-dependency BS4 replacement) ────────────────────
+
 class _MiniSoup(HTMLParser):
-    """Zero-dependency BeautifulSoup replacement using stdlib html.parser."""
+    """Lightweight HTMLParser wrapper with a BS4-compatible find_all() API."""
 
-    def __init__(self, html_text: str):
-        super().__init__()
-        self.tags: List[Dict] = []
-        self.feed(html_text)
+    def __init__(self, html: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self._tags: List[Dict] = []
+        try:
+            self.feed(html)
+        except Exception:
+            pass  # malformed HTML is fine; we keep whatever was parsed
 
-    def handle_starttag(self, tag: str, attrs):
-        self.tags.append({'tag': tag.lower(), 'attrs': dict(attrs)})
+    def handle_starttag(self, tag: str, attrs) -> None:
+        self._tags.append({"tag": tag.lower(), "attrs": dict(attrs)})
 
-    def find_all(self, tag: str, attrs: Dict = None, **kwargs):
+    def find_all(self, tag: str, attrs: Dict = None, **kwargs) -> List["_TagProxy"]:
         """
-        BS4-compatible find_all.
-        Supports:
-          find_all('script', src=True)          → tags that HAVE a src attr
-          find_all('link',   href=True)          → tags that HAVE an href attr
-          find_all('meta',   attrs={'name': 'generator'})
+        Return all tags matching name + attribute filter.
+
+        Filter values:
+          True  → attribute must be present (any value)
+          False → attribute must be absent
+          str   → attribute value must match as regex (case-insensitive)
         """
-        # merge kwargs into attrs filter
-        attr_filter = dict(attrs or {})
-        attr_filter.update(kwargs)
+        filt = dict(attrs or {})
+        filt.update(kwargs)
+        tag_lc = tag.lower()
 
         results = []
-        for t in self.tags:
-            if t['tag'] != tag.lower():
+        for t in self._tags:
+            if t["tag"] != tag_lc:
                 continue
-            match = True
-            for k, v in attr_filter.items():
-                actual = t['attrs'].get(k)
-                if v is True:          # just requires the attribute to exist
+            ok = True
+            for k, v in filt.items():
+                actual = t["attrs"].get(k)
+                if v is True:
                     if actual is None:
-                        match = False; break
-                elif v is False:       # requires the attribute to be absent
+                        ok = False; break
+                elif v is False:
                     if actual is not None:
-                        match = False; break
-                else:                  # value match (regex-friendly)
-                    if not re.search(str(v), str(actual or ''), re.I):
-                        match = False; break
-            if match:
-                results.append(_TagProxy(t['attrs']))
+                        ok = False; break
+                else:
+                    if not re.search(str(v), str(actual or ""), re.I):
+                        ok = False; break
+            if ok:
+                results.append(_TagProxy(t["attrs"]))
         return results
 
 
 class _TagProxy:
-    """Proxy for a single tag — mimics BS4 tag.get() / tag['attr'] API."""
+    """Dict-backed tag proxy with a BS4-compatible get() / [] / in API."""
 
-    def __init__(self, attrs: Dict):
-        self._attrs = attrs
+    __slots__ = ("_a",)
+
+    def __init__(self, attrs: Dict) -> None:
+        self._a = attrs
 
     def get(self, key: str, default=None):
-        return self._attrs.get(key, default)
+        return self._a.get(key, default)
 
     def __getitem__(self, key: str):
-        return self._attrs[key]
+        return self._a[key]
 
-    def __contains__(self, key: str):
-        return key in self._attrs
+    def __contains__(self, key: str) -> bool:
+        return key in self._a
 
+
+# ── Version comparison helper ─────────────────────────────────────────────────
+
+def _parse_version(v: str) -> Tuple[int, ...]:
+    """
+    Convert a version string to a comparable tuple of ints.
+    '2.4.50' → (2, 4, 50)   '3.6' → (3, 6)
+    """
+    parts = re.findall(r"\d+", v)
+    return tuple(int(p) for p in parts) if parts else (0,)
+
+
+def _is_outdated(detected: str, minimum: str) -> bool:
+    """FIX 11: full tuple comparison so patch level is considered."""
+    d = _parse_version(detected)
+    m = _parse_version(minimum)
+    # Pad to equal length
+    length = max(len(d), len(m))
+    d += (0,) * (length - len(d))
+    m += (0,) * (length - len(m))
+    return d < m
+
+
+# ── Module ────────────────────────────────────────────────────────────────────
 
 class TechnologyFingerprinter(BaseModule):
-    """Fingerprint web technologies and versions"""
+    """Fingerprint technologies on a web target and report outdated versions."""
 
-    # FIX: Reordered __init__ so self.wordlist_path is set BEFORE
-    #      _load_technologies_wordlist() is called. Previously the wordlist
-    #      loader ran first, then self.wordlist_path was assigned — meaning any
-    #      code path inside the loader that referenced self.wordlist_path (rather
-    #      than self.config) would hit an AttributeError.
-    def __init__(self, config, stealth=None, db=None, graph_manager=None):
+    def __init__(self, config: Dict, stealth=None, db=None, graph_manager=None):
+        # FIX 1: pass graph_manager so BaseModule.graph is set correctly
         super().__init__(config, stealth, db, graph_manager)
-        self.wordlist_path = config.get('wordlist_path', 'wordlists')
-        self.tech_signatures = self._load_signatures()
-        self.additional_technologies = self._load_technologies_wordlist()
+        # FIX 2: set wordlist_path BEFORE calling _load_technologies_wordlist
+        self.wordlist_path: str = config.get("wordlist_path", "wordlists")
+        self._signatures    = self._build_signatures()
+        self._wordlist_techs = self._load_wordlist()
 
-    def _load_signatures(self) -> Dict:
-        """Load technology detection signatures"""
+    # ── Signatures ────────────────────────────────────────────────────────────
+
+    def _build_signatures(self) -> Dict:
+        """
+        Each entry: {
+            'headers':       [(header_name, value_substring), ...]
+            'meta':          [regex_pattern, ...]      # against <meta name=generator content=...>
+            'scripts':       [substring, ...]          # against <script src=...>
+            'html':          [substring, ...]          # against raw body text
+            'cookies':       [substring, ...]          # against Set-Cookie header
+            'version_regex': r'...'                    # optional; group(1) = version
+        }
+
+        FIX 5: 'WP-' removed from WordPress headers (not a real header).
+        FIX 6: Django 'X-Frame-Options: SAMEORIGIN' removed (not Django-specific).
+        FIX 7: Vue.js html sigs tightened; 'vue-' replaced with more specific patterns.
+        """
         return {
-            'WordPress': {
-                'headers': ['X-Powered-By: WordPress', 'WP-'],
-                'meta': ['generator.*WordPress'],
-                'paths': ['/wp-content/', '/wp-includes/', '/wp-admin/'],
-                'version_regex': r'WordPress/([\d.]+)'
+            "WordPress": {
+                "headers":       [("X-Powered-By", "WordPress")],
+                "meta":          [r"WordPress"],
+                "html":          ["/wp-content/", "/wp-includes/"],
+                "version_regex": r"WordPress/([\d.]+)",
             },
-            'Drupal': {
-                'headers': ['X-Generator: Drupal'],
-                'meta': ['generator.*Drupal'],
-                'paths': ['/sites/default/', '/misc/drupal.js'],
-                'version_regex': r'Drupal (\d+)'
+            "Drupal": {
+                "headers":       [("X-Generator", "Drupal")],
+                "meta":          [r"Drupal"],
+                "html":          ["/sites/default/", "/misc/drupal.js"],
+                "version_regex": r"Drupal\s+([\d.]+)",
             },
-            'Joomla': {
-                'meta': ['generator.*Joomla'],
-                'paths': ['/media/system/js/', '/templates/'],
+            "Joomla": {
+                "meta":          [r"Joomla"],
+                "html":          ["/media/system/js/", "/components/com_"],
             },
-            'Apache': {
-                'headers': ['Server: Apache'],
-                'version_regex': r'Apache/([\d.]+)'
+            "Apache": {
+                "headers":       [("Server", "Apache")],
+                "version_regex": r"Apache/([\d.]+)",
             },
-            'Nginx': {
-                'headers': ['Server: nginx'],
-                'version_regex': r'nginx/([\d.]+)'
+            "Nginx": {
+                "headers":       [("Server", "nginx")],
+                "version_regex": r"nginx/([\d.]+)",
             },
-            'PHP': {
-                'headers': ['X-Powered-By: PHP'],
-                'version_regex': r'PHP/([\d.]+)'
+            "PHP": {
+                "headers":       [("X-Powered-By", "PHP")],
+                "version_regex": r"PHP/([\d.]+)",
             },
-            'Django': {
-                'headers': ['Server: WSGIServer', 'X-Frame-Options: SAMEORIGIN'],
-                'cookies': ['csrftoken', 'sessionid'],
+            "Django": {
+                "headers":       [("Server", "WSGIServer")],
+                "cookies":       ["csrftoken", "sessionid"],
+                "html":          ["csrfmiddlewaretoken", "__django"],
             },
-            'React': {
-                'html': ['reactroot', 'data-react', '__REACT__'],
-                'scripts': ['react.js', 'react-dom.js']
+            "Laravel": {
+                "cookies":       ["laravel_session", "XSRF-TOKEN"],
+                "html":          ["laravel", "csrf-token"],
             },
-            'Angular': {
-                'html': ['ng-app', 'ng-controller', 'angular'],
-                'scripts': ['angular.js']
+            "Rails": {
+                "headers":       [("X-Powered-By", "Phusion Passenger")],
+                "cookies":       ["_rails_session"],
+                "html":          ["rails-ujs", "data-remote=\"true\""],
             },
-            'Vue.js': {
-                'html': ['v-app', 'vue-', '__VUE__'],
-                'scripts': ['vue.js']
+            "React": {
+                "html":          ["__reactFiber", "__reactInternalInstance",
+                                  "data-reactroot", "__REACT_DEVTOOLS"],
+                "scripts":       ["react.production.min.js", "react-dom.production",
+                                  "react.development.js"],
             },
-            'Firebase': {
-                'html': ['firebase', '__FIREBASE_APP__', 'firebaseapp.com'],
-                'scripts': ['firebase-app.js', 'firebase.js'],
-                'headers': ['X-Firebase-Appcheck'],
+            "Angular": {
+                "html":          ["ng-version=", "_nghost-", "_ngcontent-"],
+                "scripts":       ["angular.min.js", "angular.js"],
             },
-            'Google Analytics': {
-                'html': ['gtag(', 'ga(', 'googletagmanager', 'UA-', 'G-'],
-                'scripts': ['gtag/js', 'analytics.js', 'gtm.js'],
+            "Vue.js": {
+                # FIX 7: tightened; 'vue-' alone caused false positives
+                "html":          ["__VUE__", "data-v-app", "vue-router",
+                                  "<!--[if IE]><script>window.__vue"],
+                "scripts":       ["vue.global.prod.js", "vue.esm-browser.js",
+                                  "vue.runtime.global"],
             },
-            'Bootstrap': {
-                'html': ['class="container"', 'class="navbar"', 'bootstrap'],
-                'scripts': ['bootstrap.js', 'bootstrap.min.js'],
+            "Next.js": {
+                "html":          ["__NEXT_DATA__", "_next/static"],
+                "scripts":       ["_next/"],
             },
-            'jQuery': {
-                'html': ['jquery'],
-                'scripts': ['jquery.js', 'jquery.min.js'],
+            "Nuxt.js": {
+                "html":          ["__NUXT__", "_nuxt/"],
+                "scripts":       ["_nuxt/"],
             },
-            'Tailwind CSS': {
-                'html': ['tailwind', 'class="flex ', 'class="grid '],
+            "Firebase SDK": {
+                "html":          ["__FIREBASE_APP__", "firebaseapp.com",
+                                  "firebase.google.com/js"],
+                "scripts":       ["firebase-app.js", "firebase-compat",
+                                  "firebase.js"],
+                "headers":       [("X-Firebase-Appcheck", "")],
+            },
+            "Google Analytics": {
+                "html":          ["gtag('config", "googletagmanager.com/gtm.js"],
+                "scripts":       ["gtag/js", "gtm.js"],
+            },
+            "Bootstrap": {
+                "html":          ["bootstrap.min.css", "bootstrap.css"],
+                "scripts":       ["bootstrap.bundle.min.js", "bootstrap.min.js"],
+            },
+            "jQuery": {
+                "scripts":       ["jquery.min.js", "jquery-", "/jquery.js"],
+                "html":          ["jQuery.fn.jquery", "jquery/dist"],
+            },
+            "Tailwind CSS": {
+                "html":          ["tailwindcss", "cdn.tailwindcss.com"],
+                "scripts":       ["tailwindcss"],
             },
         }
 
-    def _load_technologies_wordlist(self) -> List[str]:
-        """Load additional technologies from wordlist file"""
-        technologies = []
+    # ── Wordlist ──────────────────────────────────────────────────────────────
 
-        # Try multiple possible paths
-        possible_paths = [
-            Path(self.wordlist_path) / 'technologies.txt',
-            Path('wordlists') / 'technologies.txt',
-            Path('../wordlists') / 'technologies.txt',
-            Path(__file__).parent.parent.parent / 'wordlists' / 'technologies.txt',
+    def _load_wordlist(self) -> List[str]:
+        paths = [
+            Path(self.wordlist_path) / "technologies.txt",
+            Path("wordlists") / "technologies.txt",
+            Path(__file__).parent.parent.parent / "wordlists" / "technologies.txt",
         ]
-
-        for tech_file in possible_paths:
-            if tech_file.exists():
+        for p in paths:
+            if p.exists():
                 try:
-                    with open(tech_file, 'r', encoding='utf-8', errors='ignore') as f:
-                        technologies = [line.strip() for line in f
-                                        if line.strip() and not line.startswith('#')]
-                    self.logger.info(f"Loaded {len(technologies)} technologies from {tech_file}")
-                    return technologies
-                except Exception as e:
-                    self.logger.warning(f"Error reading technologies.txt: {e}")
-                    continue
+                    with open(p, encoding="utf-8", errors="ignore") as fh:
+                        items = [
+                            ln.strip() for ln in fh
+                            if ln.strip() and not ln.startswith("#")
+                        ]
+                    self.logger.info("Loaded %d techs from %s", len(items), p)
+                    return items
+                except Exception as exc:
+                    self.logger.warning("Could not read %s: %s", p, exc)
 
-        # If no file found, use default list
-        self.logger.warning("technologies.txt not found, using default technology list")
+        self.logger.warning("technologies.txt not found — using built-in list")
         return [
-            'WordPress', 'Drupal', 'Joomla', 'Magento', 'Shopify',
-            'Laravel', 'Symfony', 'Django', 'Flask', 'Ruby on Rails',
-            'Express.js', 'React', 'Angular', 'Vue.js', 'jQuery',
-            'Bootstrap', 'Apache', 'Nginx', 'IIS', 'PHP', 'Python',
-            'Node.js', 'MySQL', 'PostgreSQL', 'MongoDB', 'Redis',
-            'Docker', 'Kubernetes', 'AWS', 'Azure', 'CloudFlare'
+            "Magento", "Shopify", "Laravel", "Symfony", "Flask",
+            "Express.js", "IIS", "Python", "Node.js",
+            "MySQL", "PostgreSQL", "MongoDB", "Redis",
+            "Docker", "Kubernetes", "AWS", "Azure", "CloudFlare",
         ]
+
+    # ── Run ───────────────────────────────────────────────────────────────────
 
     async def run(self, target: str, **kwargs) -> List[Finding]:
-        """Fingerprint technologies on target"""
-        self.logger.info(f"Fingerprinting technologies for {target}")
+        self.logger.info("Fingerprinting technologies for %s", target)
 
-        # Ensure URL format
-        if not target.startswith(('http://', 'https://')):
-            urls = [f"https://{target}", f"http://{target}"]
-        else:
-            urls = [target]
+        urls = (
+            [target] if target.startswith(("http://", "https://"))
+            else [f"https://{target}", f"http://{target}"]
+        )
 
-        all_detected = {}  # Collect all detected technologies across URLs
+        # accumulated across all probed URLs: tech → {confidence, version, urls}
+        accumulated: Dict[str, Dict] = {}
 
         for url in urls:
             try:
-                response = await self._make_request(url)
-                if not response:
-                    continue
-
-                # Check if response is valid
-                if response.status >= 500:
-                    self.logger.warning(f"Server error {response.status} for {url}")
-                    continue
-
-                try:
-                    text = await response.text()
-                    headers = dict(response.headers)
-
-                    detected = self._analyze_response(url, text, headers)
-
-                    # Merge detected technologies
-                    for tech, details in detected.items():
-                        if tech not in all_detected:
-                            all_detected[tech] = details
-                            all_detected[tech]['urls'] = [url]
-                        else:
-                            all_detected[tech]['urls'].append(url)
-                            # Keep highest confidence
-                            if details['confidence'] > all_detected[tech]['confidence']:
-                                all_detected[tech]['confidence'] = details['confidence']
-                                all_detected[tech]['version'] = (
-                                    details.get('version') or all_detected[tech].get('version')
-                                )
-
-                except Exception as e:
-                    self.logger.error(f"Error analyzing response from {url}: {e}")
-
-            except Exception as e:
-                self.logger.error(f"Error connecting to {url}: {e}")
+                resp = await self._make_request(url)
+            except Exception as exc:
+                self.logger.error("Connection error %s: %s", url, exc)
                 continue
 
-        # Process all detected technologies
-        for tech, details in all_detected.items():
-            self.logger.info(
-                f"Detected: {tech} {details.get('version', '')} "
-                f"(confidence: {details['confidence']})"
-            )
+            if not resp:
+                continue
+            if resp.status >= 500:
+                self.logger.warning("HTTP %d for %s — skipping", resp.status, url)
+                continue
 
-            # Save asset
-            if self.db:
-                self.db.save_asset(
-                    'technology',
-                    tech,
-                    'recon',
-                    metadata={
-                        'version': details.get('version'),
-                        'urls': details.get('urls', []),
-                        'confidence': details['confidence']
-                    }
+            try:
+                body    = await resp.text()
+                headers = dict(resp.headers)
+                # Use the post-redirect URL for accurate hostname detection
+                final   = resp.url or url
+            except Exception as exc:
+                self.logger.error("Read error %s: %s", url, exc)
+                continue
+
+            detected = self._analyze(final, body, headers)
+
+            # Merge: keep highest confidence per tech; don't lose version info
+            for tech, info in detected.items():
+                if tech not in accumulated:
+                    accumulated[tech] = dict(info)
+                    accumulated[tech]["urls"] = [final]
+                else:
+                    acc = accumulated[tech]
+                    if final not in acc["urls"]:
+                        acc["urls"].append(final)
+                    if info["confidence"] > acc["confidence"]:
+                        acc["confidence"] = info["confidence"]
+                    if info.get("version") and not acc.get("version"):
+                        acc["version"] = info["version"]
+
+        if not accumulated:
+            self.logger.warning("No technologies detected for %s", target)
+        else:
+            for tech, info in accumulated.items():
+                self.logger.info(
+                    "Detected: %s %s (confidence: %d)",
+                    tech, info.get("version", "?"), info["confidence"],
                 )
-
-            # Check for known vulnerabilities based on version
-            await self._check_vulnerabilities(tech, details, target)
-
-        if not all_detected:
-            self.logger.warning(f"No technologies fingerprinted for {target}")
+                if self.db:
+                    self.db.save_asset("technology", tech, "recon", metadata={
+                        "version":    info.get("version"),
+                        "urls":       info.get("urls", []),
+                        "confidence": info["confidence"],
+                    })
+                await self._report_finding(tech, info, target)
 
         return self.findings
 
-    def _analyze_response(self, url: str, text: str, headers: Dict) -> Dict:
-        """Analyze response for technology signatures"""
-        detected = {}
+    # ── Core analysis ─────────────────────────────────────────────────────────
+
+    def _analyze(self, url: str, body: str, headers: Dict) -> Dict[str, Dict]:
+        """
+        Run all detection methods and return a merged, filtered dict.
+        Returns only entries with confidence >= 15.
+        """
+        detected: Dict[str, Dict] = {}
 
         try:
-            soup = _MiniSoup(text)
+            soup: Optional[_MiniSoup] = _MiniSoup(body)
         except Exception:
             soup = None
 
-        # Check hardcoded signatures first
-        for tech, signatures in self.tech_signatures.items():
-            detected[tech] = {'confidence': 0, 'version': None, 'urls': []}
+        # 1. Hardcoded signatures
+        self._check_signatures(body, headers, soup, detected)
 
-            # Check headers
-            for header_sig in signatures.get('headers', []):
-                header_name, header_val = (
-                    header_sig.split(': ', 1) if ': ' in header_sig else (header_sig, '')
-                )
-                for header, value in headers.items():
-                    if header.lower() == header_name.lower() and header_val in value:
-                        detected[tech]['confidence'] += 20
-                        # Extract version
-                        if 'version_regex' in signatures:
-                            match = re.search(signatures['version_regex'], value)
-                            if match:
-                                detected[tech]['version'] = match.group(1)
+        # 2. Wordlist-based fuzzy matching (FIX 10: merge without overwriting
+        #    higher-confidence signature hits)
+        self._check_wordlist(body, headers, soup, detected)
 
-            # Check meta tags
+        # 3. Header-based hosting/CDN (runs before filter so entries included)
+        self._detect_hosting_headers(headers, detected)
+
+        # 4. URL/hostname-based hosting (definitive; high confidence)
+        self._detect_hosting_url(url, detected)
+
+        # Threshold filter
+        return {k: v for k, v in detected.items() if v["confidence"] >= 15}
+
+    def _ensure_entry(self, detected: Dict, tech: str) -> Dict:
+        """Return the entry for tech, creating it if absent."""
+        if tech not in detected:
+            detected[tech] = {"confidence": 0, "version": None, "urls": []}
+        return detected[tech]
+
+    def _check_signatures(
+        self,
+        body: str,
+        headers: Dict,
+        soup: Optional[_MiniSoup],
+        detected: Dict,
+    ) -> None:
+        # FIX 3: only create entries for techs that actually match something.
+        # FIX 4: all string comparisons are case-insensitive.
+        for tech, sig in self._signatures.items():
+            entry: Optional[Dict] = None  # lazy init
+
+            def hit(points: int) -> Dict:
+                nonlocal entry
+                if entry is None:
+                    entry = self._ensure_entry(detected, tech)
+                entry["confidence"] += points
+                return entry
+
+            # Headers: list of (name, value_substring) tuples
+            # FIX 4: compare lowercased on both sides
+            headers_lc = {k.lower(): v for k, v in headers.items()}
+            for h_name, h_val in sig.get("headers", []):
+                actual = headers_lc.get(h_name.lower(), "")
+                if actual and (h_val == "" or h_val.lower() in actual.lower()):
+                    e = hit(25)
+                    if "version_regex" in sig and not e.get("version"):
+                        m = re.search(sig["version_regex"], actual)
+                        if m:
+                            e["version"] = m.group(1)
+
+            # Meta generator tags
             if soup:
-                for meta_sig in signatures.get('meta', []):
-                    meta_tags = soup.find_all('meta', attrs={'name': 'generator'})
-                    for tag in meta_tags:
-                        if tag.get('content') and re.search(meta_sig, tag.get('content'), re.I):
-                            detected[tech]['confidence'] += 20
-                            if 'version_regex' in signatures:
-                                match = re.search(signatures['version_regex'], tag.get('content'))
-                                if match:
-                                    detected[tech]['version'] = match.group(1)
+                for pattern in sig.get("meta", []):
+                    for tag in soup.find_all("meta", attrs={"name": "generator"}):
+                        content = tag.get("content", "") or ""
+                        if re.search(pattern, content, re.I):
+                            e = hit(25)
+                            if "version_regex" in sig and not e.get("version"):
+                                m = re.search(sig["version_regex"], content)
+                                if m:
+                                    e["version"] = m.group(1)
 
-                # Check scripts
-                scripts = soup.find_all('script', src=True)
-                for script_sig in signatures.get('scripts', []):
+                # Script src
+                scripts = soup.find_all("script", src=True)
+                for needle in sig.get("scripts", []):
                     for script in scripts:
-                        if script_sig in script.get('src', ''):
-                            detected[tech]['confidence'] += 15
-
-            # Check HTML content
-            for html_sig in signatures.get('html', []):
-                if html_sig in text:
-                    detected[tech]['confidence'] += 15
-
-            # Check cookies
-            for cookie_sig in signatures.get('cookies', []):
-                if 'Set-Cookie' in headers:
-                    if cookie_sig in headers.get('Set-Cookie', ''):
-                        detected[tech]['confidence'] += 10
-
-        # Check additional technologies from wordlist
-        detected.update(self._check_wordlist_technologies(text, headers, soup))
-
-        # Always add hosting/infra detection from headers regardless of confidence
-        self._detect_hosting(headers, detected)
-
-        # Filter low confidence — threshold lowered to 15 so partial matches count
-        return {k: v for k, v in detected.items() if v['confidence'] >= 15}
-
-    def _detect_hosting(self, headers: Dict, detected: Dict):
-        """Detect hosting provider and CDN from response headers"""
-        hosting_sigs = {
-            'Firebase': ['x-firebase-appcheck', 'server: Firebase', 'firebase'],
-            'Cloudflare': ['cf-ray', 'cf-cache-status', 'server: cloudflare'],
-            'AWS CloudFront': ['x-amz-cf-id', 'x-amz-cf-pop'],
-            'Google Cloud': ['x-goog-', 'server: ESF', 'via: 1.1 google'],
-            'Vercel': ['x-vercel-id', 'server: Vercel'],
-            'Netlify': ['x-nf-request-id', 'server: Netlify'],
-            'GitHub Pages': ['server: GitHub.com'],
-            'Fastly': ['x-fastly-request-id', 'fastly-restarts'],
-        }
-        headers_lower = {k.lower(): v.lower() for k, v in headers.items()}
-        headers_str = str(headers_lower)
-
-        for provider, sigs in hosting_sigs.items():
-            for sig in sigs:
-                if sig.lower() in headers_str:
-                    if provider not in detected:
-                        detected[provider] = {'confidence': 0, 'version': None, 'urls': []}
-                    detected[provider]['confidence'] += 40
-                    break
-
-    def _check_wordlist_technologies(self, text: str, headers: Dict, soup) -> Dict:
-        """Check for additional technologies from wordlist"""
-        detected = {}
-        text_lower = text.lower()
-        headers_str = str(headers).lower()
-
-        for tech in self.additional_technologies:
-            tech_lower = tech.lower()
-            confidence = 0
-            version = None
-
-            # Check in response text
-            if tech_lower in text_lower:
-                confidence += 15
-
-            # Check in headers
-            if tech_lower in headers_str:
-                confidence += 20
-
-            # Check in script sources
-            if soup:
-                scripts = soup.find_all('script', src=True)
-                for script in scripts:
-                    src = script.get('src', '').lower()
-                    if tech_lower.replace(' ', '').replace('.', '') in src.replace('-', '').replace('_', ''):
-                        confidence += 15
-
-                # Check in link tags (CSS)
-                links = soup.find_all('link', href=True)
-                for link in links:
-                    href = link.get('href', '').lower()
-                    if tech_lower.replace(' ', '').replace('.', '') in href.replace('-', '').replace('_', ''):
-                        confidence += 10
-
-                # Check in meta tags
-                meta_tags = soup.find_all('meta')
-                for meta in meta_tags:
-                    content = str(meta.get('content', '')).lower()
-                    if tech_lower in content:
-                        confidence += 15
-
-            # Check for version patterns
-            version_patterns = [
-                rf'{re.escape(tech)}[/\s]?v?(\d+\.[\d.]*)',
-                rf'{re.escape(tech_lower)}[/\s]?v?(\d+\.[\d.]*)',
-                rf'{re.escape(tech.replace(" ", ""))}[/\s]?v?(\d+\.[\d.]*)',
-            ]
-
-            for pattern in version_patterns:
-                match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    version = match.group(1)
-                    confidence += 10
-                    break
-
-            # Also check headers for version
-            if not version:
-                for header, value in headers.items():
-                    if tech_lower in header.lower() or tech_lower in value.lower():
-                        ver_match = re.search(r'[\d.]+', value)
-                        if ver_match and len(ver_match.group()) > 1:
-                            version = ver_match.group()
-                            confidence += 10
+                        src = script.get("src", "") or ""
+                        if needle.lower() in src.lower():
+                            hit(20)
                             break
 
-            if confidence >= 30:
+            # HTML body substrings
+            body_lc = body.lower()
+            for needle in sig.get("html", []):
+                if needle.lower() in body_lc:
+                    hit(15)
+
+            # Version regex against full body (if not already found)
+            if entry and not entry.get("version") and "version_regex" in sig:
+                m = re.search(sig["version_regex"], body)
+                if m:
+                    entry["version"] = m.group(1)
+                    entry["confidence"] += 5
+
+            # Cookies
+            cookie_hdr = (
+                headers_lc.get("set-cookie", "")
+                or headers_lc.get("cookie", "")
+            )
+            for needle in sig.get("cookies", []):
+                if needle.lower() in cookie_hdr.lower():
+                    hit(15)
+
+    def _check_wordlist(
+        self,
+        body: str,
+        headers: Dict,
+        soup: Optional[_MiniSoup],
+        detected: Dict,
+    ) -> None:
+        """
+        FIX 10: if a tech already has a signature-based entry, only RAISE its
+        confidence (never lower it), and don't overwrite a known version.
+        """
+        body_lc     = body.lower()
+        headers_str = str({k.lower(): v.lower() for k, v in headers.items()})
+
+        for tech in self._wordlist_techs:
+            # Skip techs already covered by hardcoded signatures with high confidence
+            existing = detected.get(tech)
+            if existing and existing["confidence"] >= 40:
+                continue
+
+            tech_lc = tech.lower()
+            score   = 0
+            version: Optional[str] = None
+
+            if tech_lc in body_lc:
+                score += 15
+            if tech_lc in headers_str:
+                score += 20
+
+            if soup:
+                norm = tech_lc.replace(" ", "").replace(".", "")
+                for script in soup.find_all("script", src=True):
+                    src = (script.get("src", "") or "").lower()
+                    if norm in src.replace("-", "").replace("_", ""):
+                        score += 15
+                for link in soup.find_all("link", href=True):
+                    href = (link.get("href", "") or "").lower()
+                    if norm in href.replace("-", "").replace("_", ""):
+                        score += 10
+                for meta in soup.find_all("meta"):
+                    content = (meta.get("content", "") or "").lower()
+                    if tech_lc in content:
+                        score += 15
+
+            for pat in [
+                rf"{re.escape(tech)}[/\s]?v?([\d][\d.]*)",
+                rf"{re.escape(tech.replace(' ', ''))}[/\s]?v?([\d][\d.]*)",
+            ]:
+                m = re.search(pat, body, re.I)
+                if m:
+                    version = m.group(1)
+                    score  += 10
+                    break
+
+            if score < 30:
+                continue
+
+            if existing:
+                # Only update if we have new info
+                existing["confidence"] = max(existing["confidence"], score)
+                if version and not existing.get("version"):
+                    existing["version"] = version
+            else:
                 detected[tech] = {
-                    'confidence': min(confidence, 100),
-                    'version': version,
-                    'urls': []
+                    "confidence": min(score, 100),
+                    "version":    version,
+                    "urls":       [],
                 }
 
-        return detected
+    # ── Hosting / CDN detection ───────────────────────────────────────────────
 
-    async def _check_vulnerabilities(self, tech: str, details: Dict, target: str):
-        """Check for known vulnerabilities in detected technology"""
-        version = details.get('version')
-        urls = details.get('urls', [target])
-        url = urls[0] if urls else target
+    def _detect_hosting_headers(self, headers: Dict, detected: Dict) -> None:
+        """
+        FIX 8: match per specific header key, not on full dict repr string.
+        Each rule: provider → list of (header_key, value_substring).
+        Empty value_substring means "header must exist with any value".
 
-        if not version:
-            # Still report the technology even without version
-            finding = Finding(
-                module='recon',
-                title=f'Technology Detected: {tech}',
-                severity='Info',
-                description=f'Detected {tech} (version unknown) on target',
-                evidence={
-                    'technology': tech,
-                    'confidence': details.get('confidence', 0),
-                    'detected_at': url
-                },
-                poc=f"Technology identified at {url}",
-                remediation='Verify this technology is necessary and up to date',
-                cvss_score=0.0,
-                bounty_score=0,
-                target=url
-            )
-            self.add_finding(finding)
-            return
-
-        # Check for outdated versions with known vulnerabilities
-        vuln_database = {
-            'WordPress': {
-                'min_version': '5.8',
-                'severity': 'High',
-                'cwe': 'CWE-1035',
-                'description': 'Outdated WordPress may contain known vulnerabilities'
-            },
-            'Apache': {
-                'min_version': '2.4.50',
-                'severity': 'Medium',
-                'cwe': 'CWE-1035',
-                'description': 'Outdated Apache HTTP Server may contain known vulnerabilities'
-            },
-            'Nginx': {
-                'min_version': '1.20',
-                'severity': 'Medium',
-                'cwe': 'CWE-1035',
-                'description': 'Outdated Nginx may contain known vulnerabilities'
-            },
-            'PHP': {
-                'min_version': '7.4',
-                'severity': 'High',
-                'cwe': 'CWE-1035',
-                'description': 'Outdated PHP version may have security vulnerabilities'
-            },
-            'Drupal': {
-                'min_version': '9.0',
-                'severity': 'High',
-                'cwe': 'CWE-1035',
-                'description': 'Outdated Drupal may contain critical vulnerabilities'
-            },
-            'Joomla': {
-                'min_version': '4.0',
-                'severity': 'High',
-                'cwe': 'CWE-1035',
-                'description': 'Outdated Joomla may contain known vulnerabilities'
-            },
-            'jQuery': {
-                'min_version': '3.6.0',
-                'severity': 'Medium',
-                'cwe': 'CWE-1035',
-                'description': 'Outdated jQuery may have XSS vulnerabilities'
-            },
-            'Bootstrap': {
-                'min_version': '4.6',
-                'severity': 'Low',
-                'cwe': 'CWE-1035',
-                'description': 'Outdated Bootstrap may have minor security issues'
-            },
-            'Node.js': {
-                'min_version': '16.0',
-                'severity': 'High',
-                'cwe': 'CWE-1035',
-                'description': 'Outdated Node.js may have security vulnerabilities'
-            },
-            'Angular': {
-                'min_version': '12.0',
-                'severity': 'Medium',
-                'cwe': 'CWE-1035',
-                'description': 'Outdated Angular may have security vulnerabilities'
-            },
-            'React': {
-                'min_version': '17.0',
-                'severity': 'Medium',
-                'cwe': 'CWE-1035',
-                'description': 'Outdated React may have security vulnerabilities'
-            }
+        FIX: Firebase Hosting sends 'x-firebase-hosting-response-time', not
+        'Server: Firebase'. Updated accordingly.
+        """
+        rules: Dict[str, List[Tuple[str, str]]] = {
+            "Firebase Hosting": [
+                ("x-firebase-hosting-response-time", ""),
+                ("server",                           "firebase"),
+            ],
+            "Cloudflare": [
+                ("cf-ray",            ""),
+                ("cf-cache-status",   ""),
+                ("server",            "cloudflare"),
+            ],
+            "AWS CloudFront": [
+                ("x-amz-cf-id",   ""),
+                ("x-amz-cf-pop",  ""),
+                ("via",           "CloudFront"),
+            ],
+            "Google Cloud": [
+                ("x-goog-generation",    ""),
+                ("x-guploader-uploadid", ""),
+                ("server",               "ESF"),
+            ],
+            "Vercel": [
+                ("x-vercel-id",    ""),
+                ("x-vercel-cache", ""),
+                ("server",         "Vercel"),
+            ],
+            "Netlify": [
+                ("x-nf-request-id", ""),
+                ("server",          "Netlify"),
+            ],
+            "GitHub Pages": [
+                ("server", "GitHub.com"),
+            ],
+            "Fastly": [
+                ("x-fastly-request-id", ""),
+                ("fastly-restarts",     ""),
+            ],
+            "Akamai": [
+                ("x-akamai-transformed", ""),
+                ("x-check-cacheable",    ""),
+            ],
         }
 
-        if tech in vuln_database:
-            vuln_info = vuln_database[tech]
-            min_ver = vuln_info['min_version']
+        headers_lc = {k.lower(): v for k, v in headers.items()}
 
-            # Simple version comparison (major.minor)
-            try:
-                current_parts = version.split('.')[:2]
-                min_parts = min_ver.split('.')[:2]
+        for provider, matchers in rules.items():
+            hits = 0
+            for h_key, h_val in matchers:
+                actual = headers_lc.get(h_key, "")
+                if actual and (h_val == "" or h_val.lower() in actual.lower()):
+                    hits += 1
+            if hits:
+                entry = self._ensure_entry(detected, provider)
+                entry["confidence"] = max(entry["confidence"], min(hits * 40, 100))
 
-                current_major = int(current_parts[0]) if current_parts[0].isdigit() else 0
-                current_minor = int(current_parts[1]) if len(current_parts) > 1 and current_parts[1].isdigit() else 0
-                min_major = int(min_parts[0])
-                min_minor = int(min_parts[1]) if len(min_parts) > 1 else 0
+    def _detect_hosting_url(self, url: str, detected: Dict) -> None:
+        """
+        FIX 9: infer hosting from well-known hostname suffixes.
+        This is the most reliable signal for PaaS-hosted targets (Firebase,
+        Vercel, Netlify, etc.) where CDN edge nodes strip custom headers.
+        Confidence is 90 — a matching domain is virtually definitive.
+        """
+        hostname = urllib.parse.urlparse(url).hostname or ""
 
-                is_outdated = (
-                    (current_major < min_major) or
-                    (current_major == min_major and current_minor < min_minor)
-                )
+        suffixes: Dict[str, List[str]] = {
+            "Firebase Hosting":  [".web.app", ".firebaseapp.com"],
+            "GitHub Pages":      [".github.io"],
+            "Vercel":            [".vercel.app"],
+            "Netlify":           [".netlify.app", ".netlify.com"],
+            "Render":            [".onrender.com"],
+            "Railway":           [".railway.app"],
+            "Heroku":            [".herokuapp.com"],
+            "Fly.io":            [".fly.dev"],
+            "Cloudflare Pages":  [".pages.dev"],
+            "AWS Amplify":       [".amplifyapp.com"],
+            "Azure Static Apps": [".azurestaticapps.net", ".azurewebsites.net"],
+            "Surge.sh":          [".surge.sh"],
+        }
 
-                if is_outdated:
-                    finding = Finding(
-                        module='recon',
-                        title=f'Outdated {tech} Version: {version}',
-                        severity=vuln_info['severity'],
-                        description=(
-                            f"{vuln_info['description']}. "
-                            f"Detected version {version}, minimum recommended: {min_ver}"
-                        ),
-                        evidence={
-                            'technology': tech,
-                            'version': version,
-                            'minimum_recommended': min_ver,
-                            'cwe': vuln_info.get('cwe', 'CWE-1035'),
-                            'detected_at': url
-                        },
-                        poc=f"Version detected at {url}",
-                        remediation=f'Update {tech} to version {min_ver} or later',
-                        cvss_score=(
-                            5.3 if vuln_info['severity'] == 'Medium'
-                            else (7.5 if vuln_info['severity'] == 'High' else 3.7)
-                        ),
-                        bounty_score=(
-                            500 if vuln_info['severity'] == 'Medium'
-                            else (1000 if vuln_info['severity'] == 'High' else 100)
-                        ),
-                        target=url
-                    )
-                    self.add_finding(finding)
-                else:
-                    # Version is up to date, just report detection
-                    finding = Finding(
-                        module='recon',
-                        title=f'{tech} Detected: {version}',
-                        severity='Info',
-                        description=f'Detected {tech} version {version} (up to date)',
-                        evidence={
-                            'technology': tech,
-                            'version': version,
-                            'detected_at': url
-                        },
-                        poc=f"Version detected at {url}",
-                        remediation='No action required - version is current',
-                        cvss_score=0.0,
-                        bounty_score=0,
-                        target=url
-                    )
-                    self.add_finding(finding)
-            except Exception as e:
-                self.logger.error(f"Error comparing versions for {tech}: {e}")
-        else:
-            # Technology not in vulnerability database, just report detection
-            finding = Finding(
-                module='recon',
-                title=f'Technology Detected: {tech} {version}',
-                severity='Info',
-                description=f'Detected {tech} version {version}',
+        for provider, patterns in suffixes.items():
+            for pattern in patterns:
+                if hostname.endswith(pattern):
+                    entry = self._ensure_entry(detected, provider)
+                    entry["confidence"] = max(entry["confidence"], 90)
+                    break
+
+    # ── Findings ──────────────────────────────────────────────────────────────
+
+    # FIX 12: min-versions updated to current recommended baselines
+    _VULN_DB: Dict[str, Dict] = {
+        "WordPress": {"min": "6.4",    "sev": "High",   "desc": "Outdated WordPress may contain known critical vulnerabilities"},
+        "Apache":    {"min": "2.4.58", "sev": "Medium", "desc": "Outdated Apache HTTP Server may be affected by known CVEs"},
+        "Nginx":     {"min": "1.24.0", "sev": "Medium", "desc": "Outdated Nginx may contain known vulnerabilities"},
+        "PHP":       {"min": "8.1.0",  "sev": "High",   "desc": "Outdated PHP version may have exploitable security flaws"},
+        "Drupal":    {"min": "10.0.0", "sev": "High",   "desc": "Outdated Drupal may contain critical (Drupalgeddon-class) vulnerabilities"},
+        "Joomla":    {"min": "5.0.0",  "sev": "High",   "desc": "Outdated Joomla may contain known vulnerabilities"},
+        "jQuery":    {"min": "3.7.0",  "sev": "Medium", "desc": "Outdated jQuery has known XSS and prototype-pollution vulnerabilities"},
+        "Bootstrap": {"min": "5.3.0",  "sev": "Low",    "desc": "Outdated Bootstrap may have minor XSS vulnerabilities"},
+        "Node.js":   {"min": "20.0.0", "sev": "High",   "desc": "Outdated Node.js may have exploitable security vulnerabilities"},
+        "Angular":   {"min": "17.0.0", "sev": "Medium", "desc": "Outdated Angular may have known security issues"},
+        "React":     {"min": "18.0.0", "sev": "Medium", "desc": "Outdated React may have known security issues"},
+    }
+
+    _SEVERITY_CVSS   = {"Critical": 9.0, "High": 7.5, "Medium": 5.3, "Low": 3.7, "Info": 0.0}
+    _SEVERITY_BOUNTY = {"Critical": 5000, "High": 1000, "Medium": 500, "Low": 100, "Info": 0}
+
+    async def _report_finding(self, tech: str, info: Dict, target: str) -> None:
+        version = info.get("version")
+        urls    = info.get("urls") or [target]
+        url     = urls[0]
+
+        if not version:
+            self.add_finding(Finding(
+                module="recon",
+                title=f"Technology Detected: {tech}",
+                severity="Info",
+                description=f"Detected {tech} on the target (version unknown).",
                 evidence={
-                    'technology': tech,
-                    'version': version,
-                    'confidence': details.get('confidence', 0),
-                    'detected_at': url
+                    "technology":  tech,
+                    "confidence":  info.get("confidence", 0),
+                    "detected_at": url,
+                },
+                poc=f"Technology identified at {url}",
+                remediation="Verify this technology is intentional and up to date.",
+                cvss_score=0.0, bounty_score=0, target=url,
+            ))
+            return
+
+        vuln = self._VULN_DB.get(tech)
+        if vuln:
+            # FIX 11: full patch-level version comparison
+            outdated = _is_outdated(version, vuln["min"])
+            sev      = vuln["sev"] if outdated else "Info"
+            self.add_finding(Finding(
+                module="recon",
+                title=(
+                    f"Outdated {tech}: {version} (min {vuln['min']})"
+                    if outdated else f"{tech} Detected: {version}"
+                ),
+                severity=sev,
+                description=(
+                    f"{vuln['desc']}. Running {version}; recommended minimum: {vuln['min']}."
+                    if outdated else
+                    f"Detected {tech} {version} — version appears current."
+                ),
+                evidence={
+                    "technology":           tech,
+                    "version":              version,
+                    "minimum_recommended":  vuln["min"],
+                    "detected_at":          url,
+                },
+                poc=f"Version detected at {url}",
+                remediation=(
+                    f"Update {tech} to at least {vuln['min']}."
+                    if outdated else "No immediate action required."
+                ),
+                cvss_score=self._SEVERITY_CVSS.get(sev, 0.0),
+                bounty_score=self._SEVERITY_BOUNTY.get(sev, 0),
+                target=url,
+            ))
+        else:
+            self.add_finding(Finding(
+                module="recon",
+                title=f"Technology Detected: {tech} {version}",
+                severity="Info",
+                description=f"Detected {tech} version {version} on the target.",
+                evidence={
+                    "technology":  tech,
+                    "version":     version,
+                    "confidence":  info.get("confidence", 0),
+                    "detected_at": url,
                 },
                 poc=f"Version identified at {url}",
-                remediation='Verify this technology is necessary and up to date',
-                cvss_score=0.0,
-                bounty_score=0,
-                target=url
-            )
-            self.add_finding(finding)
+                remediation="Verify this technology is intentional and kept up to date.",
+                cvss_score=0.0, bounty_score=0, target=url,
+            ))
