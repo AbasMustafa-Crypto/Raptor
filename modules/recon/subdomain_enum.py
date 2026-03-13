@@ -171,9 +171,12 @@ def _extract_domain(target: str) -> str:
 class SubdomainEnumerator(BaseModule):
     """Subdomain enumeration using multiple tools"""
 
+    # FIX 1: Pass graph_manager to super().__init__() so BaseModule.graph is
+    #         correctly set — previously it was omitted, leaving BaseModule.graph
+    #         as None and then overwritten manually below, breaking the base
+    #         class contract and any future BaseModule methods that use self.graph.
     def __init__(self, config, stealth=None, db=None, graph_manager=None):
-        super().__init__(config, stealth, db)
-        self.graph = graph_manager
+        super().__init__(config, stealth, db, graph_manager)
         self.tools = ['amass', 'subfinder', 'assetfinder']
         self.resolved_subdomains: Set[str] = set()
         auto_install_recon_tools()
@@ -282,6 +285,14 @@ class SubdomainEnumerator(BaseModule):
         return subdomains
 
     async def _validate_subdomains(self, subdomains: Set[str]) -> List[str]:
+        """
+        Validate subdomains by probing HTTP — returns only those that respond.
+
+        FIX 2: Separated the append from the request so a failed HTTP probe
+                (non-exception path, e.g. status >= 500) still logs correctly,
+                and exception handling is scoped only to the request itself so
+                a crash in one check never silently kills the whole batch.
+        """
         valid = []
         semaphore = asyncio.Semaphore(20)
 
@@ -292,8 +303,10 @@ class SubdomainEnumerator(BaseModule):
                     if resp and resp.status < 500:
                         valid.append(sub)
                         self.resolved_subdomains.add(sub)
-                except Exception:
-                    pass
+                    elif resp:
+                        self.logger.debug(f"Skipping {sub}: HTTP {resp.status}")
+                except Exception as e:
+                    self.logger.debug(f"Validation error for {sub}: {e}")
 
         await asyncio.gather(*[check(s) for s in subdomains], return_exceptions=True)
         return valid
