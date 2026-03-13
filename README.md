@@ -112,7 +112,7 @@ raptor/
 
 ```bash
 # Clone the repository
-git clone https://github.com/AbasMustafa-Crypto/raptor.git
+git clone https://github.com/AbasSec/raptor.git
 cd raptor
 
 # That's it. No pip install needed.
