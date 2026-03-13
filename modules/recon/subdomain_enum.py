@@ -236,6 +236,10 @@ class SubdomainEnumerator(BaseModule):
 
         await self._check_ct_logs(domain, all_subdomains)
 
+        # FIX 10: Wordlist-based brute force (fast async) if config allows
+        if kwargs.get("brute_force", True):
+            await self._brute_force_subdomains(domain, all_subdomains)
+
         self.logger.info("Found %d unique subdomains (pre-validation)", len(all_subdomains))
 
         valid = await self._validate_subdomains(all_subdomains) if all_subdomains else []
@@ -248,6 +252,65 @@ class SubdomainEnumerator(BaseModule):
             await self._analyze_subdomains(valid, domain)
 
         return self.findings
+
+    # ── Brute Force ───────────────────────────────────────────────────────────
+
+    async def _brute_force_subdomains(self, domain: str, existing: Set[str]) -> None:
+        """
+        Lightweight async subdomain brute-forcer using the configured wordlist.
+        """
+        wordlist_path = self.config.get("wordlist", "wordlists/subdomains.txt")
+        if not os.path.isabs(wordlist_path) and not os.path.exists(wordlist_path):
+            # Fallback for relative paths from project root
+            wordlist_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                wordlist_path
+            )
+        
+        if not os.path.exists(wordlist_path):
+            self.logger.warning("Subdomain wordlist not found: %s", wordlist_path)
+            return
+
+        try:
+            with open(wordlist_path, "r", encoding="utf-8", errors="ignore") as f:
+                words = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+        except Exception as exc:
+            self.logger.error("Could not read subdomain wordlist: %s", exc)
+            return
+
+        self.logger.info("Brute-forcing subdomains for %s (%d words) ...", domain, len(words))
+        
+        semaphore = asyncio.Semaphore(50)
+        lock      = asyncio.Lock()
+
+        async def check(word: str) -> None:
+            async with semaphore:
+                sub = f"{word}.{domain}"
+                if sub in existing:
+                    return
+                try:
+                    # Quick DNS-style probe via _make_request (HEAD)
+                    # We don't follow redirects here to keep it fast
+                    resp = await self._make_request(
+                        f"https://{sub}", method="HEAD", allow_redirects=False, timeout=5
+                    )
+                    if not resp:
+                         resp = await self._make_request(
+                            f"http://{sub}", method="HEAD", allow_redirects=False, timeout=5
+                        )
+                    
+                    if resp and resp.status < 500:
+                        async with lock:
+                            existing.add(sub.lower())
+                except Exception:
+                    pass
+
+        # Limit brute force to first 500 words by default to keep it fast
+        # unless full_scan is enabled (passed via kwargs)
+        limit = 500 if not self.config.get("full_scan") else 5000
+        to_check = words[:limit]
+        
+        await asyncio.gather(*[check(w) for w in to_check], return_exceptions=True)
 
     # ── Tool management ───────────────────────────────────────────────────────
 
@@ -326,11 +389,12 @@ class SubdomainEnumerator(BaseModule):
 
     async def _validate_subdomains(self, subdomains: Set[str]) -> List[str]:
         """
-        HTTP-probe each subdomain; return only those that respond with 2xx/3xx.
+        HTTP/HTTPS-probe each subdomain; return only those that respond.
 
         FIX 3: uses asyncio.Lock to guard the shared 'valid' list so concurrent
         appends are safe even if CPython's GIL is ever removed.
         FIX 8: status check tightened to < 400 (success + redirect only).
+        FIX 9: try both HTTPS and HTTP to catch subdomains that only listen on one.
         """
         valid: List[str] = []
         lock      = asyncio.Lock()
@@ -338,18 +402,22 @@ class SubdomainEnumerator(BaseModule):
 
         async def probe(sub: str) -> None:
             async with semaphore:
-                try:
-                    resp = await self._make_request(
-                        f"http://{sub}", allow_redirects=True, timeout=8
-                    )
-                    if resp and resp.status < 400:
-                        async with lock:
-                            valid.append(sub)
-                        self.resolved_subdomains.add(sub)
-                    elif resp:
-                        self.logger.debug("Skip %s — HTTP %d", sub, resp.status)
-                except Exception as exc:
-                    self.logger.debug("Probe error %s: %s", sub, exc)
+                # Try HTTPS first as it's more common for real assets
+                for proto in ["https", "http"]:
+                    try:
+                        resp = await self._make_request(
+                            f"{proto}://{sub}", allow_redirects=True, timeout=8
+                        )
+                        if resp and resp.status < 400:
+                            async with lock:
+                                if sub not in valid:
+                                    valid.append(sub)
+                                    self.resolved_subdomains.add(sub)
+                            return  # Success, no need to try http
+                        elif resp:
+                            self.logger.debug("Skip %s via %s — HTTP %d", sub, proto, resp.status)
+                    except Exception as exc:
+                        self.logger.debug("Probe error %s via %s: %s", sub, proto, exc)
 
         await asyncio.gather(*[probe(s) for s in subdomains], return_exceptions=True)
         return valid
@@ -371,7 +439,7 @@ class SubdomainEnumerator(BaseModule):
                             "weaker security controls than production."
                         ),
                         evidence={"subdomain": sub, "keyword": kw},
-                        poc=f"http://{sub}",
+                        poc=f"https://{sub}",
                         remediation=(
                             "Apply the same security controls (auth, headers, TLS) "
                             "to non-production environments as production."
@@ -393,24 +461,36 @@ class SubdomainEnumerator(BaseModule):
         which transparently decompresses gzip responses, so response.body is
         already plain bytes — but to be safe we decode manually and parse
         rather than relying on response.json() which re-encodes to bytes first.
+        FIX: handle crt.sh common timeouts/errors more gracefully.
         """
         clean = _extract_domain(domain) if ("/" in domain or "://" in domain) else domain
         url   = f"https://crt.sh/?q=%.{clean}&output=json"
         self.logger.info("Checking CT logs: %s", url)
 
-        resp = await self._make_request(url, timeout=15)
-        if not resp:
-            self.logger.warning("CT logs: no response from crt.sh")
-            return
-
-        if resp.status != 200:
-            self.logger.warning("CT logs: crt.sh returned HTTP %d", resp.status)
-            return
-
         try:
+            resp = await self._make_request(url, timeout=20)
+            if not resp:
+                self.logger.warning("CT logs: no response from crt.sh (timeout or error)")
+                return
+
+            if resp.status != 200:
+                self.logger.warning("CT logs: crt.sh returned HTTP %d", resp.status)
+                return
+
             # Decode body ourselves — handles both compressed and plain responses
             raw  = resp._body.decode("utf-8", errors="replace")
+            if not raw or raw.strip() == "[]":
+                self.logger.info("CT logs returned 0 results for %s", clean)
+                return
+            
             data = json.loads(raw)
+            if not isinstance(data, list):
+                self.logger.warning("CT logs: unexpected JSON format from crt.sh")
+                return
+
+        except json.JSONDecodeError:
+             self.logger.warning("CT logs: crt.sh returned malformed JSON (possibly HTML error page)")
+             return
         except Exception as exc:
             self.logger.warning("CT logs: failed to parse crt.sh response: %s", exc)
             return
@@ -419,7 +499,13 @@ class SubdomainEnumerator(BaseModule):
         for entry in data:
             for name in entry.get("name_value", "").split("\n"):
                 name = name.strip().lower()
-                if name and "*" not in name and clean in name:
+                # Remove wildcard prefix and common port suffixes
+                if name.startswith("*."):
+                    name = name[2:]
+                if ":" in name:
+                    name = name.split(":")[0]
+                
+                if name and clean in name:
                     ct_found.add(name)
 
         self.logger.info("CT logs returned %d subdomains", len(ct_found))

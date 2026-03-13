@@ -155,30 +155,31 @@ class TechnologyFingerprinter(BaseModule):
             "WordPress": {
                 "headers":       [("X-Powered-By", "WordPress")],
                 "meta":          [r"WordPress"],
-                "html":          ["/wp-content/", "/wp-includes/"],
-                "version_regex": r"WordPress/([\d.]+)",
+                "html":          ["/wp-content/", "/wp-includes/", "wp-json"],
+                "version_regex": r"WordPress[/\s]([\d.]+)",
             },
             "Drupal": {
                 "headers":       [("X-Generator", "Drupal")],
                 "meta":          [r"Drupal"],
                 "html":          ["/sites/default/", "/misc/drupal.js"],
-                "version_regex": r"Drupal\s+([\d.]+)",
+                "version_regex": r"Drupal[/\s]+([\d.]+)",
             },
             "Joomla": {
                 "meta":          [r"Joomla"],
                 "html":          ["/media/system/js/", "/components/com_"],
+                "version_regex": r"Joomla![/\s]([\d.]+)",
             },
             "Apache": {
                 "headers":       [("Server", "Apache")],
-                "version_regex": r"Apache/([\d.]+)",
+                "version_regex": r"Apache[/\s]([\d.]+)",
             },
             "Nginx": {
                 "headers":       [("Server", "nginx")],
-                "version_regex": r"nginx/([\d.]+)",
+                "version_regex": r"nginx[/\s]([\d.]+)",
             },
             "PHP": {
                 "headers":       [("X-Powered-By", "PHP")],
-                "version_regex": r"PHP/([\d.]+)",
+                "version_regex": r"PHP[/\s]([\d.]+)",
             },
             "Django": {
                 "headers":       [("Server", "WSGIServer")],
