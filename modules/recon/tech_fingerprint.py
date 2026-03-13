@@ -64,16 +64,21 @@ class _TagProxy:
     def __contains__(self, key: str):
         return key in self._attrs
 
+
 class TechnologyFingerprinter(BaseModule):
     """Fingerprint web technologies and versions"""
-    
+
+    # FIX: Reordered __init__ so self.wordlist_path is set BEFORE
+    #      _load_technologies_wordlist() is called. Previously the wordlist
+    #      loader ran first, then self.wordlist_path was assigned — meaning any
+    #      code path inside the loader that referenced self.wordlist_path (rather
+    #      than self.config) would hit an AttributeError.
     def __init__(self, config, stealth=None, db=None, graph_manager=None):
-        super().__init__(config, stealth, db)
-        self.graph = graph_manager
+        super().__init__(config, stealth, db, graph_manager)
+        self.wordlist_path = config.get('wordlist_path', 'wordlists')
         self.tech_signatures = self._load_signatures()
         self.additional_technologies = self._load_technologies_wordlist()
-        self.wordlist_path = config.get('wordlist_path', 'wordlists')
-        
+
     def _load_signatures(self) -> Dict:
         """Load technology detection signatures"""
         return {
@@ -142,30 +147,31 @@ class TechnologyFingerprinter(BaseModule):
                 'html': ['tailwind', 'class="flex ', 'class="grid '],
             },
         }
-        
+
     def _load_technologies_wordlist(self) -> List[str]:
         """Load additional technologies from wordlist file"""
         technologies = []
-        
+
         # Try multiple possible paths
         possible_paths = [
-            Path(self.config.get('wordlist_path', 'wordlists')) / 'technologies.txt',
+            Path(self.wordlist_path) / 'technologies.txt',
             Path('wordlists') / 'technologies.txt',
             Path('../wordlists') / 'technologies.txt',
             Path(__file__).parent.parent.parent / 'wordlists' / 'technologies.txt',
         ]
-        
+
         for tech_file in possible_paths:
             if tech_file.exists():
                 try:
                     with open(tech_file, 'r', encoding='utf-8', errors='ignore') as f:
-                        technologies = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+                        technologies = [line.strip() for line in f
+                                        if line.strip() and not line.startswith('#')]
                     self.logger.info(f"Loaded {len(technologies)} technologies from {tech_file}")
                     return technologies
                 except Exception as e:
                     self.logger.warning(f"Error reading technologies.txt: {e}")
                     continue
-                    
+
         # If no file found, use default list
         self.logger.warning("technologies.txt not found, using default technology list")
         return [
@@ -176,36 +182,36 @@ class TechnologyFingerprinter(BaseModule):
             'Node.js', 'MySQL', 'PostgreSQL', 'MongoDB', 'Redis',
             'Docker', 'Kubernetes', 'AWS', 'Azure', 'CloudFlare'
         ]
-        
+
     async def run(self, target: str, **kwargs) -> List[Finding]:
         """Fingerprint technologies on target"""
         self.logger.info(f"Fingerprinting technologies for {target}")
-        
+
         # Ensure URL format
         if not target.startswith(('http://', 'https://')):
             urls = [f"https://{target}", f"http://{target}"]
         else:
             urls = [target]
-            
+
         all_detected = {}  # Collect all detected technologies across URLs
-        
+
         for url in urls:
             try:
                 response = await self._make_request(url)
                 if not response:
                     continue
-                
+
                 # Check if response is valid
                 if response.status >= 500:
                     self.logger.warning(f"Server error {response.status} for {url}")
                     continue
-                    
+
                 try:
                     text = await response.text()
                     headers = dict(response.headers)
-                    
+
                     detected = self._analyze_response(url, text, headers)
-                    
+
                     # Merge detected technologies
                     for tech, details in detected.items():
                         if tech not in all_detected:
@@ -216,56 +222,63 @@ class TechnologyFingerprinter(BaseModule):
                             # Keep highest confidence
                             if details['confidence'] > all_detected[tech]['confidence']:
                                 all_detected[tech]['confidence'] = details['confidence']
-                                all_detected[tech]['version'] = details.get('version') or all_detected[tech].get('version')
-                    
+                                all_detected[tech]['version'] = (
+                                    details.get('version') or all_detected[tech].get('version')
+                                )
+
                 except Exception as e:
                     self.logger.error(f"Error analyzing response from {url}: {e}")
-                    
+
             except Exception as e:
                 self.logger.error(f"Error connecting to {url}: {e}")
                 continue
-        
+
         # Process all detected technologies
         for tech, details in all_detected.items():
-            self.logger.info(f"Detected: {tech} {details.get('version', '')} (confidence: {details['confidence']})")
-            
+            self.logger.info(
+                f"Detected: {tech} {details.get('version', '')} "
+                f"(confidence: {details['confidence']})"
+            )
+
             # Save asset
             if self.db:
                 self.db.save_asset(
-                    'technology', 
-                    tech, 
+                    'technology',
+                    tech,
                     'recon',
                     metadata={
-                        'version': details.get('version'), 
+                        'version': details.get('version'),
                         'urls': details.get('urls', []),
                         'confidence': details['confidence']
                     }
                 )
-                
+
             # Check for known vulnerabilities based on version
             await self._check_vulnerabilities(tech, details, target)
-        
+
         if not all_detected:
             self.logger.warning(f"No technologies fingerprinted for {target}")
-                
+
         return self.findings
-        
+
     def _analyze_response(self, url: str, text: str, headers: Dict) -> Dict:
         """Analyze response for technology signatures"""
         detected = {}
-        
+
         try:
             soup = _MiniSoup(text)
         except Exception:
             soup = None
-            
+
         # Check hardcoded signatures first
         for tech, signatures in self.tech_signatures.items():
             detected[tech] = {'confidence': 0, 'version': None, 'urls': []}
-            
+
             # Check headers
             for header_sig in signatures.get('headers', []):
-                header_name, header_val = header_sig.split(': ', 1) if ': ' in header_sig else (header_sig, '')
+                header_name, header_val = (
+                    header_sig.split(': ', 1) if ': ' in header_sig else (header_sig, '')
+                )
                 for header, value in headers.items():
                     if header.lower() == header_name.lower() and header_val in value:
                         detected[tech]['confidence'] += 20
@@ -274,7 +287,7 @@ class TechnologyFingerprinter(BaseModule):
                             match = re.search(signatures['version_regex'], value)
                             if match:
                                 detected[tech]['version'] = match.group(1)
-                                
+
             # Check meta tags
             if soup:
                 for meta_sig in signatures.get('meta', []):
@@ -286,25 +299,25 @@ class TechnologyFingerprinter(BaseModule):
                                 match = re.search(signatures['version_regex'], tag.get('content'))
                                 if match:
                                     detected[tech]['version'] = match.group(1)
-                                    
+
                 # Check scripts
                 scripts = soup.find_all('script', src=True)
                 for script_sig in signatures.get('scripts', []):
                     for script in scripts:
                         if script_sig in script.get('src', ''):
                             detected[tech]['confidence'] += 15
-            
+
             # Check HTML content
             for html_sig in signatures.get('html', []):
                 if html_sig in text:
                     detected[tech]['confidence'] += 15
-                        
+
             # Check cookies
             for cookie_sig in signatures.get('cookies', []):
                 if 'Set-Cookie' in headers:
                     if cookie_sig in headers.get('Set-Cookie', ''):
                         detected[tech]['confidence'] += 10
-                        
+
         # Check additional technologies from wordlist
         detected.update(self._check_wordlist_technologies(text, headers, soup))
 
@@ -337,26 +350,25 @@ class TechnologyFingerprinter(BaseModule):
                     detected[provider]['confidence'] += 40
                     break
 
-
     def _check_wordlist_technologies(self, text: str, headers: Dict, soup) -> Dict:
         """Check for additional technologies from wordlist"""
         detected = {}
         text_lower = text.lower()
         headers_str = str(headers).lower()
-        
+
         for tech in self.additional_technologies:
             tech_lower = tech.lower()
             confidence = 0
             version = None
-            
+
             # Check in response text
             if tech_lower in text_lower:
                 confidence += 15
-                
+
             # Check in headers
             if tech_lower in headers_str:
                 confidence += 20
-                
+
             # Check in script sources
             if soup:
                 scripts = soup.find_all('script', src=True)
@@ -364,35 +376,35 @@ class TechnologyFingerprinter(BaseModule):
                     src = script.get('src', '').lower()
                     if tech_lower.replace(' ', '').replace('.', '') in src.replace('-', '').replace('_', ''):
                         confidence += 15
-                        
+
                 # Check in link tags (CSS)
                 links = soup.find_all('link', href=True)
                 for link in links:
                     href = link.get('href', '').lower()
                     if tech_lower.replace(' ', '').replace('.', '') in href.replace('-', '').replace('_', ''):
                         confidence += 10
-                        
+
                 # Check in meta tags
                 meta_tags = soup.find_all('meta')
                 for meta in meta_tags:
                     content = str(meta.get('content', '')).lower()
                     if tech_lower in content:
                         confidence += 15
-                        
+
             # Check for version patterns
             version_patterns = [
                 rf'{re.escape(tech)}[/\s]?v?(\d+\.[\d.]*)',
                 rf'{re.escape(tech_lower)}[/\s]?v?(\d+\.[\d.]*)',
                 rf'{re.escape(tech.replace(" ", ""))}[/\s]?v?(\d+\.[\d.]*)',
             ]
-            
+
             for pattern in version_patterns:
                 match = re.search(pattern, text, re.IGNORECASE)
                 if match:
                     version = match.group(1)
                     confidence += 10
                     break
-                    
+
             # Also check headers for version
             if not version:
                 for header, value in headers.items():
@@ -402,22 +414,22 @@ class TechnologyFingerprinter(BaseModule):
                             version = ver_match.group()
                             confidence += 10
                             break
-            
+
             if confidence >= 30:
                 detected[tech] = {
                     'confidence': min(confidence, 100),
                     'version': version,
                     'urls': []
                 }
-                
+
         return detected
-        
+
     async def _check_vulnerabilities(self, tech: str, details: Dict, target: str):
         """Check for known vulnerabilities in detected technology"""
         version = details.get('version')
         urls = details.get('urls', [target])
         url = urls[0] if urls else target
-        
+
         if not version:
             # Still report the technology even without version
             finding = Finding(
@@ -438,7 +450,7 @@ class TechnologyFingerprinter(BaseModule):
             )
             self.add_finding(finding)
             return
-            
+
         # Check for outdated versions with known vulnerabilities
         vuln_database = {
             'WordPress': {
@@ -508,29 +520,35 @@ class TechnologyFingerprinter(BaseModule):
                 'description': 'Outdated React may have security vulnerabilities'
             }
         }
-        
+
         if tech in vuln_database:
             vuln_info = vuln_database[tech]
             min_ver = vuln_info['min_version']
-            
+
             # Simple version comparison (major.minor)
             try:
                 current_parts = version.split('.')[:2]
                 min_parts = min_ver.split('.')[:2]
-                
+
                 current_major = int(current_parts[0]) if current_parts[0].isdigit() else 0
                 current_minor = int(current_parts[1]) if len(current_parts) > 1 and current_parts[1].isdigit() else 0
                 min_major = int(min_parts[0])
                 min_minor = int(min_parts[1]) if len(min_parts) > 1 else 0
-                
-                is_outdated = (current_major < min_major) or (current_major == min_major and current_minor < min_minor)
-                
+
+                is_outdated = (
+                    (current_major < min_major) or
+                    (current_major == min_major and current_minor < min_minor)
+                )
+
                 if is_outdated:
                     finding = Finding(
                         module='recon',
                         title=f'Outdated {tech} Version: {version}',
                         severity=vuln_info['severity'],
-                        description=f"{vuln_info['description']}. Detected version {version}, minimum recommended: {min_ver}",
+                        description=(
+                            f"{vuln_info['description']}. "
+                            f"Detected version {version}, minimum recommended: {min_ver}"
+                        ),
                         evidence={
                             'technology': tech,
                             'version': version,
@@ -540,8 +558,14 @@ class TechnologyFingerprinter(BaseModule):
                         },
                         poc=f"Version detected at {url}",
                         remediation=f'Update {tech} to version {min_ver} or later',
-                        cvss_score=5.3 if vuln_info['severity'] == 'Medium' else (7.5 if vuln_info['severity'] == 'High' else 3.7),
-                        bounty_score=500 if vuln_info['severity'] == 'Medium' else (1000 if vuln_info['severity'] == 'High' else 100),
+                        cvss_score=(
+                            5.3 if vuln_info['severity'] == 'Medium'
+                            else (7.5 if vuln_info['severity'] == 'High' else 3.7)
+                        ),
+                        bounty_score=(
+                            500 if vuln_info['severity'] == 'Medium'
+                            else (1000 if vuln_info['severity'] == 'High' else 100)
+                        ),
                         target=url
                     )
                     self.add_finding(finding)
