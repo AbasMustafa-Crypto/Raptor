@@ -63,10 +63,23 @@ class Finding:
 
 # ── Internal HTTP response wrapper ────────────────────────────────────────────
 
+class HeaderProxy(dict):
+    """A dictionary-like object that supports get_all for multi-value headers."""
+    def __init__(self, headers_obj):
+        # Initialise dict with single-value mapping
+        super().__init__(dict(headers_obj))
+        self._headers_obj = headers_obj
+
+    def get_all(self, name, default=None):
+        """Return all values for a given header name."""
+        if hasattr(self._headers_obj, 'get_all'):
+            return self._headers_obj.get_all(name, default)
+        return [self.get(name)] if name in self else default
+
 class _Response:
-    def __init__(self, status: int, headers: Dict[str, str], body: bytes, url: str):
+    def __init__(self, status: int, headers: Any, body: bytes, url: str):
         self.status  = status
-        self.headers = headers
+        self.headers = HeaderProxy(headers)
         self._body   = body
         self.url     = url
 
@@ -245,7 +258,7 @@ class BaseModule(ABC):
             with opener.open(req, timeout=timeout) as resp:
                 body      = resp.read()
                 status    = resp.status
-                hdrs      = dict(resp.headers)
+                hdrs      = resp.headers
                 final_url = resp.url
         except urllib.error.HTTPError as exc:
             # FIX 7: e.read() can raise if body already consumed — guard it
@@ -254,7 +267,7 @@ class BaseModule(ABC):
             except Exception:
                 body = b""
             status    = exc.code
-            hdrs      = dict(exc.headers) if exc.headers else {}
+            hdrs      = exc.headers if exc.headers else {}
             final_url = req.full_url
 
         return _Response(status, hdrs, body, final_url)

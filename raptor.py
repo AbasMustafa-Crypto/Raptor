@@ -42,12 +42,15 @@ except ImportError:
 # ── Modules ─────────────────────────────────────────────────────────────────
 from modules.recon.subdomain_enum            import SubdomainEnumerator
 from modules.recon.tech_fingerprint          import TechnologyFingerprinter
+from modules.recon.port_scanner              import PortScanner
+from modules.recon.dns_analyzer              import DNSAnalyzer
 from modules.server_misconfig.header_audit   import HeaderAuditor
 from modules.server_misconfig.sensitive_files import SensitiveFileScanner
+from modules.server_misconfig.ssl_tester     import SSLTester
 from modules.idor.idor_tester                import IDORTester
 from modules.brute_force.credential_tester   import CredentialTester
-from modules.xss.xss_tester                 import XSSTester
 from modules.sqli.sqli_tester               import SQLiTester
+from modules.fuzzing.param_fuzzer            import ParamFuzzer
 
 console = Console()
 
@@ -68,7 +71,7 @@ def show_welcome():
 
 [bold green]Quick Start:[/bold green]
   python3 raptor.py -t [cyan]target.com[/cyan]
-  python3 raptor.py -t [cyan]target.com[/cyan] --modules [green]xss,sqli,idor[/green]
+  python3 raptor.py -t [cyan]target.com[/cyan] --modules [green]sqli,idor[/green]
   
 [bold green]New Features:[/bold green]
   [yellow]Interactive Neo4j Sync[/yellow] — Visualize attack paths at the end of any scan!
@@ -76,9 +79,9 @@ def show_welcome():
 [bold green]Modules:[/bold green]
   [cyan]recon[/cyan]   Reconnaissance & Discovery
   [cyan]server[/cyan]  Server Misconfiguration
-  [cyan]xss[/cyan]     Cross-Site Scripting
   [cyan]sqli[/cyan]    SQL Injection
   [cyan]idor[/cyan]    Insecure Direct Object Reference
+  [cyan]fuzz[/cyan]    Parameter Fuzzing & Hidden Endpoint Discovery
   [cyan]brute[/cyan]   Brute Force (--enable-brute-force required)
 
 [bold green]Brute Force Wordlists:[/bold green]
@@ -103,9 +106,9 @@ def create_help_text():
 [bold cyan]MODULES[/bold cyan]
   [cyan]recon[/cyan]   Subdomain enumeration, tech fingerprinting, endpoint discovery
   [cyan]server[/cyan]  Security headers, sensitive file exposure, info disclosure
-  [cyan]xss[/cyan]     Reflected, DOM, Blind XSS — all contexts, WAF bypass
   [cyan]sqli[/cyan]    Error, Boolean, Time-based, UNION — all DB types
   [cyan]idor[/cyan]    Sequential IDs, REST manipulation, mass assignment
+  [cyan]fuzz[/cyan]    Parameter Fuzzing & Hidden Endpoint Discovery
   [cyan]brute[/cyan]   Credential brute force (requires --enable-brute-force)
   [cyan]all[/cyan]     Run everything except brute
 
@@ -116,7 +119,7 @@ def create_help_text():
 
 [bold cyan]USAGE[/bold cyan]
   [green]python3 raptor.py -t target.com[/green]
-  [green]python3 raptor.py -t target.com --modules xss,sqli,idor[/green]
+  [green]python3 raptor.py -t target.com --modules sqli,idor,fuzz[/green]
   [green]python3 raptor.py -t target.com --full-scan[/green]
   [green]python3 raptor.py -t target.com --modules brute --enable-brute-force[/green]
   [green]python3 raptor.py -t target.com --modules brute --enable-brute-force --userlist users.txt --passlist passwords.txt[/green]
@@ -235,6 +238,31 @@ class Raptor:
                     self._module_cfg('modules', 'recon'),
                     stealth, self.db, self.graph
                 ) as mod:
+                    findings = await mod.run(target, **kwargs)
+                    all_findings.extend([f.to_dict() for f in findings])
+                    
+                    # Add newly discovered subdomains to kwargs for subsequent modules
+                    discovered_urls = kwargs.get('discovered_urls', [])
+                    for f in findings:
+                        if hasattr(f, 'evidence') and "subdomain" in f.evidence:
+                            discovered_urls.append(f"https://{f.evidence['subdomain']}")
+                        elif hasattr(f, 'evidence') and "subdomains" in f.evidence:
+                            for sub in f.evidence['subdomains']:
+                                discovered_urls.append(f"https://{sub}")
+                    kwargs['discovered_urls'] = discovered_urls
+
+                async with DNSAnalyzer(
+                    self._module_cfg('modules', 'recon'),
+                    stealth, self.db, self.graph
+                ) as mod:
+                    all_findings.extend(
+                        [f.to_dict() for f in await mod.run(target, **kwargs)]
+                    )
+
+                async with PortScanner(
+                    self._module_cfg('modules', 'recon'),
+                    stealth, self.db, self.graph
+                ) as mod:
                     all_findings.extend(
                         [f.to_dict() for f in await mod.run(target, **kwargs)]
                     )
@@ -269,14 +297,8 @@ class Raptor:
                         [f.to_dict() for f in await mod.run(target, **kwargs)]
                     )
 
-                progress.update(task, completed=True)
-
-            # ── XSS ───────────────────────────────────────────────────────
-            if 'xss' in modules:
-                task = progress.add_task("[cyan]Testing for XSS...", total=None)
-
-                async with XSSTester(
-                    self._module_cfg('modules', 'xss'),
+                async with SSLTester(
+                    self._module_cfg('modules', 'server'),
                     stealth, self.db, self.graph
                 ) as mod:
                     all_findings.extend(
@@ -311,6 +333,19 @@ class Raptor:
                         [f.to_dict() for f in await mod.run(target, **kwargs)]
                     )
 
+                progress.update(task, completed=True)
+
+            # ── Fuzzing ────────────────────────────────────────────────────
+            if 'fuzz' in modules:
+                task = progress.add_task("[cyan]Parameter Fuzzing...", total=None)
+                async with ParamFuzzer(
+                    self._module_cfg('modules', 'fuzzing'),
+                    self.stealth if stealth_mode else None,
+                    self.db,
+                    self.graph
+                ) as module:
+                    findings = await module.run(target, target_id=target_id, **kwargs)
+                    all_findings.extend([f.to_dict() for f in findings])
                 progress.update(task, completed=True)
 
             # ── Brute force ────────────────────────────────────────────────
@@ -495,7 +530,7 @@ def main():
     )
     parser.add_argument('-h', '--help',              action='store_true')
     parser.add_argument('-t', '--target')
-    parser.add_argument('--modules',                 default='recon,server,xss,sqli,idor')
+    parser.add_argument('--modules',                 default='recon,server,sqli,idor,fuzz')
     parser.add_argument('--full-scan',               action='store_true')
     parser.add_argument('--enable-brute-force',      action='store_true')
     # ── Wordlist flags ────────────────────────────────────────────────────
@@ -532,10 +567,10 @@ def main():
         args.target = f"https://{args.target}"
 
     if args.full_scan or 'all' in args.modules:
-        modules = ['recon', 'server', 'xss', 'sqli', 'idor']
+        modules = ['recon', 'server', 'sqli', 'idor', 'fuzz']
     else:
         modules = [m.strip() for m in args.modules.split(',')]
-        valid   = {'recon', 'server', 'xss', 'sqli', 'idor', 'brute', 'all'}
+        valid   = {'recon', 'server', 'sqli', 'idor', 'brute', 'fuzz', 'all'}
         invalid = set(modules) - valid
         if invalid:
             console.print(f"[red]Error: Invalid modules: {', '.join(invalid)}[/red]")
@@ -612,7 +647,7 @@ def main():
                         browser_url = f"http://{host}:7474"
                         console.print(f"\n[bold green]📊 Graph Synced![/bold green] Open your browser to view the visualization:")
                         console.print(f"   👉 [bold cyan underline]{browser_url}[/bold cyan underline]")
-                    except:
+                    except Exception:
                         console.print(f"\n[bold green]📊 Graph Synced![/bold green] View at: [bold cyan]http://localhost:7474[/bold cyan]")
                     
                     # ── Neo4j Tutorial ──────────────────────────────────

@@ -16,10 +16,9 @@ cli:
   # python3 raptor.py -t <TARGET> --modules <MODULE>
   # 
   # Examples:
-  # python3 raptor.py -t target.com --modules xss
   # python3 raptor.py -t target.com --modules sqli
   # python3 raptor.py -t target.com --modules recon
-  # python3 raptor.py -t target.com --modules xss,sqli,idor
+  # python3 raptor.py -t target.com --modules sqli,idor
   
   parser:
     target:
@@ -30,7 +29,7 @@ cli:
     modules:
       flag: "--modules"
       required: true
-      choices: ["recon", "server", "xss", "sqli", "idor", "api", "auth", "all"]
+      choices: ["recon", "server", "sqli", "idor", "api", "auth", "all"]
       help: "Comma-separated module selection"
     
     # Optional flags (no env vars needed)
@@ -54,34 +53,6 @@ cli:
 # =============================================================================
 
 modules:
-
-  # ---------------------------------------------------------------------------
-  # XSS MODULE
-  # Command: python3 raptor.py -t target.com --modules xss
-  # ---------------------------------------------------------------------------
-  xss:
-    enabled: true
-    description: "Cross-site scripting detection"
-    
-    test_vectors:
-      reflected: true
-      stored: true
-      dom_based: true
-      blind: true
-    
-    payloads:
-      source: "embedded"        # Built-in 10,000 payloads
-      encoding: ["raw", "url", "html_entities", "unicode"]
-    
-    evasion:
-      level: 3                  # 1-5, higher = more evasive
-      waf_bypass: true
-      techniques: ["case_randomization", "comment_injection", "encoding_cascade"]
-    
-    blind_detection:
-      enabled: true
-      mode: "dns_fallback"      # Uses DNS if no callback server
-      timeout: 300              # 5 minutes
 
   # ---------------------------------------------------------------------------
   # SQL INJECTION MODULE
@@ -294,22 +265,21 @@ graph:
 # =============================================================================
 
 # Single module:
-#   python3 raptor.py -t target.com --modules xss
 #   python3 raptor.py -t target.com --modules sqli
 #   python3 raptor.py -t target.com --modules idor
 
 # Multiple modules:
-#   python3 raptor.py -t target.com --modules xss,sqli
-#   python3 raptor.py -t target.com --modules recon,server,xss
+#   python3 raptor.py -t target.com --modules sqli,idor
+#   python3 raptor.py -t target.com --modules recon,server
 
 # All modules:
 #   python3 raptor.py -t target.com --modules all
 
 # With stealth:
-#   python3 raptor.py -t target.com --modules xss --stealth
+#   python3 raptor.py -t target.com --modules sqli --stealth
 
 # With output:
-#   python3 raptor.py -t target.com --modules xss -o xss_report.md
+#   python3 raptor.py -t target.com --modules sqli -o sqli_report.md
 
 # Verbose:
-#   python3 raptor.py -t target.com --modules xss -v
+#   python3 raptor.py -t target.com --modules sqli -v

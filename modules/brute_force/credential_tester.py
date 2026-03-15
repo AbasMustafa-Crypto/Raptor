@@ -1,716 +1,352 @@
-import asyncio
-import sys
-from typing import List, Dict, Optional, Tuple, Set
-from core.base_module import BaseModule, Finding
-from pathlib import Path
-import json
-import urllib.request
-import urllib.error
-import urllib.parse
-import base64
-import re
+"""
+RAPTOR Credential Tester Module v4.0 - Enterprise Grade
+======================================================
+Professional-grade authentication auditing suite.
+Implements password spraying, baseline failure modeling, lockout detection,
+and automatic authentication endpoint discovery. Uses BaseModule's async engine.
+"""
 
+import asyncio
+import base64
+import json
+import re
+import urllib.parse
+import hashlib
+from difflib import SequenceMatcher
+from typing import List, Dict, Optional, Tuple, Set
+from dataclasses import dataclass
+from pathlib import Path
+import os
+import time
+
+from core.base_module import BaseModule, Finding
+
+@dataclass
+class AuthEndpoint:
+    url: str
+    auth_type: str
+    method: str
+    username_field: str
+    password_field: str
+    extra_fields: Dict[str, str]
+
+@dataclass
+class AuthBaseline:
+    failed_status: int
+    failed_length: int
+    failed_body: str
+    failed_hash: str
 
 class CredentialTester(BaseModule):
-    """Universal brute force module - supports 20+ authentication types"""
+    """
+    Enterprise authentication auditing: Password Spraying and Brute Forcing.
+    """
 
-    def __init__(self, config, stealth=None, db=None, graph_manager=None):
+    def __init__(self, config: Dict, stealth=None, db=None, graph_manager=None):
         super().__init__(config, stealth, db, graph_manager)
         self.max_attempts    = config.get('max_attempts', 1000)
-        self.delay           = 0
+        self.concurrency     = config.get('concurrency', 5) # Keep low to avoid immediate lockouts
         self.wordlist_path   = config.get('wordlist_path', 'wordlists')
-        self.concurrency     = config.get('concurrency', 50)
-        self.custom_userlist  = config.get('userlist', None)
-        self.custom_passlist  = config.get('passlist', None)
-        self._max_usernames   = config.get('max_usernames', 200)
-        self._max_passwords   = config.get('max_passwords', 2000)
-
-    def _print_progress(self, current: int, total: int, prefix: str = 'Progress', width: int = 40):
-        if total == 0:
-            return
-        pct   = current / total
-        filled = int(width * pct)
-        bar   = '█' * filled + '░' * (width - filled)
-        line  = f'\r\033[96m{prefix}:\033[0m [{bar}] \033[93m{pct*100:5.1f}%\033[0m  {current}/{total}'
-        sys.stdout.write(line)
-        sys.stdout.flush()
-        if current >= total:
-            sys.stdout.write('\n')
-            sys.stdout.flush()
+        self.custom_userlist = config.get('userlist', None)
+        self.custom_passlist = config.get('passlist', None)
+        self._max_usernames  = config.get('max_usernames', 100)
+        self._max_passwords  = config.get('max_passwords', 50)
+        self.max_pages       = config.get('max_pages', 20)
+        
+        self.semaphore = asyncio.Semaphore(self.concurrency)
+        
+        self.endpoints: List[AuthEndpoint] = []
+        self.baselines: Dict[str, AuthBaseline] = {}
+        
+        self.locked_users: Set[str] = set()
+        self.rate_limited = False
 
     async def run(self, target: str, **kwargs) -> List[Finding]:
         if not kwargs.get('enable_brute_force', False):
+            self.logger.info("Brute force module disabled. Pass --enable-brute-force to run.")
             return self.findings
 
-        if kwargs.get('userlist'):      self.custom_userlist = kwargs['userlist']
-        if kwargs.get('passlist'):      self.custom_passlist = kwargs['passlist']
-        if kwargs.get('max_usernames'): self._max_usernames  = kwargs['max_usernames']
-        if kwargs.get('max_passwords'): self._max_passwords  = kwargs['max_passwords']
+        # Override lists if provided via CLI args
+        if kwargs.get('userlist'): self.custom_userlist = kwargs['userlist']
+        if kwargs.get('passlist'): self.custom_passlist = kwargs['passlist']
 
-        target_url = target if target.startswith(('http://', 'https://')) else f"https://{target}"
+        self.logger.info(f"🔥 Starting Enterprise Authentication Audit on {target}")
 
-        print(f"\033[96m[*] Target URL: {target_url}\033[0m")
+        # PHASE 0: Discovery
+        await self._discover_endpoints(target)
+        if not self.endpoints:
+            # Fallback to universal JSON root if nothing found
+            self.logger.info("[AUTH] No login forms found, adding root universal endpoint.")
+            self.endpoints.append(AuthEndpoint(
+                url=target, auth_type='universal_json', method='POST',
+                username_field='email', password_field='password', extra_fields={}
+            ))
+            self.endpoints.append(AuthEndpoint(
+                url=target, auth_type='basic_auth', method='GET',
+                username_field='', password_field='', extra_fields={}
+            ))
 
-        # Check if direct Firebase URL provided
-        if 'identitytoolkit.googleapis.com' in target_url:
-            print(f"\033[92m[+] Using Firebase Identity Toolkit URL directly\033[0m")
-            endpoint = {
-                'url': target_url,
-                'auth_type': 'firebase',
-                'fields': {'username_fields': ['email'], 'password_field': 'password'}
-            }
-        else:
-            # Check if it's a Firebase hosting URL that needs API key extraction
-            detected_type = self._detect_auth_type(target_url)
-            
-            if detected_type == 'firebase':
-                print(f"\033[96m[*] Firebase hosting detected, extracting API key...\033[0m")
-                firebase_url = await self._extract_firebase_endpoint(target_url)
+        self.logger.info(f"[AUTH] Testing {len(self.endpoints)} authentication endpoint(s)")
+
+        # Load lists
+        usernames, passwords = self._load_wordlists()
+        if not usernames or not passwords:
+            self.logger.error("Wordlists are empty. Aborting.")
+            return self.findings
+
+        # PHASE 1: Baseline Capture
+        for ep in self.endpoints:
+            await self._capture_baseline(ep)
+
+        # PHASE 2: Password Spraying / Brute Forcing
+        # We use password spraying (1 pass, all users) to minimize lockouts per user
+        for ep in self.endpoints:
+            if self.rate_limited:
+                break
                 
-                if firebase_url:
-                    print(f"\033[92m[+] Firebase Identity Toolkit endpoint: {firebase_url}\033[0m")
-                    endpoint = {
-                        'url': firebase_url,
-                        'auth_type': 'firebase',
-                        'fields': {'username_fields': ['email'], 'password_field': 'password'}
-                    }
-                else:
-                    print(f"\033[93m[!] Could not extract Firebase API key, trying universal brute force on HTML page\033[0m")
-                    endpoint = {
-                        'url': target_url,
-                        'auth_type': 'universal',
-                        'fields': {'username_fields': ['email', 'username'], 'password_field': 'password'}
-                    }
-            elif detected_type:
-                print(f"\033[92m[+] Detected auth type: {detected_type}\033[0m")
-                endpoint = {
-                    'url': target_url,
-                    'auth_type': detected_type,
-                    'fields': {'username_fields': ['email', 'username'], 'password_field': 'password'}
-                }
-            else:
-                print(f"\033[93m[!] No specific auth type detected, using universal brute force\033[0m")
-                endpoint = {
-                    'url': target_url,
-                    'auth_type': 'universal',
-                    'fields': {'username_fields': ['email', 'username', 'user', 'login'], 'password_field': 'password'}
-                }
+            self.logger.info(f"[AUTH] Auditing endpoint: {ep.url} ({ep.auth_type})")
+            baseline = self.baselines.get(ep.url)
+            
+            # Tasks list
+            tasks = []
+            
+            # Spraying approach
+            for password in passwords:
+                for username in usernames:
+                    tasks.append(self._test_credential(ep, baseline, username, password))
+            
+            # Execute in controlled batches
+            chunk_size = 50
+            for i in range(0, len(tasks), chunk_size):
+                if self.rate_limited: break
+                await asyncio.gather(*tasks[i:i+chunk_size])
+                await asyncio.sleep(0.5) # Gentle cooldown
 
-        ulist_label = self.custom_userlist or f"{self.wordlist_path}/usernames.txt"
-        plist_label = self.custom_passlist or f"{self.wordlist_path}/passwords.txt"
-        print(f"\033[96m[*] Userlist : {ulist_label}\033[0m")
-        print(f"\033[96m[*] Passlist : {plist_label}\033[0m\n")
-
-        await self._test_brute_force(endpoint)
         return self.findings
 
-    def _detect_auth_type(self, url: str) -> Optional[str]:
-        """Detect authentication type from URL patterns"""
-        url_lower = url.lower()
-        
-        # Firebase patterns (web.app, firebaseapp.com, etc.)
-        if any(kw in url_lower for kw in ['web.app', 'firebaseapp.com', 'firebase', 'identitytoolkit']):
-            return 'firebase'
-        
-        patterns = {
-            'aws_cognito': ['cognito', 'amazoncognito', 'aws.amazon.com'],
-            'auth0': ['auth0.com', 'auth0'],
-            'okta': ['okta.com', 'oktapreview', 'okta-emea'],
-            'keycloak': ['keycloak', 'auth/realms'],
-            'jwt': ['/jwt', '/token', 'api/token', 'auth/token'],
-            'oauth2': ['/oauth', '/oauth2', 'authorize', 'access_token'],
-            'graphql': ['/graphql', '/gql', 'api/graphql'],
-            'wordpress': ['wp-login', 'wp-admin', 'wordpress'],
-            'drupal': ['/user/login', 'drupal'],
-            'joomla': ['/administrator', 'joomla'],
-            'django': ['/admin', 'django', 'csrfmiddlewaretoken'],
-            'rails': ['/users/sign_in', 'authenticity_token'],
-            'spring': ['/login', 'spring-security', 'j_spring_security_check'],
-            'sap': ['/sap', 'sap-system-login'],
-            'sharepoint': ['sharepoint', '_layouts/authenticate'],
-            'exchange': ['/owa', 'exchange', 'outlook'],
-            'citrix': ['/citrix', 'nfauth'],
-            'vmware': ['/ui', 'vmware', 'vsphere'],
-            'basic_auth': ['basic', 'auth'],
-            'xml_soap': ['/soap', '/ws/', '/wsdl', '/service'],
-        }
-        
-        for auth_type, keywords in patterns.items():
-            if any(kw in url_lower for kw in keywords):
-                return auth_type
-        
-        return None
+    # ── Phase 0: Discovery ───────────────────────────────────────────────────
 
-    async def _extract_firebase_endpoint(self, url: str) -> Optional[str]:
-        """Extract Firebase API key from page and construct Identity Toolkit endpoint"""
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=15) as response:
-                html = response.read().decode('utf-8', errors='ignore')
-            
-            api_key = None
-            
-            # Look for apiKey in various formats
-            patterns = [
-                r'apiKey["\'\s]*[:=]["\'\s]*([A-Za-z0-9_-]{39})',
-                r'apiKey:\s*["\']([A-Za-z0-9_-]{39})["\']',
-                r'"apiKey":\s*"([A-Za-z0-9_-]{39})"',
-                r'apiKey\s*=\s*["\']([A-Za-z0-9_-]{39})["\']',
-                r'AIza[0-9A-Za-z_-]{35}',  # Direct API key pattern (39 chars starting with AIza)
-            ]
-            
-            for pattern in patterns:
-                match = re.search(pattern, html)
-                if match:
-                    api_key = match.group(1) if match.groups() else match.group(0)
-                    # Clean up the key if needed
-                    api_key = api_key.strip().strip('"\'')
-                    print(f"\033[92m[+] Found Firebase API key in page source\033[0m")
-                    break
-            
-            # If not found in HTML, check linked JS files
-            if not api_key:
-                js_files = re.findall(r'src=["\']([^"\']+\.js)["\']', html)
-                if js_files:
-                    print(f"\033[96m[*] Scanning {len(js_files)} JS file(s) for API key...\033[0m")
+    async def _discover_endpoints(self, target: str):
+        """Crawl to find login forms and API auth endpoints."""
+        pages = set(await self.crawl_pages(target, max_pages=self.max_pages))
+        pages.add(target)
+        
+        # Add common API endpoints
+        parsed = urllib.parse.urlparse(target)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        for path in ['/login', '/api/login', '/auth', '/api/auth/token', '/wp-login.php']:
+            pages.add(f"{base_url}{path}")
+
+        for page in pages:
+            try:
+                forms = await self.get_forms(page)
+                for form in forms:
+                    inputs = form['inputs']
                     
-                    for js_path in js_files[:10]:
-                        try:
-                            js_url = js_path if js_path.startswith('http') else urllib.parse.urljoin(url, js_path)
-                            js_req = urllib.request.Request(js_url, headers={'User-Agent': 'Mozilla/5.0'})
-                            with urllib.request.urlopen(js_req, timeout=10) as js_response:
-                                js_content = js_response.read().decode('utf-8', errors='ignore')
-                            
-                            for pattern in patterns:
-                                match = re.search(pattern, js_content)
-                                if match:
-                                    api_key = match.group(1) if match.groups() else match.group(0)
-                                    api_key = api_key.strip().strip('"\'')
-                                    print(f"\033[92m[+] Found API key in {js_path}\033[0m")
-                                    break
-                            
-                            if api_key:
-                                break
-                        except Exception:
-                            continue
+                    # Detect if it's a login form (has password field)
+                    pass_field = None
+                    user_field = None
+                    
+                    for name, _ in inputs.items():
+                        nl = name.lower()
+                        if 'pass' in nl or 'pwd' in nl:
+                            pass_field = name
+                        elif 'user' in nl or 'email' in nl or 'login' in nl:
+                            user_field = name
+
+                    # We found a login form
+                    if pass_field and user_field:
+                        # Remove them from extra fields
+                        extra = dict(inputs)
+                        if user_field in extra: del extra[user_field]
+                        if pass_field in extra: del extra[pass_field]
+                        
+                        ep = AuthEndpoint(
+                            url=form['action'] if form['action'].startswith('http') else urllib.parse.urljoin(page, form['action']),
+                            auth_type='form_urlencoded',
+                            method=form['method'].upper() if form['method'] else 'POST',
+                            username_field=user_field,
+                            password_field=pass_field,
+                            extra_fields=extra
+                        )
+                        # Add if unique
+                        if not any(e.url == ep.url for e in self.endpoints):
+                            self.endpoints.append(ep)
+                            self.logger.info(f"[AUTH] Discovered form login: {ep.url}")
+
+            except Exception: pass
+
+    # ── Phase 1: Baseline ────────────────────────────────────────────────────
+
+    async def _capture_baseline(self, ep: AuthEndpoint):
+        """Send a completely fake credential to establish what a failure looks like."""
+        fake_u = f"fakeuser_{int(time.time())}@example.com"
+        fake_p = "ThisPasswordIsFakeAndWillFail123!"
+        
+        resp = await self._send_auth_request(ep, fake_u, fake_p)
+        if resp:
+            body = await resp.text()
+            self.baselines[ep.url] = AuthBaseline(
+                failed_status=resp.status,
+                failed_length=len(body),
+                failed_body=body.lower()[:1000],
+                failed_hash=hashlib.md5(body.encode('utf-8', errors='ignore')).hexdigest()
+            )
+            self.logger.info(f"[AUTH] Baseline set for {ep.url} -> Status {resp.status}, {len(body)}B")
+
+    # ── Phase 2: Testing ─────────────────────────────────────────────────────
+
+    async def _test_credential(self, ep: AuthEndpoint, baseline: Optional[AuthBaseline], username: str, password: str):
+        if username in self.locked_users:
+            return
             
-            if api_key:
-                # Validate API key format (should be 39 chars starting with AIza)
-                if len(api_key) >= 35 and api_key.startswith('AIza'):
-                    firebase_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={api_key}"
-                    return firebase_url
-                else:
-                    print(f"\033[93m[!] Invalid API key format found: {api_key[:10]}...\033[0m")
+        async with self.semaphore:
+            if self.rate_limited: return
             
+            resp = await self._send_auth_request(ep, username, password)
+            if not resp: return
+            
+            body = await resp.text()
+            body_l = body.lower()
+            
+            # WAF / Rate Limiting Check
+            if resp.status in (429, 403) or 'too many requests' in body_l or 'cloudflare' in body_l:
+                if resp.status == 429:
+                    self.logger.warning("[AUTH] Rate limit hit (429). Halting auth audit.")
+                    self.rate_limited = True
+                    self._report_rate_limit(ep.url)
+                return
+
+            # Lockout Detection
+            if any(x in body_l for x in ['account locked', 'too many attempts', 'temporarily banned']):
+                self.logger.warning(f"[AUTH] Account {username} locked out. Skipping further tests for this user.")
+                self.locked_users.add(username)
+                return
+
+            # Success Detection
+            is_success = False
+            
+            # 1. HTTP Status Success
+            if resp.status in (200, 201) and baseline and resp.status != baseline.failed_status:
+                is_success = True
+                
+            # 2. Redirect to internal page
+            if resp.status in (301, 302, 303):
+                loc = resp.headers.get('Location', '').lower()
+                if loc and not any(x in loc for x in ['login', 'error', 'fail']):
+                    is_success = True
+            
+            # 3. JWT / Token in body (Very common in APIs)
+            if any(k in body_l for k in ['access_token', 'id_token', 'sessionid', 'bearer']):
+                if not any(err in body_l for err in ['invalid', 'error', 'failed']):
+                    is_success = True
+
+            # 4. Anomaly from baseline (Differential analysis)
+            if baseline and not is_success:
+                if abs(len(body) - baseline.failed_length) > (baseline.failed_length * 0.1) and resp.status != 401:
+                    # If length changed by >10% and it's not a generic 401
+                    if 'invalid' not in body_l and 'incorrect' not in body_l:
+                        is_success = True
+
+            if is_success:
+                self._report_success(ep, username, password, resp.status)
+
+    async def _send_auth_request(self, ep: AuthEndpoint, u: str, p: str):
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        
+        try:
+            if ep.auth_type == 'basic_auth':
+                auth_str = base64.b64encode(f"{u}:{p}".encode()).decode()
+                headers['Authorization'] = f"Basic {auth_str}"
+                return await self._make_request(ep.url, method='GET', headers=headers, allow_redirects=False)
+
+            elif ep.auth_type == 'universal_json':
+                data = {ep.username_field: u, ep.password_field: p}
+                data.update(ep.extra_fields)
+                headers['Content-Type'] = 'application/json'
+                return await self._make_request(ep.url, method='POST', headers=headers, data=json.dumps(data), allow_redirects=False)
+
+            elif ep.auth_type == 'form_urlencoded':
+                data = {ep.username_field: u, ep.password_field: p}
+                data.update(ep.extra_fields)
+                return await self._make_request(ep.url, method=ep.method, data=data, allow_redirects=False)
+                
+        except Exception:
             return None
-            
-        except Exception as e:
-            self.logger.debug(f"Failed to extract Firebase config: {e}")
-            return None
+
+    # ── Wordlist Management ──────────────────────────────────────────────────
 
     def _load_wordlists(self) -> Tuple[List[str], List[str]]:
-        usernames: List[str] = []
-        passwords: List[str] = []
-
-        MAX_U = getattr(self, '_max_usernames', 200)
-        MAX_P = getattr(self, '_max_passwords', 2000)
-
-        def _load_capped(path, label, cap):
-            lines = []
-            with open(path, 'r', errors='ignore') as fh:
-                for line in fh:
-                    s = line.strip()
-                    if s:
-                        lines.append(s)
-                    if len(lines) >= cap:
-                        break
-            flag = f' \033[91m(capped)\033[0m' if len(lines) == cap else ''
-            print(f"\033[92m[+] {label}: {path} ({len(lines)} entries{flag})\033[0m")
-            return lines
-
-        import os
-        cwd = Path(os.getcwd())
+        usernames = []
+        passwords = []
 
         def _resolve(raw_path: str) -> Optional[Path]:
-            candidates = [
-                Path(raw_path),
-                cwd / raw_path,
-                Path(raw_path).expanduser(),
-            ]
+            cwd = Path(os.getcwd())
+            candidates = [Path(raw_path), cwd / raw_path, Path(raw_path).expanduser()]
             for c in candidates:
-                try:
-                    if c.exists():
-                        return c.resolve()
-                except Exception:
-                    pass
+                if c.exists(): return c.resolve()
             return None
 
-        if self.custom_userlist:
-            upath = _resolve(self.custom_userlist)
-            if upath:
-                usernames = _load_capped(upath, 'Custom userlist', MAX_U)
-            else:
-                print(f"\033[91m[!] Userlist not found: '{self.custom_userlist}'\033[0m")
+        def _load_capped(path, cap):
+            lines = []
+            try:
+                with open(path, 'r', errors='ignore') as fh:
+                    for line in fh:
+                        s = line.strip()
+                        if s: lines.append(s)
+                        if len(lines) >= cap: break
+            except Exception: pass
+            return lines
 
-        if not usernames:
-            upath = _resolve(str(Path(self.wordlist_path) / 'usernames.txt'))
-            if upath:
-                usernames = _load_capped(upath, 'Userlist (default)', MAX_U)
-            else:
-                usernames = ['admin', 'administrator', 'user', 'test', 'root', 'admin@email.com']
-                print(f"\033[93m[!] No userlist found — using {len(usernames)} built-in defaults\033[0m")
-
-        if self.custom_passlist:
-            ppath = _resolve(self.custom_passlist)
-            if ppath:
-                passwords = _load_capped(ppath, 'Custom passlist', MAX_P)
-            else:
-                print(f"\033[91m[!] Passlist not found: '{self.custom_passlist}'\033[0m")
-
-        if not passwords:
-            ppath = _resolve(str(Path(self.wordlist_path) / 'passwords.txt'))
-            if ppath:
-                passwords = _load_capped(ppath, 'Passlist (default)', MAX_P)
-            else:
-                passwords = ['admin', 'password', '123456', 'login', 'admin123']
-                print(f"\033[93m[!] No passlist found — using {len(passwords)} built-in defaults\033[0m")
-
-        print()
-        return usernames, passwords
-
-    def _build_payload(self, auth_type: str, username: str, password: str, url: str) -> Dict:
-        """Build request payload based on auth type"""
-        result = {
-            'url': url,
-            'method': 'POST',
-            'headers': {},
-            'data': None,
-            'use_json': False,
-            'use_basic_auth': False,
-            'basic_auth_tuple': None
-        }
-
-        # Firebase / Google Identity Toolkit
-        if auth_type == 'firebase':
-            result['data'] = {
-                'email': username,
-                'password': password,
-                'returnSecureToken': True
-            }
-            result['use_json'] = True
-            result['headers']['Content-Type'] = 'application/json'
-
-        # AWS Cognito
-        elif auth_type == 'aws_cognito':
-            result['data'] = {
-                'AuthFlow': 'USER_PASSWORD_AUTH',
-                'ClientId': self._extract_cognito_client_id(url),
-                'AuthParameters': {
-                    'USERNAME': username,
-                    'PASSWORD': password
-                }
-            }
-            result['use_json'] = True
-            result['headers']['Content-Type'] = 'application/x-amz-json-1.1'
-            result['headers']['X-Amz-Target'] = 'AWSCognitoIdentityProviderService.InitiateAuth'
-
-        # Auth0
-        elif auth_type == 'auth0':
-            result['data'] = {
-                'grant_type': 'password',
-                'username': username,
-                'password': password,
-                'audience': url,
-                'scope': 'openid profile'
-            }
-            result['use_json'] = True
-            result['headers']['Content-Type'] = 'application/json'
-
-        # Okta
-        elif auth_type == 'okta':
-            result['data'] = {
-                'username': username,
-                'password': password,
-                'options': {
-                    'multiOptionalFactorEnroll': False,
-                    'warnBeforePasswordExpired': False
-                }
-            }
-            result['use_json'] = True
-            result['headers']['Content-Type'] = 'application/json'
-            result['headers']['Accept'] = 'application/json'
-
-        # Keycloak
-        elif auth_type == 'keycloak':
-            result['data'] = {
-                'grant_type': 'password',
-                'client_id': 'admin-cli',
-                'username': username,
-                'password': password
-            }
-            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
-
-        # JWT / Token endpoint
-        elif auth_type == 'jwt':
-            result['data'] = {
-                'username': username,
-                'password': password,
-                'grant_type': 'password'
-            }
-            result['use_json'] = True
-            result['headers']['Content-Type'] = 'application/json'
-
-        # OAuth2
-        elif auth_type == 'oauth2':
-            result['data'] = {
-                'grant_type': 'password',
-                'username': username,
-                'password': password,
-                'scope': 'read write'
-            }
-            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
-
-        # GraphQL
-        elif auth_type == 'graphql':
-            mutation = f'mutation {{ login(input: {{email: "{username}", password: "{password}"}}) {{ token user {{ id email }} }} }}'
-            result['data'] = {'query': mutation}
-            result['use_json'] = True
-            result['headers']['Content-Type'] = 'application/json'
-
-        # WordPress
-        elif auth_type == 'wordpress':
-            result['data'] = {
-                'log': username,
-                'pwd': password,
-                'wp-submit': 'Log In',
-                'redirect_to': '/wp-admin/',
-                'testcookie': '1'
-            }
-            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
-            result['headers']['Cookie'] = 'wordpress_test_cookie=WP+Cookie+check'
-
-        # Drupal
-        elif auth_type == 'drupal':
-            result['data'] = {
-                'name': username,
-                'pass': password,
-                'form_id': 'user_login_form',
-                'op': 'Log in'
-            }
-            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
-
-        # Joomla
-        elif auth_type == 'joomla':
-            result['data'] = {
-                'username': username,
-                'passwd': password,
-                'task': 'login',
-                'option': 'com_users'
-            }
-            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
-
-        # Django
-        elif auth_type == 'django':
-            result['data'] = {
-                'username': username,
-                'password': password,
-                'csrfmiddlewaretoken': 'placeholder'
-            }
-            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
-
-        # Ruby on Rails
-        elif auth_type == 'rails':
-            result['data'] = {
-                'user[email]': username,
-                'user[password]': password,
-                'authenticity_token': 'placeholder'
-            }
-            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
-
-        # Spring Security
-        elif auth_type == 'spring':
-            result['data'] = {
-                'j_username': username,
-                'j_password': password,
-                'submit': 'Login'
-            }
-            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
-
-        # SAP
-        elif auth_type == 'sap':
-            result['data'] = {
-                'j_user': username,
-                'j_password': password,
-                'sap-system-login': 'on'
-            }
-            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
-
-        # SharePoint
-        elif auth_type == 'sharepoint':
-            result['data'] = {
-                'ctl00$PlaceHolderMain$signInControl$UserName': username,
-                'ctl00$PlaceHolderMain$signInControl$Password': password
-            }
-            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
-
-        # Exchange / OWA
-        elif auth_type == 'exchange':
-            result['data'] = {
-                'username': username,
-                'password': password,
-                'trusted': '4'
-            }
-            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
-
-        # Citrix
-        elif auth_type == 'citrix':
-            result['data'] = {
-                'login': username,
-                'passwd': password,
-                'nsg-user-login': 'true'
-            }
-            result['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
-
-        # VMware vSphere
-        elif auth_type == 'vmware':
-            result['data'] = {
-                'userName': username,
-                'password': password
-            }
-            result['use_json'] = True
-            result['headers']['Content-Type'] = 'application/json'
-
-        # Basic Auth
-        elif auth_type == 'basic_auth':
-            result['use_basic_auth'] = True
-            result['basic_auth_tuple'] = (username, password)
-            result['method'] = 'GET'
-
-        # XML/SOAP
-        elif auth_type == 'xml_soap':
-            result['data'] = f'''<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-  <soap:Body>
-    <Login xmlns="http://tempuri.org/">
-      <username>{username}</username>
-      <password>{password}</password>
-    </Login>
-  </soap:Body>
-</soap:Envelope>'''
-            result['headers']['Content-Type'] = 'text/xml; charset=utf-8'
-            result['headers']['SOAPAction'] = '"Login"'
-
-        # Universal / Default - try common formats
+        # Users
+        upath = _resolve(self.custom_userlist) if self.custom_userlist else _resolve(f"{self.wordlist_path}/usernames.txt")
+        if upath:
+            usernames = _load_capped(upath, self._max_usernames)
         else:
-            result['data'] = {
-                'email': username,
-                'password': password
-            }
-            result['use_json'] = True
-            result['headers']['Content-Type'] = 'application/json'
+            usernames = ['admin', 'administrator', 'user', 'test', 'root']
 
-        return result
+        # Passwords
+        ppath = _resolve(self.custom_passlist) if self.custom_passlist else _resolve(f"{self.wordlist_path}/passwords.txt")
+        if ppath:
+            passwords = _load_capped(ppath, self._max_passwords)
+        else:
+            passwords = ['admin', 'password', '123456', 'Password123!']
 
-    def _extract_cognito_client_id(self, url: str) -> str:
-        """Extract AWS Cognito Client ID from URL or return placeholder"""
-        match = re.search(r'client_id=([a-z0-9]+)', url, re.IGNORECASE)
-        if match:
-            return match.group(1)
-        return 'PLACEHOLDER_CLIENT_ID'
+        return list(set(usernames)), list(set(passwords))
 
-    async def _test_brute_force(self, endpoint: Dict):
-        import itertools
+    # ── Reporting ────────────────────────────────────────────────────────────
 
-        url = endpoint['url']
-        auth_type = endpoint.get('auth_type', 'universal')
-        fields = endpoint.get('fields', {})
+    def _report_success(self, ep: AuthEndpoint, username: str, password: str, status: int):
+        # Determine if it's default or weak
+        is_default = username == password or password in ['admin', 'password', '123456']
+        severity = 'Critical'
+        bounty = 5000 if not is_default else 3000
         
-        base_usernames, passwords = self._load_wordlists()
-        all_usernames = list(dict.fromkeys(base_usernames))
-        total_attempts = len(all_usernames) * len(passwords)
-
-        semaphore = asyncio.Semaphore(self.concurrency)
-        found_event = asyncio.Event()
-        rate_limited = [False]
-        counter = [0]
-
-        print(f"\033[96m[*] Auth Type : {auth_type}\033[0m")
-        print(f"\033[96m[*] Target    : {url}\033[0m")
-        print(f"\033[96m[*] Usernames : {len(all_usernames)}\033[0m")
-        print(f"\033[96m[*] Passwords : {len(passwords)}\033[0m")
-        print(f"\033[96m[*] Total     : {total_attempts}\033[0m\n")
-
-        async def attempt(username: str, password: str):
-            if found_event.is_set():
-                return
-            async with semaphore:
-                if found_event.is_set():
-                    return
-                try:
-                    loop = asyncio.get_event_loop()
-
-                    def do_request():
-                        config = self._build_payload(auth_type, username, password, url)
-                        
-                        try:
-                            if config.get('use_basic_auth'):
-                                auth_str = base64.b64encode(
-                                    f"{config['basic_auth_tuple'][0]}:{config['basic_auth_tuple'][1]}".encode()
-                                ).decode()
-                                req = urllib.request.Request(
-                                    config['url'],
-                                    headers={
-                                        'Authorization': f'Basic {auth_str}',
-                                        'User-Agent': 'Mozilla/5.0'
-                                    },
-                                    method=config['method']
-                                )
-                                with urllib.request.urlopen(req, timeout=15) as r:
-                                    return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), auth_type
-                            
-                            else:
-                                data = config['data']
-                                if config.get('use_json'):
-                                    body = json.dumps(data).encode('utf-8')
-                                else:
-                                    body = urllib.parse.urlencode(data).encode('utf-8')
-                                
-                                req = urllib.request.Request(
-                                    config['url'],
-                                    data=body,
-                                    headers={**config['headers'], 'User-Agent': 'Mozilla/5.0'},
-                                    method=config['method']
-                                )
-                                with urllib.request.urlopen(req, timeout=15) as r:
-                                    return r.status, r.read().decode('utf-8', errors='ignore'), dict(r.headers), auth_type
-                                    
-                        except urllib.error.HTTPError as e:
-                            return e.code, e.read().decode('utf-8', errors='ignore'), dict(e.headers), auth_type
-                        except Exception as ex:
-                            return 0, str(ex), {}, auth_type
-
-                    status, text, resp_headers, used_format = await loop.run_in_executor(None, do_request)
-                    tl = text.lower()
-
-                    counter[0] += 1
-                    self._print_progress(counter[0], total_attempts,
-                                         prefix=f'  \033[96m{username[:22]:<22}\033[0m')
-
-                    if counter[0] == 1:
-                        sys.stdout.write('\n')
-                        print(f"\033[90m[debug] HTTP {status} | Format: {used_format} | {text[:300]}\033[0m\n")
-
-                    if status == 429:
-                        rate_limited[0] = True
-                        found_event.set()
-                        return
-
-                    is_success = False
-
-                    # Firebase success detection
-                    if auth_type == 'firebase':
-                        if 'idtoken' in tl or 'id_token' in tl:
-                            if not any(err in tl for err in ['invalid', 'error', 'failed']):
-                                is_success = True
-                        elif 'registered' in tl and 'true' in tl:
-                            is_success = True
-                        # Also check for error indicating wrong password vs invalid user
-                        elif 'INVALID_PASSWORD' in text:
-                            pass  # Wrong password, but user exists
-                        elif 'EMAIL_NOT_FOUND' in text:
-                            pass  # User doesn't exist
-                    
-                    elif auth_type == 'aws_cognito':
-                        if 'accessToken' in tl or 'idToken' in tl or 'AuthenticationResult' in tl:
-                            is_success = True
-                    
-                    elif auth_type == 'auth0':
-                        if 'access_token' in tl or 'id_token' in tl:
-                            is_success = True
-                    
-                    elif auth_type == 'okta':
-                        if 'sessionToken' in tl or ('status' in tl and 'success' in tl):
-                            is_success = True
-                    
-                    elif auth_type == 'jwt' or auth_type == 'oauth2':
-                        if 'access_token' in tl or 'token' in tl:
-                            if not any(err in tl for err in ['invalid', 'error', 'unauthorized']):
-                                is_success = True
-                    
-                    elif auth_type == 'wordpress':
-                        if status in [301, 302] and 'wp-admin' in resp_headers.get('Location', '').lower():
-                            is_success = True
-                        if 'dashboard' in tl or 'wp-admin' in tl:
-                            is_success = True
-                    
-                    elif auth_type == 'basic_auth' or auth_type == 'digest_auth':
-                        if status == 200:
-                            is_success = True
-                    
-                    # Universal success indicators
-                    if not is_success:
-                        if any(k in tl for k in ['token', 'access_token', 'session', 'authenticated', 'success', 'welcome', 'dashboard']):
-                            if not any(err in tl for err in ['invalid', 'error', 'failed', 'wrong', 'denied', 'unauthorized']):
-                                is_success = True
-                        
-                        # Redirect to non-login page
-                        if status in [301, 302, 303]:
-                            location = resp_headers.get('Location', '').lower()
-                            if location and not any(p in location for p in ['login', 'signin', 'error', 'fail', 'denied', 'auth']):
-                                is_success = True
-
-                    if is_success:
-                        sys.stdout.write('\n')
-                        self._report_success(username, password, url, counter[0],
-                                             [auth_type], 'password')
-                        found_event.set()
-
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    counter[0] += 1
-
-        tasks = [asyncio.create_task(attempt(u, p))
-                 for u, p in itertools.product(all_usernames, passwords)]
-        try:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            for t in tasks: t.cancel()
-            sys.stdout.write('\n')
-            print(f"\033[93m[!] Interrupted after {counter[0]} attempts\033[0m")
-            return
-
-        sys.stdout.write('\n')
-        if rate_limited[0]:
-            self._add_rate_limit_finding(url, counter[0])
-        elif not found_event.is_set():
-            print(f"\033[93m[-] No credentials found after {counter[0]} attempts\033[0m")
-
-    def _report_success(self, username, password, url, attempts, username_fields, password_field):
-        sep = "=" * 60
-        print(f"\n\033[91m{sep}\033[0m")
-        print(f"\033[92m[!!!] CREDENTIALS FOUND!\033[0m")
-        print(f"\033[92m      Username : {username}\033[0m")
-        print(f"\033[92m      Password : {password}\033[0m")
-        print(f"\033[92m      URL      : {url}\033[0m")
-        print(f"\033[92m      Attempts : {attempts}\033[0m")
-        print(f"\033[91m{sep}\033[0m\n")
         self.add_finding(Finding(
             module='brute_force',
-            title=f'[CREDENTIALS FOUND] {username}:{password} @ {url}',
-            severity='Critical',
-            description=f'Successfully brute-forced login at {url}\nUsername: {username}\nPassword: {password}\nAttempts: {attempts}',
-            evidence={'username': username, 'password': password, 'url': url, 'attempts': attempts},
-            poc=f"curl -X POST '{url}' -d 'email={username}&password={password}'",
-            remediation='Implement strong password policy, rate limiting, and account lockout',
-            cvss_score=9.8, bounty_score=5000, target=url))
+            title=f"Valid Credentials Found: {username}:{password} at {ep.url}",
+            severity=severity,
+            description=(
+                f"## Authentication Compromised\n\n"
+                f"Successfully authenticated against `{ep.url}`.\n"
+                f"**Username:** `{username}`\n"
+                f"**Password:** `{password}`\n"
+                f"**Auth Type:** {ep.auth_type}\n"
+                f"**Status Code:** {status}\n\n"
+                f"**Impact:** Total compromise of user account privileges."
+            ),
+            evidence={'url': ep.url, 'username': username, 'password': password, 'auth_type': ep.auth_type},
+            poc=f"Authenticate at {ep.url} using {username}:{password}",
+            remediation="Enforce strong password policies. Implement MFA/2FA. Ensure account lockout mechanisms and rate limiting are properly configured.",
+            cvss_score=9.8, bounty_score=bounty, target=ep.url
+        ))
 
-    def _add_rate_limit_finding(self, url, attempts):
+    def _report_rate_limit(self, url: str):
         self.add_finding(Finding(
-            module='brute_force', title='Rate Limiting Detected During Brute Force',
+            module='brute_force',
+            title='Rate Limiting / WAF Block Detected',
             severity='Info',
-            description=f'Rate limiting triggered after {attempts} attempts',
-            evidence={'attempts': attempts, 'url': url},
-            poc=f"Send {attempts} login requests to {url}",
-            remediation='Rate limiting is working correctly',
-            cvss_score=0.0, bounty_score=0, target=url))
+            description=f"Authentication audit halted for {url} due to Rate Limiting (HTTP 429) or WAF intervention (HTTP 403).",
+            evidence={'url': url},
+            cvss_score=0.0, bounty_score=0, target=url
+        ))
