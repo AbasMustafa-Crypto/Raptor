@@ -7,6 +7,7 @@ Discovers hidden parameters, debug flags, and undocumented API endpoints.
 import asyncio
 import logging
 import time
+import re
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from typing import List, Dict, Optional, Set, Any
 
@@ -20,7 +21,7 @@ class ParamFuzzer(BaseModule):
     def __init__(self, config: Dict, stealth=None, db=None, graph_manager=None):
         super().__init__(config, stealth, db, graph_manager)
         self.wordlist: List[str] = self._load_wordlist()
-        self.semaphore = asyncio.Semaphore(5)
+        self.semaphore = asyncio.Semaphore(20)
         self.max_pages = config.get('max_pages', 30)
         
         # Anomaly keywords
@@ -41,8 +42,22 @@ class ParamFuzzer(BaseModule):
         self.logger.info(f"🔥 Starting Parameter Fuzzing on {target}")
         
         # Phase 1: URL Collection
-        urls = await self._collect_urls(target, **kwargs)
-        self.logger.info(f"[FUZZ] Collected {len(urls)} candidate endpoints")
+        raw_urls = await self._collect_urls(target, **kwargs)
+        
+        # FIX: Filter out static assets and duplicates
+        urls = []
+        seen_patterns = set()
+        for url in raw_urls:
+            parsed = urlparse(url)
+            path = parsed.path.lower()
+            if any(path.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.css', '.woff', '.woff2', '.ttf', '.svg', '.ico', '.pdf', '.js']):
+                continue
+            pattern = re.sub(r'/\d+', '/*', path)
+            if pattern not in seen_patterns:
+                seen_patterns.add(pattern)
+                urls.append(url)
+
+        self.logger.info(f"[FUZZ] Filtered to {len(urls)} interesting endpoints")
         
         for url in urls:
             # Phase 2: Baseline Capture
@@ -97,8 +112,8 @@ class ParamFuzzer(BaseModule):
         """Fuzz an endpoint with parameters from the wordlist."""
         tasks = []
         for param in self.wordlist:
-            # Variants for each parameter
-            for value in ['true', '1', 'enabled', 'admin', '../', "'"]:
+            # Variants for each parameter - limit to top 3 as per requirements
+            for value in ['true', '1', 'admin']:
                 tasks.append(self._test_param(url, param, value, baseline))
         
         if tasks:

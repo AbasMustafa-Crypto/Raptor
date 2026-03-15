@@ -197,8 +197,20 @@ class BaseModule(ABC):
                     elif isinstance(data, dict):
                         encoded_data = urllib.parse.urlencode(data).encode()
 
+                # FIX: Encode non-ASCII characters in URL
+                parsed_url = urllib.parse.urlsplit(url)
+                url_path = urllib.parse.quote(parsed_url.path)
+                url_query = urllib.parse.quote(parsed_url.query, safe='=&')
+                encoded_url = urllib.parse.urlunsplit((
+                    parsed_url.scheme,
+                    parsed_url.netloc,
+                    url_path,
+                    url_query,
+                    parsed_url.fragment
+                ))
+
                 req = urllib.request.Request(
-                    url,
+                    encoded_url,
                     data=encoded_data,
                     headers=req_headers,
                     method=method.upper(),
