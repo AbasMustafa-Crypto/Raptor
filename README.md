@@ -195,6 +195,6 @@ python3 raptor.py -t https://target.com --stealth
 
 **RAPTOR v4.0** — Built for Elite Security Research
 
-*AbasSec · Professional Offensive Security*
+*AbasSec · student of cyber Security*
 
 </div>
